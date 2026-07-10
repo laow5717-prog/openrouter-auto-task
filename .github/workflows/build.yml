@@ -1,0 +1,71 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+            artifact: CloudflareAutoTask-macOS
+          - os: windows-latest
+            name: Windows
+            artifact: CloudflareAutoTask-Windows
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask pyyaml requests selenium selenium-stealth waitress webdriver-manager faker pyinstaller
+
+      - name: Build with PyInstaller
+        run: python build.py
+
+      - name: Compress (macOS)
+        if: runner.os == 'macOS'
+        run: cd dist && zip -r ../${{ matrix.artifact }}.zip CloudflareAutoTask/
+
+      - name: Compress (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist\CloudflareAutoTask\* -DestinationPath ${{ matrix.artifact }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            CloudflareAutoTask-macOS/CloudflareAutoTask-macOS.zip
+            CloudflareAutoTask-Windows/CloudflareAutoTask-Windows.zip
+          generate_release_notes: true

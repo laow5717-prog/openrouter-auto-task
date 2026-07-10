@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloudflare Auto Task</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <!-- 侧边栏 -->
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-icon">☁️</div>
+            <div class="brand-text">CF Auto</div>
+        </div>
+
+        <nav class="nav-menu">
+            <div class="nav-item active" onclick="switchTab('dashboard')">
+                <span>📊</span> 仪表盘
+            </div>
+            <div class="nav-item" onclick="switchTab('accounts')">
+                <span>👥</span> 账号管理
+            </div>
+        </nav>
+
+        <div class="control-box">
+            <div class="control-header">任务控制</div>
+
+            <div class="ctrl-row">
+                <label class="ctrl-label">注册数量</label>
+                <input type="number" id="targetCount" class="ctrl-input" value="1" min="1" max="50">
+            </div>
+
+            <!-- 信用卡信息区域 -->
+            <div class="ctrl-row">
+                <label class="ctrl-label">信用卡号</label>
+                <input type="text" id="cardNumber" class="ctrl-input" placeholder="4242424242424242">
+            </div>
+            <div class="ctrl-row" style="display:flex; gap:8px;">
+                <div style="flex:1">
+                    <label class="ctrl-label">有效期月</label>
+                    <input type="text" id="cardExpMonth" class="ctrl-input" placeholder="12" maxlength="2">
+                </div>
+                <div style="flex:1">
+                    <label class="ctrl-label">有效期年</label>
+                    <input type="text" id="cardExpYear" class="ctrl-input" placeholder="2027" maxlength="4">
+                </div>
+            </div>
+            <div class="ctrl-row">
+                <label class="ctrl-label">CVC 安全码</label>
+                <input type="text" id="cardCvc" class="ctrl-input" placeholder="123" maxlength="4">
+            </div>
+
+            <!-- 账单地址（可折叠） -->
+            <details class="billing-details">
+                <summary class="ctrl-label" style="cursor:pointer; margin-bottom:8px;">📍 账单地址（可选）</summary>
+                <div class="ctrl-row">
+                    <label class="ctrl-label">持卡人姓名</label>
+                    <input type="text" id="billingName" class="ctrl-input" placeholder="John Doe">
+                </div>
+                <div class="ctrl-row">
+                    <label class="ctrl-label">地址</label>
+                    <input type="text" id="billingAddress" class="ctrl-input" placeholder="123 Main St">
+                </div>
+                <div class="ctrl-row" style="display:flex; gap:8px;">
+                    <div style="flex:1">
+                        <label class="ctrl-label">城市</label>
+                        <input type="text" id="billingCity" class="ctrl-input" placeholder="New York">
+                    </div>
+                    <div style="flex:1">
+                        <label class="ctrl-label">州/省</label>
+                        <input type="text" id="billingState" class="ctrl-input" placeholder="NY">
+                    </div>
+                </div>
+                <div class="ctrl-row" style="display:flex; gap:8px;">
+                    <div style="flex:1">
+                        <label class="ctrl-label">邮编</label>
+                        <input type="text" id="billingZip" class="ctrl-input" placeholder="10001">
+                    </div>
+                    <div style="flex:1">
+                        <label class="ctrl-label">国家</label>
+                        <input type="text" id="billingCountry" class="ctrl-input" placeholder="US" value="US">
+                    </div>
+                </div>
+            </details>
+
+            <button id="btnStart" class="btn btn-primary" onclick="startTask()">
+                <span>🚀</span> 启动任务
+            </button>
+            <button id="btnStop" class="btn btn-danger hidden" onclick="stopTask()">
+                <span>🛑</span> 停止运行
+            </button>
+        </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main class="main-view">
+
+        <!-- 顶部栏 -->
+        <header class="page-header">
+            <h2 class="page-title">系统概览</h2>
+            <div class="status-badge">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">系统就绪</span>
+            </div>
+        </header>
+
+        <!-- 仪表盘 -->
+        <div id="view-dashboard" class="view-section">
+
+            <!-- 统计卡片 -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">当前步骤</div>
+                    <div class="stat-value" id="valAction" style="font-size: 18px;">等待启动</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">本次成功</div>
+                    <div class="stat-value green" id="valSuccess">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">本次失败</div>
+                    <div class="stat-value red" id="valFail">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">库存总数</div>
+                    <div class="stat-value blue" id="valInventory">0</div>
+                </div>
+            </div>
+
+            <!-- 监控与日志（分栏视图）-->
+            <div class="split-view">
+                <!-- 实时画面 -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <span>📺</span> 实时画面
+                        </div>
+                        <span class="status-pill neutral" id="monitorStatus">OFFLINE</span>
+                    </div>
+                    <div class="monitor-body">
+                        <img id="liveMonitor" class="monitor-img hidden" src="" alt="Monitor">
+                        <div id="noSignal" style="color:#666; font-size:12px">等待信号...</div>
+                    </div>
+                </div>
+
+                <!-- 终端日志 -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <span>📜</span> 终端日志
+                        </div>
+                        <button class="action-btn" onclick="clearLogs()">清空</button>
+                    </div>
+                    <div class="log-body" id="logContainer">
+                        <div class="log-placeholder">> 准备就绪...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 账号管理 -->
+        <div id="view-accounts" class="view-section">
+            <div class="panel">
+                <div class="panel-header">
+                    <input type="text" id="searchInput" placeholder="搜索邮箱..." class="ctrl-input"
+                        style="width: 300px" onkeyup="filterAccounts()">
+                    <button class="action-btn" onclick="loadAccounts()">🔄 刷新列表</button>
+                </div>
+                <div class="table-container" style="border:none; box-shadow:none; border-radius:0">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>邮箱账号</th>
+                                <th>密码</th>
+                                <th>状态</th>
+                                <th>时间</th>
+                            </tr>
+                        </thead>
+                        <tbody id="accountTableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <script src="script.js"></script>
+</body>
+
+</html>

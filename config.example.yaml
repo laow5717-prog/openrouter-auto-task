@@ -1,0 +1,57 @@
+# ==========================================
+# Cloudflare Auto Task - 配置文件模板
+# 使用说明:
+# 1. 复制此文件为 config.yaml
+# 2. 编辑 config.yaml 中的配置
+# ==========================================
+
+# 注册配置
+registration:
+  total_accounts: 1      # 批量注册的账号数量
+
+# 临时邮箱配置 (使用 mail.tm 免费 API，无需自行部署)
+email:
+  wait_timeout: 120      # 等待验证邮件的最大超时时间(秒)
+  poll_interval: 3       # 轮询检查邮件的间隔(秒)
+
+# 浏览器自动化配置
+browser:
+  max_wait_time: 600     # 全局最大等待时间
+  short_wait_time: 120   # 短任务等待时间
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# 账号密码规则
+password:
+  length: 16
+  charset: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%"
+
+# 错误重试策略
+retry:
+  http_max_retries: 5
+  http_timeout: 30
+  error_page_max_retries: 5
+  button_click_max_retries: 3
+
+# 批量注册间隔
+batch:
+  interval_min: 5        # 最小间隔(秒)
+  interval_max: 15       # 最大间隔(秒)
+
+# 信用卡信息 (通过 Web UI 输入，以下为默认值)
+payment:
+  credit_card:
+    number: ""
+    expiry_month: "12"
+    expiry_year: "2027"
+    cvc: ""
+  billing_address:
+    name: ""
+    address: ""
+    city: ""
+    state: ""
+    zip: ""
+    country: "US"
+
+# 文件路径配置
+files:
+  accounts_file: "registered_accounts.txt"

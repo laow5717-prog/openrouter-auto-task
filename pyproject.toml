@@ -1,0 +1,16 @@
+[project]
+name = "cloudflare-auto-task"
+version = "0.1.0"
+description = "Automated Cloudflare account registration and credit card binding tool using Selenium."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faker>=40.1.0",
+    "flask>=3.1.2",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+    "selenium>=4.39.0",
+    "selenium-stealth>=1.0.6",
+    "waitress>=3.0.2",
+    "webdriver-manager>=4.1.2",
+]

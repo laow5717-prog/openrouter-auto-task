@@ -1,0 +1,13 @@
+config.yaml
+config.local.yaml
+config.local.yml
+registered_accounts.txt
+__pycache__/
+*.pyc
+.venv/
+.idea/
+debug_*.png
+build/
+dist/
+*.spec
+.wdm/
