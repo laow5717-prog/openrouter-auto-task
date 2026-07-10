@@ -157,7 +157,8 @@ def check_and_handle_cf_challenge(driver, max_wait=120):
             print("")
             print("  " + "=" * 50)
             print("  ⚠️  需要手动完成人机验证！")
-            print("  👉 请在浏览器窗口中点击 Turnstile 验证框")
+            print("  👉 请在浏览器窗口中勾选验证框")
+            print("  👉 (中文: '确认您是真人' / 英文: 'Verify you are human')")
             print(f"  ⏰ 剩余等待时间: {remaining} 秒")
             print("  " + "=" * 50)
             print("")
@@ -383,10 +384,14 @@ def _handle_inline_turnstile(driver, max_wait=120):
         if containers:
             turnstile_found = True
 
-        # 方法2: 查找包含 "human" 文本的提示
+        # 方法2: 查找包含人机验证提示文本（支持中英文）
         if not turnstile_found:
             body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-            if 'let us know you are human' in body_text or 'verify you are human' in body_text:
+            if ('let us know you are human' in body_text or
+                'verify you are human' in body_text or
+                '确认您是真人' in body_text or
+                '证明你是人类' in body_text or
+                '请确认您不是机器人' in body_text):
                 turnstile_found = True
 
         # 方法3: 通过 JS 查找 shadow DOM 中的 Turnstile iframe
@@ -425,7 +430,8 @@ def _handle_inline_turnstile(driver, max_wait=120):
     print("")
     print("  " + "=" * 50)
     print("  ⚠️  需要手动完成人机验证！")
-    print("  👉 请在浏览器窗口中点击 'Verify you are human' 验证框")
+    print("  👉 请在浏览器窗口中勾选验证框")
+    print("  👉 (中文: '确认您是真人' / 英文: 'Verify you are human')")
     print(f"  ⏰ 等待时间: 最长 {max_wait} 秒")
     print("  " + "=" * 50)
     print("")
@@ -492,11 +498,13 @@ def _is_turnstile_solved(driver):
         except Exception:
             pass
 
-        # 方法3: 检查 "human" 提示文字是否消失
+        # 方法3: 检查人机验证提示文字是否消失（中英文）
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
             if ('let us know you are human' not in body_text and
-                'verify you are human' not in body_text):
+                'verify you are human' not in body_text and
+                '确认您是真人' not in body_text and
+                '证明你是人类' not in body_text):
                 signup_btn = driver.find_elements(By.CSS_SELECTOR, 'button[type="submit"]')
                 if signup_btn:
                     return True
