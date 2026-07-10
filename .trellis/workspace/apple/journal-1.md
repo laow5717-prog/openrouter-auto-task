@@ -39,3 +39,37 @@ Restructured project from flat .py files to src/ package with models/services/br
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Fix index 404 and convert card Excel
+
+**Date**: 2026-07-11
+**Task**: Fix index 404 and convert card Excel
+**Branch**: `main`
+
+### Summary
+
+Fixed send_from_directory 404 bug by using absolute static_dir path. Converted user's raw card Excel to project template format (27 cards).
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fb880ab` | (see git log) |
+| `97d690e` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
