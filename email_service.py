@@ -41,15 +41,16 @@ def _get_available_domain():
 
 def create_temp_email():
     """
-    创建临时邮箱（使用 mail.tm）
-    返回: (邮箱地址, token) 或 (None, None)
+    创建邮箱（使用 mail.tm）
+    mail.tm 账号是持久的，可通过邮箱地址+密码随时重新登录
+    返回: (邮箱地址, 邮箱密码, token) 或 (None, None, None)
     """
     print("📧 正在创建临时邮箱 (mail.tm)...")
 
     # 1. 获取可用域名
     domain = _get_available_domain()
     if not domain:
-        return None, None
+        return None, None, None
 
     # 2. 生成随机邮箱地址和密码
     prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
@@ -69,13 +70,13 @@ def create_temp_email():
 
         if response.status_code not in (200, 201):
             print(f"  ❌ 创建账号失败: HTTP {response.status_code} - {response.text[:200]}")
-            return None, None
+            return None, None, None
 
         print(f"  ✅ 账号创建成功: {address}")
 
     except Exception as e:
         print(f"  ❌ 创建账号失败: {e}")
-        return None, None
+        return None, None, None
 
     # 4. 获取 Token
     try:
@@ -90,7 +91,7 @@ def create_temp_email():
             token = response.json().get('token', '')
             if token:
                 print(f"✅ 邮箱创建成功: {address}")
-                return address, token
+                return address, password, token
             else:
                 print("  ❌ 响应中未包含 token")
         else:
@@ -99,7 +100,7 @@ def create_temp_email():
     except Exception as e:
         print(f"  ❌ 获取 token 失败: {e}")
 
-    return None, None
+    return None, None, None
 
 
 def fetch_emails(token: str):

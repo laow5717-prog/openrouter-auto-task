@@ -177,14 +177,14 @@ function clearLogs() {
 // 加载账号列表
 async function loadAccounts() {
     const tbody = document.getElementById('accountTableBody');
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center">加载中...</td></tr>';
 
     try {
         const res = await fetch('/api/accounts');
         const accounts = await res.json();
         renderAccounts(accounts);
     } catch (e) {
-        tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:red">加载失败: ${e}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:red">加载失败: ${e}</td></tr>`;
     }
 }
 
@@ -193,7 +193,7 @@ function renderAccounts(accounts) {
     tbody.innerHTML = '';
 
     if (accounts.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#666">暂无数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666">暂无数据</td></tr>';
         return;
     }
 
@@ -206,6 +206,7 @@ function renderAccounts(accounts) {
         tr.innerHTML = `
             <td>${acc.email}</td>
             <td style="font-family:monospace">${acc.password}</td>
+            <td style="font-family:monospace">${acc.email_password || '-'}</td>
             <td><span class="status-tag ${statusClass}">${acc.status}</span></td>
             <td>${acc.time}</td>
         `;

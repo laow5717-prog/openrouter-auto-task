@@ -269,6 +269,7 @@ def get_accounts():
                             "password": parts[1].strip(),
                             "status": parts[3].strip() if len(parts) > 3 else "",
                             "time": parts[2].strip() if len(parts) > 2 else "",
+                            "email_password": parts[4].strip() if len(parts) > 4 else "",
                         })
         except Exception as e:
             return jsonify({"error": str(e)}), 500

@@ -68,8 +68,11 @@ def generate_random_password(length=None):
     return password
 
 
-def save_to_txt(email: str, password: str = None, status="已注册"):
-    """保存账号信息到 TXT 文件"""
+def save_to_txt(email: str, password: str = None, status="已注册", email_password: str = None):
+    """
+    保存账号信息到 TXT 文件
+    格式: 邮箱----CF密码----时间----状态----邮箱密码
+    """
     try:
         base = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(__file__)
         file_path = os.path.join(base, TXT_FILE)
@@ -81,14 +84,17 @@ def save_to_txt(email: str, password: str = None, status="已注册"):
                 lines = f.readlines()
 
         found = False
-        new_line = f"{email}----{password if password else 'N/A'}----{current_date}----{status}\n"
+        ep = email_password if email_password else 'N/A'
+        new_line = f"{email}----{password if password else 'N/A'}----{current_date}----{status}----{ep}\n"
 
         for i, line in enumerate(lines):
             if line.startswith(f"{email}----"):
                 parts = line.strip().split("----")
                 current_pw = parts[1] if len(parts) > 1 else 'N/A'
+                current_ep = parts[4] if len(parts) > 4 else 'N/A'
                 final_pw = password if password else current_pw
-                lines[i] = f"{email}----{final_pw}----{current_date}----{status}\n"
+                final_ep = email_password if email_password else current_ep
+                lines[i] = f"{email}----{final_pw}----{current_date}----{status}----{final_ep}\n"
                 found = True
                 break
 
@@ -104,9 +110,9 @@ def save_to_txt(email: str, password: str = None, status="已注册"):
         print(f"❌ 保存账号信息失败: {e}")
 
 
-def update_account_status(email: str, new_status: str, password: str = None):
+def update_account_status(email: str, new_status: str, password: str = None, email_password: str = None):
     """更新账号状态的快捷函数"""
-    save_to_txt(email, password, new_status)
+    save_to_txt(email, password, new_status, email_password=email_password)
 
 
 def extract_verification_link(content: str):

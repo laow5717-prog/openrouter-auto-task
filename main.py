@@ -56,12 +56,13 @@ def register_one_account(card_info=None, monitor_callback=None):
             monitor_callback(driver, step_name)
 
     try:
-        # 1. 创建临时邮箱
-        print("📧 正在创建临时邮箱...")
-        email, jwt_token = create_temp_email()
+        # 1. 创建邮箱
+        print("📧 正在创建邮箱...")
+        email, email_password, jwt_token = create_temp_email()
         if not email:
             print("❌ 创建邮箱失败，终止注册")
             return None, None, False
+        print(f"📧 邮箱密码: {email_password}（可在 mail.tm 网站登录查看邮件）")
 
         # 2. 生成随机密码
         password = generate_random_password()
@@ -91,7 +92,7 @@ def register_one_account(card_info=None, monitor_callback=None):
         _report("email_verified")
 
         # 7. 保存账号信息（注册成功）
-        save_to_txt(email, password, "已注册")
+        save_to_txt(email, password, "已注册", email_password=email_password)
 
         print("\n" + "=" * 50)
         print("🎉 注册成功！")
