@@ -142,6 +142,19 @@ body {
     box-shadow: 0 0 0 3px rgba(243, 128, 32, 0.1);
 }
 
+.card-entry {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    margin-bottom: 8px;
+    transition: border-color 0.2s;
+}
+
+.card-entry:hover {
+    border-color: var(--primary);
+}
+
 .billing-details {
     margin-bottom: 12px;
     padding: 8px;

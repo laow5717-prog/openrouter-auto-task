@@ -24,6 +24,9 @@
             <div class="nav-item active" onclick="switchTab('dashboard')">
                 <span>📊</span> 仪表盘
             </div>
+            <div class="nav-item" onclick="switchTab('cardmode')">
+                <span>💳</span> 信用卡模式
+            </div>
             <div class="nav-item" onclick="switchTab('accounts')">
                 <span>👥</span> 账号管理
             </div>
@@ -43,58 +46,21 @@
                 <div style="font-size:11px; color:#999; margin-top:2px;">设置后所有账号使用同一密码</div>
             </div>
 
-            <!-- 信用卡信息区域 -->
             <div class="ctrl-row">
-                <label class="ctrl-label">信用卡号</label>
-                <input type="text" id="cardNumber" class="ctrl-input" placeholder="4242424242424242">
-            </div>
-            <div class="ctrl-row" style="display:flex; gap:8px;">
-                <div style="flex:1">
-                    <label class="ctrl-label">有效期月</label>
-                    <input type="text" id="cardExpMonth" class="ctrl-input" placeholder="12" maxlength="2">
-                </div>
-                <div style="flex:1">
-                    <label class="ctrl-label">有效期年</label>
-                    <input type="text" id="cardExpYear" class="ctrl-input" placeholder="2027" maxlength="4">
-                </div>
-            </div>
-            <div class="ctrl-row">
-                <label class="ctrl-label">CVC 安全码</label>
-                <input type="text" id="cardCvc" class="ctrl-input" placeholder="123" maxlength="4">
+                <label class="ctrl-label">2Captcha API Key</label>
+                <input type="text" id="captchaApiKey" class="ctrl-input" placeholder="用于自动解决人机验证">
+                <div style="font-size:11px; color:#999; margin-top:2px;">遇到 Turnstile 验证时自动调用</div>
             </div>
 
-            <!-- 账单地址（可折叠） -->
-            <details class="billing-details">
-                <summary class="ctrl-label" style="cursor:pointer; margin-bottom:8px;">📍 账单地址（可选）</summary>
-                <div class="ctrl-row">
-                    <label class="ctrl-label">持卡人姓名</label>
-                    <input type="text" id="billingName" class="ctrl-input" placeholder="John Doe">
+            <!-- 信用卡列表区域 -->
+            <div class="ctrl-row">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <label class="ctrl-label" style="margin-bottom:0">💳 信用卡列表</label>
+                    <button type="button" class="action-btn" onclick="addCardEntry()" style="font-size:12px;">+ 添加</button>
                 </div>
-                <div class="ctrl-row">
-                    <label class="ctrl-label">地址</label>
-                    <input type="text" id="billingAddress" class="ctrl-input" placeholder="123 Main St">
-                </div>
-                <div class="ctrl-row" style="display:flex; gap:8px;">
-                    <div style="flex:1">
-                        <label class="ctrl-label">城市</label>
-                        <input type="text" id="billingCity" class="ctrl-input" placeholder="New York">
-                    </div>
-                    <div style="flex:1">
-                        <label class="ctrl-label">州/省</label>
-                        <input type="text" id="billingState" class="ctrl-input" placeholder="NY">
-                    </div>
-                </div>
-                <div class="ctrl-row" style="display:flex; gap:8px;">
-                    <div style="flex:1">
-                        <label class="ctrl-label">邮编</label>
-                        <input type="text" id="billingZip" class="ctrl-input" placeholder="10001">
-                    </div>
-                    <div style="flex:1">
-                        <label class="ctrl-label">国家</label>
-                        <input type="text" id="billingCountry" class="ctrl-input" placeholder="US" value="US">
-                    </div>
-                </div>
-            </details>
+                <div style="font-size:11px; color:#999; margin-bottom:8px;">每个账号最多绑定 2 张，每张卡需填写独立账单地址</div>
+                <div id="cardList"></div>
+            </div>
 
             <button id="btnStart" class="btn btn-primary" onclick="startTask()">
                 <span>🚀</span> 启动任务
@@ -167,6 +133,79 @@
                     <div class="log-body" id="logContainer">
                         <div class="log-placeholder">> 准备就绪...</div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 信用卡驱动模式 -->
+        <div id="view-cardmode" class="view-section">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">总卡数</div>
+                    <div class="stat-value" id="cardTotal">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">绑定成功</div>
+                    <div class="stat-value green" id="cardSuccess">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">绑定失败</div>
+                    <div class="stat-value red" id="cardFailed">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">待处理</div>
+                    <div class="stat-value blue" id="cardPending">0</div>
+                </div>
+            </div>
+
+            <div class="panel" style="margin-bottom: 16px;">
+                <div class="panel-header">
+                    <div class="panel-title"><span>📁</span> 上传信用卡 Excel</div>
+                    <a href="/api/card/template" class="action-btn" style="text-decoration:none">📥 下载模版</a>
+                </div>
+                <div style="padding: 16px;">
+                    <div style="font-size:12px; color:#666; margin-bottom:12px;">
+                        上传包含信用卡数据的 Excel 文件，系统将根据卡片数量自动注册账号并逐张绑定。每个账号最多绑定 2 张卡。
+                    </div>
+                    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                        <input type="file" id="cardExcelFile" accept=".xlsx,.xls" style="font-size:12px;">
+                        <button class="action-btn" onclick="uploadCardExcel()">📤 上传并解析</button>
+                    </div>
+                    <div id="uploadResult" style="margin-top:10px; font-size:12px;"></div>
+
+                    <div style="margin-top:16px; display:flex; gap:10px; align-items:center;">
+                        <button id="btnStartCardMode" class="btn btn-primary" onclick="startCardDrivenTask()" style="width:auto; padding:8px 20px;">
+                            🚀 启动信用卡驱动任务
+                        </button>
+                        <button id="btnStopCardMode" class="btn btn-danger hidden" onclick="stopTask()" style="width:auto; padding:8px 20px;">
+                            🛑 停止
+                        </button>
+                        <a href="/api/card/report" class="action-btn" id="btnDownloadReport" style="text-decoration:none; display:none;">📊 下载报告</a>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title"><span>📋</span> 绑卡记录</div>
+                    <button class="action-btn" onclick="loadCardStatus()">🔄 刷新</button>
+                </div>
+                <div class="table-container" style="border:none; box-shadow:none; border-radius:0">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>卡号(后4位)</th>
+                                <th>状态</th>
+                                <th>绑定账号</th>
+                                <th>错误信息</th>
+                                <th>处理时间</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cardTableBody">
+                            <tr><td colspan="6" style="text-align:center;color:#666">请先上传 Excel 文件</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
