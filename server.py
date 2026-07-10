@@ -3,11 +3,22 @@ Cloudflare 自动注册工具 - Web 服务端
 提供可视化控制台，支持实时监控浏览器操作
 """
 
+import platform
 import threading
 import time
 import builtins
 import os
 import random
+
+# Windows 环境强制 UTF-8 输出
+if platform.system() == 'Windows':
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    try:
+        import sys as _sys
+        _sys.stdout.reconfigure(encoding='utf-8')
+        _sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 from datetime import datetime
 from flask import Flask, jsonify, request, send_from_directory
 

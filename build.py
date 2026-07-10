@@ -9,9 +9,19 @@
 
 import subprocess
 import sys
+import os
 import shutil
 import platform
 from pathlib import Path
+
+# Windows 环境强制 UTF-8 输出
+if platform.system() == 'Windows':
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 BASE_DIR = Path(__file__).parent
 
