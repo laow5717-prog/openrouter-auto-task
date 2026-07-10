@@ -137,8 +137,13 @@ async function startTask() {
     // 清空旧日志
     clearLogs();
 
+    const cfPassword = document.getElementById('cfPassword').value.trim();
+
     try {
         const body = { count: count };
+        if (cfPassword) {
+            body.cf_password = cfPassword;
+        }
         if (cardInfo) {
             body.card_info = cardInfo;
         }

@@ -37,6 +37,12 @@
                 <input type="number" id="targetCount" class="ctrl-input" value="1" min="1" max="50">
             </div>
 
+            <div class="ctrl-row">
+                <label class="ctrl-label">Cloudflare 统一密码</label>
+                <input type="text" id="cfPassword" class="ctrl-input" placeholder="留空则每个账号随机生成">
+                <div style="font-size:11px; color:#999; margin-top:2px;">设置后所有账号使用同一密码</div>
+            </div>
+
             <!-- 信用卡信息区域 -->
             <div class="ctrl-row">
                 <label class="ctrl-label">信用卡号</label>
@@ -179,7 +185,7 @@
                             <tr>
                                 <th>邮箱账号</th>
                                 <th>CF密码</th>
-                                <th>邮箱密码</th>
+                                <th>邮箱密码 <a href="https://mail.tm" target="_blank" style="font-weight:normal;font-size:11px;color:var(--primary)">(mail.tm 登录)</a></th>
                                 <th>状态</th>
                                 <th>时间</th>
                             </tr>

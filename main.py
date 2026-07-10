@@ -29,18 +29,13 @@ from browser import (
 )
 
 
-def register_one_account(card_info=None, monitor_callback=None):
+def register_one_account(card_info=None, cf_password=None, monitor_callback=None):
     """
     注册单个 Cloudflare 账号并添加信用卡
 
     参数:
-        card_info: 信用卡信息字典（由 Web UI 传入），包含:
-            - number: 卡号
-            - expiry_month: 有效期月 (MM)
-            - expiry_year: 有效期年 (YYYY)
-            - cvc: 安全码
-            - name: 持卡人姓名（可选）
-            - address, city, state, zip, country: 账单地址（可选）
+        card_info: 信用卡信息字典（由 Web UI 传入）
+        cf_password: 自定义 Cloudflare 密码（留空则随机生成）
         monitor_callback: 回调函数 func(driver, step_name)，用于截图和中断检查
 
     返回:
@@ -64,8 +59,12 @@ def register_one_account(card_info=None, monitor_callback=None):
             return None, None, False
         print(f"📧 邮箱密码: {email_password}（可在 mail.tm 网站登录查看邮件）")
 
-        # 2. 生成随机密码
-        password = generate_random_password()
+        # 2. 使用自定义密码或生成随机密码
+        if cf_password:
+            password = cf_password
+            print(f"🔑 使用自定义密码")
+        else:
+            password = generate_random_password()
 
         # 3. 初始化浏览器
         driver = create_driver(headless=False)

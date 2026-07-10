@@ -103,7 +103,7 @@ email_service.print = hooked_print
 # 后台工作线程
 # ==========================================
 
-def worker_thread(count, card_info=None):
+def worker_thread(count, card_info=None, cf_password=None):
     """后台执行注册任务的工作线程"""
     state.is_running = True
     state.stop_requested = False
@@ -140,6 +140,7 @@ def worker_thread(count, card_info=None):
             try:
                 email, password, success = main.register_one_account(
                     card_info=card_info,
+                    cf_password=cf_password,
                     monitor_callback=monitor,
                 )
 
@@ -231,12 +232,13 @@ def start_task():
     data = request.json or {}
     count = data.get('count', 1)
 
-    # 从请求中获取信用卡信息
+    # 从请求中获取信用卡信息和自定义密码
     card_info = data.get('card_info', None)
+    cf_password = data.get('cf_password', None)
 
     threading.Thread(
         target=worker_thread,
-        args=(count, card_info),
+        args=(count, card_info, cf_password),
         daemon=True,
     ).start()
 
