@@ -17,13 +17,11 @@ except ImportError:
 
 @dataclass
 class RegistrationConfig:
-    """注册配置"""
     total_accounts: int = 1
 
 
 @dataclass
 class EmailConfig:
-    """邮箱服务配置"""
     worker_url: str = ""
     domain: str = ""
     prefix_length: int = 10
@@ -34,7 +32,6 @@ class EmailConfig:
 
 @dataclass
 class BrowserConfig:
-    """浏览器配置"""
     max_wait_time: int = 600
     short_wait_time: int = 120
     user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -42,14 +39,12 @@ class BrowserConfig:
 
 @dataclass
 class PasswordConfig:
-    """密码配置"""
     length: int = 16
     charset: str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%"
 
 
 @dataclass
 class RetryConfig:
-    """重试配置"""
     http_max_retries: int = 5
     http_timeout: int = 30
     error_page_max_retries: int = 5
@@ -58,55 +53,67 @@ class RetryConfig:
 
 @dataclass
 class BatchConfig:
-    """批量注册配置"""
     interval_min: int = 5
     interval_max: int = 15
 
 
 @dataclass
+class CaptchaConfig:
+    api_key: str = ""
+    service: str = "2captcha"
+
+
+@dataclass
+class DatabaseConfig:
+    path: str = "data/cloudflare_auto.db"
+
+
+@dataclass
 class FilesConfig:
-    """文件路径配置"""
     accounts_file: str = "registered_accounts.txt"
 
 
 @dataclass
 class CreditCardConfig:
-    """信用卡配置"""
     number: str = ""
     expiry_month: str = ""
     expiry_year: str = ""
     cvc: str = ""
-
-
-@dataclass
-class BillingAddressConfig:
-    """账单地址配置"""
-    name: str = ""
+    first_name: str = ""
+    last_name: str = ""
+    country: str = "United States"
     address: str = ""
+    address2: str = ""
     city: str = ""
     state: str = ""
     zip: str = ""
-    country: str = "US"
+    company: str = ""
 
 
 @dataclass
 class PaymentConfig:
-    """支付配置"""
-    credit_card: CreditCardConfig = field(default_factory=CreditCardConfig)
-    billing_address: BillingAddressConfig = field(default_factory=BillingAddressConfig)
+    max_bindable_cards: int = 2
+    credit_cards: list = field(default_factory=list)
 
 
 @dataclass
 class AppConfig:
-    """应用程序完整配置"""
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     email: EmailConfig = field(default_factory=EmailConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     password: PasswordConfig = field(default_factory=PasswordConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
     batch: BatchConfig = field(default_factory=BatchConfig)
+    captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     payment: PaymentConfig = field(default_factory=PaymentConfig)
+
+
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent.parent
 
 
 class ConfigLoader:
@@ -124,10 +131,7 @@ class ConfigLoader:
         self._load_config()
 
     def _find_config_file(self) -> Optional[Path]:
-        if getattr(sys, 'frozen', False):
-            base_dir = Path(sys.executable).parent
-        else:
-            base_dir = Path(__file__).parent
+        base_dir = get_base_dir()
         for filename in self.CONFIG_FILES:
             config_file = base_dir / filename
             if config_file.exists():
@@ -141,17 +145,16 @@ class ConfigLoader:
             config_file = self._find_config_file()
 
         if config_file is None or not config_file.exists():
-            print("⚠️ 未找到配置文件 config.yaml，使用默认配置")
+            print("Warning: config.yaml not found, using defaults")
             return
 
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 self.raw_config = yaml.safe_load(f) or {}
             self.config_path = str(config_file)
-            print(f"📄 已加载配置文件: {config_file.name}")
             self._parse_config()
         except yaml.YAMLError as e:
-            print(f"❌ 配置文件格式错误: {e}")
+            print(f"Config parse error: {e}")
             sys.exit(1)
 
     def _parse_config(self) -> None:
@@ -203,6 +206,19 @@ class ConfigLoader:
                 interval_max=batch.get('interval_max', 15),
             )
 
+        if 'captcha' in self.raw_config:
+            captcha = self.raw_config['captcha']
+            self.config.captcha = CaptchaConfig(
+                api_key=captcha.get('api_key', ''),
+                service=captcha.get('service', '2captcha'),
+            )
+
+        if 'database' in self.raw_config:
+            database = self.raw_config['database']
+            self.config.database = DatabaseConfig(
+                path=database.get('path', 'data/cloudflare_auto.db'),
+            )
+
         if 'files' in self.raw_config:
             files = self.raw_config['files']
             self.config.files = FilesConfig(
@@ -211,51 +227,34 @@ class ConfigLoader:
 
         if 'payment' in self.raw_config:
             payment = self.raw_config['payment']
-            cc = payment.get('credit_card', {})
-            ba = payment.get('billing_address', {})
+            cards_raw = payment.get('credit_cards', [])
+            credit_cards = []
+            if isinstance(cards_raw, list):
+                for cc in cards_raw:
+                    if isinstance(cc, dict) and cc.get('number'):
+                        credit_cards.append(CreditCardConfig(
+                            number=cc.get('number', ''),
+                            expiry_month=cc.get('expiry_month', ''),
+                            expiry_year=cc.get('expiry_year', ''),
+                            cvc=cc.get('cvc', ''),
+                            first_name=cc.get('first_name', ''),
+                            last_name=cc.get('last_name', ''),
+                            country=cc.get('country', 'United States'),
+                            address=cc.get('address', ''),
+                            address2=cc.get('address2', ''),
+                            city=cc.get('city', ''),
+                            state=cc.get('state', ''),
+                            zip=cc.get('zip', ''),
+                            company=cc.get('company', ''),
+                        ))
             self.config.payment = PaymentConfig(
-                credit_card=CreditCardConfig(
-                    number=cc.get('number', ''),
-                    expiry_month=cc.get('expiry_month', ''),
-                    expiry_year=cc.get('expiry_year', ''),
-                    cvc=cc.get('cvc', ''),
-                ),
-                billing_address=BillingAddressConfig(
-                    name=ba.get('name', ''),
-                    address=ba.get('address', ''),
-                    city=ba.get('city', ''),
-                    state=ba.get('state', ''),
-                    zip=ba.get('zip', ''),
-                    country=ba.get('country', 'US'),
-                ),
+                max_bindable_cards=payment.get('max_bindable_cards', 2),
+                credit_cards=credit_cards,
             )
 
     def reload(self) -> None:
-        """重新加载配置文件"""
         self._load_config()
 
 
-# 全局配置实例
 _loader = ConfigLoader()
 cfg = _loader.config
-
-# 兼容性导出
-TOTAL_ACCOUNTS = cfg.registration.total_accounts
-EMAIL_WORKER_URL = cfg.email.worker_url
-EMAIL_DOMAIN = cfg.email.domain
-EMAIL_PREFIX_LENGTH = cfg.email.prefix_length
-EMAIL_WAIT_TIMEOUT = cfg.email.wait_timeout
-EMAIL_POLL_INTERVAL = cfg.email.poll_interval
-EMAIL_ADMIN_PASSWORD = cfg.email.admin_password
-MAX_WAIT_TIME = cfg.browser.max_wait_time
-SHORT_WAIT_TIME = cfg.browser.short_wait_time
-USER_AGENT = cfg.browser.user_agent
-PASSWORD_LENGTH = cfg.password.length
-PASSWORD_CHARS = cfg.password.charset
-HTTP_MAX_RETRIES = cfg.retry.http_max_retries
-HTTP_TIMEOUT = cfg.retry.http_timeout
-ERROR_PAGE_MAX_RETRIES = cfg.retry.error_page_max_retries
-BUTTON_CLICK_MAX_RETRIES = cfg.retry.button_click_max_retries
-BATCH_INTERVAL_MIN = cfg.batch.interval_min
-BATCH_INTERVAL_MAX = cfg.batch.interval_max
-TXT_FILE = cfg.files.accounts_file

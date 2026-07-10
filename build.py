@@ -57,6 +57,7 @@ def build():
         '--add-data', f'static{sep}static',
         '--add-data', f'config.example.yaml{sep}.',
         # 隐式导入
+        '--collect-submodules', 'src',
         '--hidden-import', 'selenium_stealth',
         '--hidden-import', 'webdriver_manager',
         '--hidden-import', 'selenium.webdriver',

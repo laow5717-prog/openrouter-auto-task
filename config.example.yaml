@@ -37,21 +37,22 @@ batch:
   interval_min: 5        # 最小间隔(秒)
   interval_max: 15       # 最大间隔(秒)
 
-# 信用卡信息 (通过 Web UI 输入，以下为默认值)
-payment:
-  credit_card:
-    number: ""
-    expiry_month: "12"
-    expiry_year: "2027"
-    cvc: ""
-  billing_address:
-    name: ""
-    address: ""
-    city: ""
-    state: ""
-    zip: ""
-    country: "US"
+# 验证码服务配置 (2Captcha)
+captcha:
+  api_key: ""              # 2Captcha API Key
+  service: "2captcha"
 
-# 文件路径配置
+# 信用卡信息 (通过 Web UI 输入，以下为默认值)
+# 支持多张信用卡，每个账号最多绑定 2 张
+# 每张卡包含独立的账单地址
+payment:
+  max_bindable_cards: 2
+  credit_cards: []
+
+# 本地数据库配置
+database:
+  path: "data/cloudflare_auto.db"
+
+# 文件路径配置 (legacy, 首次启动时自动迁移到数据库)
 files:
   accounts_file: "registered_accounts.txt"

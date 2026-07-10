@@ -1,0 +1,144 @@
+"""
+SQLite 数据库管理模块
+提供连接管理、schema 创建、版本迁移
+"""
+
+import os
+import sys
+import sqlite3
+import threading
+
+_SCHEMA_V1 = """
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    cf_password TEXT,
+    email_password TEXT,
+    status TEXT DEFAULT 'registered',
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    status TEXT DEFAULT 'running',
+    total_count INTEGER DEFAULT 0,
+    success_count INTEGER DEFAULT 0,
+    fail_count INTEGER DEFAULT 0,
+    config_json TEXT,
+    started_at TEXT DEFAULT (datetime('now','localtime')),
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS card_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER REFERENCES tasks(id),
+    card_display TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    bound_to_email TEXT,
+    error TEXT,
+    attempted_at TEXT,
+    card_data_json TEXT
+);
+"""
+
+_MIGRATIONS = {
+    1: _SCHEMA_V1,
+}
+
+
+class Database:
+    """线程安全的 SQLite 数据库封装"""
+
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = self._default_path()
+
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._migrate()
+        self._import_txt_if_needed()
+
+    @staticmethod
+    def _default_path():
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return os.path.join(base, "data", "cloudflare_auto.db")
+
+    def _migrate(self):
+        current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        target = max(_MIGRATIONS.keys())
+        if current >= target:
+            return
+        for version in range(current + 1, target + 1):
+            sql = _MIGRATIONS[version]
+            self._conn.executescript(sql)
+        self._conn.execute(f"PRAGMA user_version = {target}")
+        self._conn.commit()
+
+    def _import_txt_if_needed(self):
+        """首次运行时从 registered_accounts.txt 导入数据"""
+        count = self._conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        if count > 0:
+            return
+
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+        txt_path = os.path.join(base, "registered_accounts.txt")
+        if not os.path.exists(txt_path):
+            return
+
+        imported = 0
+        try:
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split('----')
+                    if len(parts) >= 2:
+                        email = parts[0].strip()
+                        cf_pw = parts[1].strip() if len(parts) > 1 else None
+                        ts = parts[2].strip() if len(parts) > 2 else None
+                        status = parts[3].strip() if len(parts) > 3 else 'registered'
+                        email_pw = parts[4].strip() if len(parts) > 4 else None
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO accounts (email, cf_password, email_password, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (email, cf_pw, email_pw, status, ts),
+                        )
+                        imported += 1
+            self._conn.commit()
+
+            migrated_path = txt_path + ".migrated"
+            os.rename(txt_path, migrated_path)
+            print(f"DB: imported {imported} accounts from TXT, renamed to {os.path.basename(migrated_path)}")
+        except Exception as e:
+            print(f"DB: TXT import failed: {e}")
+
+    def execute(self, sql, params=None):
+        with self._lock:
+            cursor = self._conn.execute(sql, params or ())
+            self._conn.commit()
+            return cursor
+
+    def fetchone(self, sql, params=None):
+        with self._lock:
+            return self._conn.execute(sql, params or ()).fetchone()
+
+    def fetchall(self, sql, params=None):
+        with self._lock:
+            return self._conn.execute(sql, params or ()).fetchall()
+
+    def close(self):
+        self._conn.close()
