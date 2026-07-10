@@ -9,5 +9,7 @@ __pycache__/
 debug_*.png
 build/
 dist/
+release/
 *.spec
 .wdm/
+.DS_Store
