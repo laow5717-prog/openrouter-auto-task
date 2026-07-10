@@ -328,7 +328,7 @@ def create_app(db_path=None):
     # 首页
     @app.route('/')
     def index():
-        return send_from_directory('static', 'index.html')
+        return send_from_directory(static_dir, 'index.html')
 
     # MJPEG 流
     @app.route('/video_feed')
