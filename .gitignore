@@ -13,3 +13,7 @@ release/
 *.spec
 .wdm/
 .DS_Store
+data/cloudflare_auto.db
+data/uploads/
+registered_accounts.txt.migrated
+*.xlsx
