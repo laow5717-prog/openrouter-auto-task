@@ -357,39 +357,63 @@ def _click_turnstile_via_cdp(driver):
     node_id = iframe_node.get('nodeId')
     backend_node_id = iframe_node.get('backendNodeId')
 
-    # 获取 iframe 元素在页面中的位置
+    # 获取 iframe 元素在视口中的位置
     try:
-        box_model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
-        content = box_model['model']['content']
-        # content 是 [x1,y1, x2,y2, x3,y3, x4,y4] 四个角的坐标
-        x = (content[0] + content[2]) / 2  # 中心 x — 但 checkbox 在左侧
-        y = (content[1] + content[5]) / 2  # 中心 y
-        # checkbox 在 iframe 左侧约 30px 处
-        click_x = content[0] + 30
-        click_y = (content[1] + content[5]) / 2
+        # 优先使用 getContentQuads 获取视口坐标
+        try:
+            quads = driver.execute_cdp_cmd('DOM.getContentQuads', {'backendNodeId': backend_node_id})
+            quad = quads['quads'][0]
+            click_x = quad[0] + 30
+            click_y = (quad[1] + quad[5]) / 2
+        except Exception:
+            box_model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
+            content = box_model['model']['content']
+            click_x = content[0] + 30
+            click_y = (content[1] + content[5]) / 2
 
-        print(f"    → CDP: 找到 Turnstile iframe, 点击坐标 ({click_x:.0f}, {click_y:.0f})")
-
-        # 使用 CDP Input 事件模拟点击
-        driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-            'type': 'mousePressed',
-            'x': click_x,
-            'y': click_y,
-            'button': 'left',
-            'clickCount': 1,
-        })
-        driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-            'type': 'mouseReleased',
-            'x': click_x,
-            'y': click_y,
-            'button': 'left',
-            'clickCount': 1,
-        })
+        print(f"    → CDP: 找到 Turnstile iframe, 点击视口坐标 ({click_x:.0f}, {click_y:.0f})")
+        _cdp_click_at(driver, click_x, click_y)
         print("    ✅ CDP: 已模拟点击 Turnstile checkbox")
         return True
     except Exception as e:
         print(f"    ⚠️ CDP 点击失败: {e}")
         return False
+
+
+def _cdp_click_at(driver, x, y):
+    """使用 CDP 在指定视口坐标处模拟完整的鼠标点击（mouseMoved + mousePressed + mouseReleased）"""
+    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+        'type': 'mouseMoved',
+        'x': x,
+        'y': y,
+    })
+    time.sleep(0.1)
+    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+        'type': 'mousePressed',
+        'x': x,
+        'y': y,
+        'button': 'left',
+        'clickCount': 1,
+    })
+    time.sleep(0.05)
+    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+        'type': 'mouseReleased',
+        'x': x,
+        'y': y,
+        'button': 'left',
+        'clickCount': 1,
+    })
+
+
+def _get_viewport_coords(driver, element):
+    """
+    获取元素相对于视口的坐标（而非页面坐标）。
+    CDP Input.dispatchMouseEvent 需要视口坐标。
+    """
+    return driver.execute_script("""
+        var rect = arguments[0].getBoundingClientRect();
+        return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+    """, element)
 
 
 def _click_hcaptcha_via_cdp(driver):
@@ -406,31 +430,54 @@ def _click_hcaptcha_via_cdp(driver):
             'iframe[data-hcaptcha-widget-id], '
             'iframe[src*="hcaptcha.com"]'
         )
+
+        # 过滤出 checkbox iframe（尺寸较小，通常宽度 < 400px）
+        checkbox_iframe = None
         for iframe in hcaptcha_iframes:
             if not iframe.is_displayed():
                 continue
-            rect = iframe.rect
+            size = iframe.size
+            # hCaptcha checkbox iframe 通常尺寸约 302x78 或类似
+            # 图片挑战 iframe 尺寸较大 (>400px)
+            if size.get('width', 0) < 400:
+                checkbox_iframe = iframe
+                break
+            elif not checkbox_iframe:
+                checkbox_iframe = iframe  # 兜底取第一个可见的
+
+        if checkbox_iframe:
+            # 先滚动到 iframe 可见
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox_iframe)
+            time.sleep(0.5)
+
+            # 使用 getBoundingClientRect 获取视口坐标（非页面坐标）
+            viewport_rect = _get_viewport_coords(driver, checkbox_iframe)
             # hCaptcha checkbox 在 iframe 左侧约 30px，垂直居中
-            click_x = rect['x'] + 30
-            click_y = rect['y'] + rect['height'] / 2
+            click_x = viewport_rect['x'] + 30
+            click_y = viewport_rect['y'] + viewport_rect['height'] / 2
 
-            print(f"    → CDP: 找到 hCaptcha iframe, 点击坐标 ({click_x:.0f}, {click_y:.0f})")
+            print(f"    → CDP: 找到 hCaptcha iframe ({viewport_rect['width']:.0f}x{viewport_rect['height']:.0f}), "
+                  f"点击视口坐标 ({click_x:.0f}, {click_y:.0f})")
 
-            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                'type': 'mousePressed',
-                'x': click_x,
-                'y': click_y,
-                'button': 'left',
-                'clickCount': 1,
-            })
-            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                'type': 'mouseReleased',
-                'x': click_x,
-                'y': click_y,
-                'button': 'left',
-                'clickCount': 1,
-            })
+            _cdp_click_at(driver, click_x, click_y)
             print("    ✅ CDP: 已模拟点击 hCaptcha checkbox")
+
+            # 等待短暂时间后检查是否需要重试
+            time.sleep(2)
+            # 检查 checkbox 是否被选中（aria-checked 变化或 iframe 尺寸变化）
+            try:
+                new_rect = _get_viewport_coords(driver, checkbox_iframe)
+                # 如果 iframe 尺寸没有变化，可能点击未生效，尝试微调坐标重试
+                if abs(new_rect['width'] - viewport_rect['width']) < 5:
+                    print("    → 重试: 微调坐标再次点击...")
+                    # 尝试偏移一些坐标
+                    click_x2 = viewport_rect['x'] + 25
+                    click_y2 = viewport_rect['y'] + viewport_rect['height'] / 2 - 2
+                    _cdp_click_at(driver, click_x2, click_y2)
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
             return True
 
         # 方法2: CDP DOM 遍历查找（包括 shadow DOM）
@@ -459,27 +506,22 @@ def _click_hcaptcha_via_cdp(driver):
         iframe_node = find_hcaptcha_iframe(root)
         if iframe_node:
             backend_node_id = iframe_node.get('backendNodeId')
-            box_model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
-            content = box_model['model']['content']
-            click_x = content[0] + 30
-            click_y = (content[1] + content[5]) / 2
+            # 使用 DOM.getContentQuads 获取视口坐标（比 getBoxModel 更准确）
+            try:
+                quads = driver.execute_cdp_cmd('DOM.getContentQuads', {'backendNodeId': backend_node_id})
+                quad = quads['quads'][0]
+                # quad 是 [x1,y1, x2,y2, x3,y3, x4,y4] 四个角的视口坐标
+                click_x = quad[0] + 30
+                click_y = (quad[1] + quad[5]) / 2
+            except Exception:
+                # 回退到 getBoxModel
+                box_model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
+                content = box_model['model']['content']
+                click_x = content[0] + 30
+                click_y = (content[1] + content[5]) / 2
 
-            print(f"    → CDP(DOM): 找到 hCaptcha iframe, 点击坐标 ({click_x:.0f}, {click_y:.0f})")
-
-            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                'type': 'mousePressed',
-                'x': click_x,
-                'y': click_y,
-                'button': 'left',
-                'clickCount': 1,
-            })
-            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                'type': 'mouseReleased',
-                'x': click_x,
-                'y': click_y,
-                'button': 'left',
-                'clickCount': 1,
-            })
+            print(f"    → CDP(DOM): 找到 hCaptcha iframe, 点击视口坐标 ({click_x:.0f}, {click_y:.0f})")
+            _cdp_click_at(driver, click_x, click_y)
             print("    ✅ CDP(DOM): 已模拟点击 hCaptcha checkbox")
             return True
 
@@ -548,14 +590,19 @@ def _handle_inline_turnstile(driver, max_wait=120):
     # 尝试自动点击
     print("  🤖 尝试自动点击验证框...")
     _try_click_turnstile(driver)
-    time.sleep(5)
 
-    # 检查是否已通过
-    if _is_turnstile_solved(driver):
-        print("  ✅ 人机验证已自动通过！")
-        return True
+    # CDP 点击后需要等待 Turnstile 后台验证完成（通常 5~20 秒）
+    # 不能过早进入 2Captcha，否则会干扰正在进行的验证导致组件刷新
+    print("  ⏳ 等待 Turnstile 后台验证...")
+    for i in range(10):
+        time.sleep(3)
+        if _is_turnstile_solved(driver):
+            print("  ✅ 人机验证已自动通过！")
+            return True
+        if i == 3:
+            print("  ⏳ 仍在等待验证结果...")
 
-    # 使用 2Captcha 自动解决
+    # CDP 点击未能通过，尝试 2Captcha
     if captcha_solver.is_available():
         print("  🤖 尝试使用 2Captcha 解决内嵌 Turnstile...")
         if captcha_solver.solve_turnstile(driver):
@@ -1475,51 +1522,32 @@ def add_credit_card(driver, card_info):
         submitted = False
 
         # 精确匹配弹窗中的 "Add payment method" 按钮
-        try:
-            submit_btn = driver.execute_script("""
-                var dialog = document.querySelector('[role="dialog"]');
-                if (!dialog) return null;
-                var buttons = dialog.querySelectorAll('button[data-kumo-component="Button"]');
-                for (var i = 0; i < buttons.length; i++) {
-                    var text = buttons[i].textContent.trim();
-                    if (text === 'Add payment method') {
-                        return buttons[i];
-                    }
-                }
-                return null;
-            """)
-            if submit_btn and submit_btn.is_displayed():
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", submit_btn)
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", submit_btn)
-                print("  🔘 已点击 'Add payment method' 按钮")
-                submitted = True
-        except Exception as e:
-            print(f"  ⚠️ JS 点击提交按钮失败: {e}")
+        submit_btn = _find_payment_submit_button(driver)
 
-        # 回退方式
-        if not submitted:
-            submit_xpaths = [
-                '//div[@role="dialog"]//button[contains(., "Add payment method")]',
-                '//div[@role="dialog"]//button[contains(., "Add")]',
-                '//button[contains(., "Add payment method")]',
-            ]
-            for xpath in submit_xpaths:
-                try:
-                    btns = driver.find_elements(By.XPATH, xpath)
-                    for btn in btns:
-                        if btn.is_displayed() and 'Cancel' not in btn.text:
-                            driver.execute_script("arguments[0].click();", btn)
-                            print(f"  🔘 已点击提交按钮: {btn.text.strip()}")
-                            submitted = True
-                            break
-                except Exception:
-                    continue
-                if submitted:
-                    break
-
-        if not submitted:
+        if not submit_btn:
             print("  ❌ 未找到提交按钮")
+            return False
+
+        # 先滚动到按钮可见
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", submit_btn)
+        time.sleep(0.5)
+
+        # 优先使用原生 Selenium 点击（更好地触发 React/Stripe 事件）
+        try:
+            submit_btn.click()
+            print("  🔘 已点击 'Add payment method' 按钮 (原生点击)")
+            submitted = True
+        except Exception as e1:
+            print(f"  ⚠️ 原生点击失败: {e1}, 尝试 JS 点击...")
+            try:
+                driver.execute_script("arguments[0].click();", submit_btn)
+                print("  🔘 已点击 'Add payment method' 按钮 (JS 点击)")
+                submitted = True
+            except Exception as e2:
+                print(f"  ⚠️ JS 点击也失败: {e2}")
+
+        if not submitted:
+            print("  ❌ 点击提交按钮失败")
             return False
 
         # 7. 等待提交结果（含人机验证检测）
@@ -1532,6 +1560,45 @@ def add_credit_card(driver, card_info):
         except Exception:
             pass
         return False
+
+
+def _find_payment_submit_button(driver):
+    """在弹窗中查找 'Add payment method' 提交按钮"""
+    # 方法1: 精确匹配 data-kumo-component 按钮
+    try:
+        submit_btn = driver.execute_script("""
+            var dialog = document.querySelector('[role="dialog"]');
+            if (!dialog) return null;
+            var buttons = dialog.querySelectorAll('button[data-kumo-component="Button"]');
+            for (var i = 0; i < buttons.length; i++) {
+                var text = buttons[i].textContent.trim();
+                if (text === 'Add payment method') {
+                    return buttons[i];
+                }
+            }
+            return null;
+        """)
+        if submit_btn and submit_btn.is_displayed():
+            return submit_btn
+    except Exception:
+        pass
+
+    # 方法2: XPath 回退
+    submit_xpaths = [
+        '//div[@role="dialog"]//button[contains(., "Add payment method")]',
+        '//div[@role="dialog"]//button[contains(., "Add")]',
+        '//button[contains(., "Add payment method")]',
+    ]
+    for xpath in submit_xpaths:
+        try:
+            btns = driver.find_elements(By.XPATH, xpath)
+            for btn in btns:
+                if btn.is_displayed() and 'Cancel' not in btn.text:
+                    return btn
+        except Exception:
+            continue
+
+    return None
 
 
 def _wait_for_payment_submit_result(driver, max_wait=180):
@@ -1551,8 +1618,39 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         bool: 是否成功添加
     """
     print("⏳ 等待提交结果...")
-    time.sleep(15)
-    print("  ⏳ 数据传输完成，开始检测结果...")
+    time.sleep(5)
+
+    # 提交后短暂等待，检查按钮是否仍然可点击（说明第一次点击可能未生效）
+    retry_clicked = False
+    try:
+        retry_btn = _find_payment_submit_button(driver)
+        if retry_btn and retry_btn.is_displayed() and retry_btn.is_enabled():
+            # 检查按钮是否处于 loading 状态
+            btn_classes = retry_btn.get_attribute('class') or ''
+            btn_disabled = retry_btn.get_attribute('disabled')
+            aria_busy = retry_btn.get_attribute('aria-busy')
+            if not btn_disabled and 'loading' not in btn_classes.lower() and aria_busy != 'true':
+                print("  ⚠️ 提交按钮仍然可用，第一次点击可能未生效，重试点击...")
+                time.sleep(1)
+                try:
+                    retry_btn.click()
+                    print("  🔘 已重试点击提交按钮 (原生点击)")
+                    retry_clicked = True
+                except Exception:
+                    try:
+                        driver.execute_script("arguments[0].click();", retry_btn)
+                        print("  🔘 已重试点击提交按钮 (JS 点击)")
+                        retry_clicked = True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if not retry_clicked:
+        print("  ⏳ 提交按钮已进入处理状态，等待结果...")
+
+    time.sleep(10)
+    print("  ⏳ 开始检测结果...")
 
     user_notified_captcha = False
     start = time.time()
@@ -1795,17 +1893,55 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
             for dialog in dialogs:
                 if not dialog.is_displayed():
                     continue
-                dialog_text = dialog.text.lower()
-                error_keywords = ['error', 'declined', 'invalid', 'failed', 'unable', 'unsuccessful']
-                for kw in error_keywords:
+                dialog_text = dialog.text
+
+                # 中文错误信息检测（原文匹配，不转小写）
+                cn_error_keywords = [
+                    '安全码错误', '卡号错误', '卡号无效', '银行卡被拒',
+                    '交易被拒绝', '卡片被拒绝', '信用卡被拒', '付款失败',
+                    '验证失败', '无法处理', '请检查您的', '卡已过期',
+                    '资金不足', '卡号不正确', '有效期错误', '信息不正确',
+                ]
+                for kw in cn_error_keywords:
                     if kw in dialog_text:
-                        print(f"  ❌ 添加失败: 检测到错误关键词 '{kw}'")
+                        print(f"  ❌ 添加失败: {kw}")
                         _close_payment_dialog(driver)
                         return False
+
+                # 英文错误信息检测
+                dialog_text_lower = dialog_text.lower()
+                en_error_keywords = [
+                    'security code is incorrect', 'card was declined',
+                    'card number is invalid', 'card has expired',
+                    'insufficient funds', 'transaction declined',
+                    'payment failed', 'unable to process',
+                    'incorrect cvc', 'incorrect security code',
+                    'error', 'declined', 'invalid', 'failed',
+                    'unable', 'unsuccessful',
+                ]
+                for kw in en_error_keywords:
+                    if kw in dialog_text_lower:
+                        print(f"  ❌ 添加失败: 检测到错误 '{kw}'")
+                        _close_payment_dialog(driver)
+                        return False
+
+                # 通用错误样式检测（弹窗内的 alert/error 元素）
+                try:
+                    error_els = dialog.find_elements(By.CSS_SELECTOR,
+                        '[role="alert"], .error, .Error, [data-error], '
+                        '.field-error, .form-error, .validation-error, '
+                        '[class*="error" i], [class*="Error"]')
+                    for err_el in error_els:
+                        if err_el.is_displayed() and err_el.text.strip():
+                            print(f"  ❌ 添加失败: 表单错误 - {err_el.text.strip()[:100]}")
+                            _close_payment_dialog(driver)
+                            return False
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # 检查4: Stripe 表单验证错误
+        # 检查4: Stripe 表单验证错误（在 iframe 内）
         try:
             stripe_errors = driver.find_elements(By.CSS_SELECTOR, '.StripeElement--invalid')
             visible_errors = [e for e in stripe_errors if e.is_displayed()]
