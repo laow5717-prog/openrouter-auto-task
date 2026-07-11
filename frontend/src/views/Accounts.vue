@@ -16,6 +16,9 @@
         <option value="">全部状态</option>
         <option value="registered">已注册</option>
         <option value="bound">已绑卡</option>
+        <option value="billing_page">账单页面</option>
+        <option value="interrupted">已中断</option>
+        <option value="all_bindings_failed">绑卡全部失败</option>
         <option value="failed">失败</option>
         <option value="error">错误</option>
       </select>
@@ -146,13 +149,20 @@ const statusMap = {
   bound: '已绑卡',
   failed: '失败',
   error: '错误',
+  interrupted: '已中断',
+  billing_page: '账单页面',
+  all_bindings_failed: '绑卡全部失败',
 }
 function accStatusLabel(s) {
-  return statusMap[s] || s
+  if (statusMap[s]) return statusMap[s]
+  const m = s.match(/^bound_(\d+)_cards$/)
+  if (m) return `已绑${m[1]}张卡`
+  return s
 }
 function accStatusClass(s) {
-  if (s.includes('bound') || s.includes('registered')) return 'success'
-  if (s.includes('failed') || s.includes('error')) return 'fail'
+  if (s.includes('bound') || s === 'registered') return 'success'
+  if (s.includes('failed') || s === 'error') return 'fail'
+  if (s === 'interrupted' || s === 'billing_page') return 'warn'
   return ''
 }
 
