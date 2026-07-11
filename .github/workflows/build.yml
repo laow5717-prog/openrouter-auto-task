@@ -32,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install flask pyyaml requests selenium selenium-stealth waitress webdriver-manager faker pyinstaller
+          pip install . pyinstaller
 
       - name: Build with PyInstaller
         run: python build.py
