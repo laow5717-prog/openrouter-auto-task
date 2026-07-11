@@ -12,7 +12,7 @@ from datetime import datetime
 
 from flask import Flask, send_from_directory, Response
 
-from src.config import cfg, get_base_dir
+from src.config import cfg, get_base_dir, get_data_dir
 from src.models.database import Database
 from src.models.account import AccountModel
 from src.models.task import TaskModel
@@ -369,9 +369,9 @@ def create_app(db_path=None):
 
     app = Flask(__name__, static_url_path='', static_folder=static_dir)
 
-    # 初始化数据库
+    # 初始化数据库（路径独立于程序目录，升级版本不丢数据）
     if db_path is None:
-        db_path = str(base_dir / cfg.database.path)
+        db_path = str(get_data_dir() / "cloudflare_auto.db")
     db = Database(db_path)
 
     # 创建模型

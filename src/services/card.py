@@ -8,6 +8,8 @@ import sys
 from datetime import datetime
 from openpyxl import Workbook, load_workbook
 
+from src.config import get_data_dir
+
 TEMPLATE_COLUMNS = [
     "card_number", "expiry_month", "expiry_year", "cvc",
     "first_name", "last_name", "country", "address",
@@ -32,7 +34,7 @@ def get_base_dir():
 
 def generate_template(save_path=None):
     if save_path is None:
-        save_path = os.path.join(get_base_dir(), "credit_cards_template.xlsx")
+        save_path = str(get_data_dir() / "credit_cards_template.xlsx")
 
     wb = Workbook()
     ws = wb.active
@@ -127,9 +129,7 @@ def export_report(records, save_path=None):
     """导出绑卡报告 Excel"""
     if save_path is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_path = os.path.join(get_base_dir(), "data", f"bind_report_{timestamp}.xlsx")
-
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_path = str(get_data_dir() / f"bind_report_{timestamp}.xlsx")
 
     wb = Workbook()
     ws = wb.active

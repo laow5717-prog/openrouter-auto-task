@@ -8,7 +8,7 @@ import io
 import json
 from flask import Blueprint, jsonify, request, send_from_directory, send_file
 
-from src.config import cfg
+from src.config import cfg, get_data_dir
 from src.services import card as card_service
 
 api = Blueprint('api', __name__)
@@ -97,8 +97,7 @@ def upload_card_excel():
     if not file.filename.endswith(('.xlsx', '.xls')):
         return jsonify({"error": "Only .xlsx/.xls files are supported"}), 400
 
-    base_dir = str(card_service.get_base_dir())
-    upload_dir = os.path.join(base_dir, "data", "uploads")
+    upload_dir = str(get_data_dir() / "uploads")
     os.makedirs(upload_dir, exist_ok=True)
     save_path = os.path.join(upload_dir, "uploaded_cards.xlsx")
     file.save(save_path)
@@ -122,8 +121,7 @@ def upload_card_excel():
 def check_unfinished_cards():
     """检测是否有上次未完成的卡"""
     models = get_models()
-    base_dir = str(card_service.get_base_dir())
-    upload_path = os.path.join(base_dir, "data", "uploads", "uploaded_cards.xlsx")
+    upload_path = str(get_data_dir() / "uploads" / "uploaded_cards.xlsx")
     if not os.path.exists(upload_path):
         return jsonify({"has_unfinished": False, "remaining": 0, "total": 0})
 
@@ -154,8 +152,7 @@ def start_card_driven_task():
     max_bindable_cards = data.get('max_bindable_cards', 2)
     captcha_api_key = data.get('captcha_api_key', None)
 
-    base_dir = str(card_service.get_base_dir())
-    upload_path = os.path.join(base_dir, "data", "uploads", "uploaded_cards.xlsx")
+    upload_path = str(get_data_dir() / "uploads" / "uploaded_cards.xlsx")
     if not os.path.exists(upload_path):
         return jsonify({"error": "Please upload credit card Excel file first"}), 400
 

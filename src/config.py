@@ -116,6 +116,19 @@ def get_base_dir():
     return Path(__file__).parent.parent
 
 
+def get_data_dir() -> Path:
+    """获取数据目录。
+    打包后使用用户家目录下的固定路径，升级程序不会丢失数据；
+    开发时使用项目根目录下的 data/ 目录。
+    """
+    if getattr(sys, 'frozen', False):
+        data_dir = Path.home() / ".cloudflare-auto-task"
+    else:
+        data_dir = get_base_dir() / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
 class ConfigLoader:
     CONFIG_FILES = [
         "config.yaml",
