@@ -144,12 +144,26 @@ class ConfigLoader:
         self._load_config()
 
     def _find_config_file(self) -> Optional[Path]:
-        base_dir = get_base_dir()
-        for filename in self.CONFIG_FILES:
-            config_file = base_dir / filename
-            if config_file.exists():
-                return config_file
-        return None
+        if getattr(sys, 'frozen', False):
+            # 打包模式：config 与数据库放在同一目录，升级不丢配置
+            data_dir = get_data_dir()
+            config_file = data_dir / "config.yaml"
+            if not config_file.exists():
+                # 首次运行：从程序目录的模板自动复制
+                example = get_base_dir() / "config.example.yaml"
+                if example.exists():
+                    import shutil
+                    shutil.copy2(example, config_file)
+                    print(f"已创建配置文件: {config_file}")
+                    print("请编辑配置文件后重新启动程序")
+            return config_file if config_file.exists() else None
+        else:
+            base_dir = get_base_dir()
+            for filename in self.CONFIG_FILES:
+                config_file = base_dir / filename
+                if config_file.exists():
+                    return config_file
+            return None
 
     def _load_config(self) -> None:
         if self.config_path:

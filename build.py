@@ -141,10 +141,6 @@ if [ ! -d "/Applications/Google Chrome.app" ]; then
     exit 1
 fi
 
-if [ ! -f "config.yaml" ]; then
-    cp config.example.yaml config.yaml 2>/dev/null
-fi
-
 echo "============================================"
 echo "   Cloudflare Auto Task"
 echo "   正在启动..."
@@ -152,6 +148,7 @@ echo ""
 echo "   浏览器将自动打开控制台"
 echo "   如未打开请访问: http://localhost:5000"
 echo ""
+echo "   配置文件位置: ~/.cloudflare-auto-task/config.yaml"
 echo "   关闭此窗口即可停止程序"
 echo "============================================"
 
@@ -170,10 +167,6 @@ chcp 65001 >nul 2>&1
 title Cloudflare Auto Task
 cd /d "%~dp0"
 
-if not exist "config.yaml" (
-    if exist "config.example.yaml" copy /y config.example.yaml config.yaml >nul
-)
-
 echo ============================================
 echo    Cloudflare Auto Task
 echo    正在启动...
@@ -181,6 +174,7 @@ echo.
 echo    浏览器将自动打开控制台
 echo    如未打开请访问: http://localhost:5000
 echo.
+echo    配置文件位置: %USERPROFILE%\\.cloudflare-auto-task\\config.yaml
 echo    关闭此窗口即可停止程序
 echo ============================================
 
