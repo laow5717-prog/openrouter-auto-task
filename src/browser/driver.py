@@ -1,20 +1,17 @@
 """
 浏览器自动化模块
-使用 Selenium + selenium-stealth 实现 Cloudflare 注册、
+使用 undetected-chromedriver 实现 Cloudflare 注册、
 账单页面导航及信用卡添加流程
 """
 
 import os
 import time
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium_stealth import stealth
 
 from src.config import cfg
 import src.services.captcha as captcha_solver
@@ -44,24 +41,9 @@ ERROR_PAGE_MAX_RETRIES = cfg.retry.error_page_max_retries
 BUTTON_CLICK_MAX_RETRIES = cfg.retry.button_click_max_retries
 
 
-def _get_matching_chromedriver():
-    """
-    通过 webdriver-manager 获取与当前 Chrome 匹配的 chromedriver 路径
-    自动下载正确版本，避免系统中旧版 chromedriver 导致的兼容性问题
-    """
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        path = ChromeDriverManager().install()
-        print(f"  📦 chromedriver: {path}")
-        return path
-    except Exception as e:
-        print(f"  ⚠️ 自动获取 chromedriver 失败: {e}")
-    return None
-
-
 def create_driver(headless=False):
     """
-    创建带有反检测的 Chrome 浏览器驱动
+    创建带有反检测的 Chrome 浏览器驱动（使用 undetected-chromedriver）
 
     参数:
         headless: 是否使用无头模式
@@ -69,7 +51,8 @@ def create_driver(headless=False):
         浏览器驱动实例
     """
     print(f"🌐 正在初始化浏览器 (Headless: {headless})...")
-    options = Options()
+
+    options = uc.ChromeOptions()
 
     if headless:
         print("  👻 使用伪无头模式 (Off-screen)...")
@@ -78,39 +61,12 @@ def create_driver(headless=False):
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--disable-popup-blocking")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
 
-    # 使用 Selenium Manager 下载与当前 Chrome 匹配的 chromedriver
-    chromedriver_path = _get_matching_chromedriver()
-    service = Service(executable_path=chromedriver_path) if chromedriver_path else Service()
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = uc.Chrome(options=options, use_subprocess=True)
     driver.set_window_size(1280, 900)
 
-    # 应用 selenium-stealth 反检测
-    _apply_stealth(driver)
-
-    print("✅ 浏览器初始化成功")
+    print("✅ 浏览器初始化成功 (undetected-chromedriver)")
     return driver
-
-
-def _apply_stealth(driver):
-    """应用 selenium-stealth 反检测"""
-    print("🎭 应用反检测伪装...")
-    try:
-        stealth(
-            driver,
-            languages=["en-US", "en"],
-            vendor="Google Inc.",
-            platform="Win32",
-            webgl_vendor="Intel Inc.",
-            renderer="Intel Iris OpenGL Engine",
-            fix_hairline=True,
-        )
-    except Exception as e:
-        print(f"  ⚠️ stealth 应用失败: {e}")
 
 
 def type_slowly(element, text, delay=0.05):

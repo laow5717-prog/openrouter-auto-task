@@ -12,7 +12,6 @@ dependencies = [
     "pyyaml>=6.0.3",
     "requests>=2.32.5",
     "selenium>=4.39.0",
-    "selenium-stealth>=1.0.6",
+    "undetected-chromedriver>=3.5.5",
     "waitress>=3.0.2",
-    "webdriver-manager>=4.1.2",
 ]

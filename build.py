@@ -58,8 +58,7 @@ def build():
         '--add-data', f'config.example.yaml{sep}.',
         # 隐式导入
         '--collect-submodules', 'src',
-        '--hidden-import', 'selenium_stealth',
-        '--hidden-import', 'webdriver_manager',
+        '--hidden-import', 'undetected_chromedriver',
         '--hidden-import', 'selenium.webdriver',
         '--hidden-import', 'selenium.webdriver.chrome',
         '--hidden-import', 'selenium.webdriver.chrome.webdriver',
@@ -77,8 +76,7 @@ def build():
         '--hidden-import', 'selenium.webdriver.remote.webdriver',
         '--hidden-import', 'selenium.webdriver.remote.webelement',
         '--collect-submodules', 'selenium',
-        '--collect-submodules', 'selenium_stealth',
-        '--collect-submodules', 'webdriver_manager',
+        '--collect-submodules', 'undetected_chromedriver',
         # 不确认覆盖
         '--noconfirm',
         # 入口
