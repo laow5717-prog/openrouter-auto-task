@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 8
+- **Total Sessions**: 9
 - **Last Active**: 2026-07-11
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~275 | Active |
+| `journal-1.md` | ~309 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-07-11 | 浏览器后台运行与绑卡过滤优化 | `ac95695`, `f0d64ec` | `main` |
 | 8 | 2026-07-11 | 清理绑卡历史脏数据并添加自动/手动清理机制 | `6cb0dfa` | `main` |
 | 7 | 2026-07-11 | 修复billing address误报和提交按钮重试 | `a63f424` | `main` |
 | 6 | 2026-07-11 | Stripe支付错误检测改进 | `8dec5a9` | `main` |

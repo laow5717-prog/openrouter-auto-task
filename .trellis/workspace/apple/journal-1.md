@@ -273,3 +273,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: 浏览器后台运行与绑卡过滤优化
+
+**Date**: 2026-07-11
+**Task**: 浏览器后台运行与绑卡过滤优化
+**Branch**: `main`
+
+### Summary
+
+1. 浏览器启动改为最小化模式（minimize_window），不抢占用户焦点，需干预时点 Dock 图标还原。2. CardBindingModel 新增 get_stripe_field_error_card_numbers 方法，重启任务时过滤曾因 Stripe 字段错误失败的卡，避免无效重试。3. captcha.py：hCaptcha 调用支持 rqdata 参数，Turnstile sitekey 提取增加 iframe URL 回退策略。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ac95695` | (see git log) |
+| `f0d64ec` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
