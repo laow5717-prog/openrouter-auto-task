@@ -141,3 +141,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 实时画面优化
+
+**Date**: 2026-07-11
+**Task**: 实时画面优化
+**Branch**: `main`
+
+### Summary
+
+添加后台持续截图线程(300ms间隔)替代仅步骤切换时截图，MJPEG帧发送间隔从500ms降至150ms，大幅提升Dashboard实时画面刷新率
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `91e609d` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
