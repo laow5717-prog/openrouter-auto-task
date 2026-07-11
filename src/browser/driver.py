@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 import time
 import random
 import logging
@@ -108,6 +109,41 @@ def create_driver(headless=False):
 
     # 记录临时目录，关闭时清理
     driver._cf_temp_profile = user_data_dir
+
+    # 注入控制台拦截器（在所有页面 JS 执行之前生效）
+    # 用于捕获 Cloudflare/Stripe 的错误日志
+    try:
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            'source': '''
+                window.__cfAutoErrors = [];
+                (function() {
+                    var methods = ['log', 'error', 'warn'];
+                    methods.forEach(function(method) {
+                        var orig = console[method].bind(console);
+                        console[method] = function() {
+                            var msg = '';
+                            try {
+                                msg = Array.from(arguments).map(function(a) {
+                                    return typeof a === 'string' ? a : String(a);
+                                }).join(' ');
+                            } catch(e) {}
+                            if (/setup.intent.error/i.test(msg) ||
+                                /form.error.handler/i.test(msg) ||
+                                /payment.intent.failed/i.test(msg) ||
+                                /failed.to.save.payment/i.test(msg) ||
+                                /card.*(incorrect|invalid|declined|expired|failed)/i.test(msg) ||
+                                /security.code.*(incorrect|invalid)/i.test(msg) ||
+                                /cvc.*(incorrect|invalid|incomplete)/i.test(msg)) {
+                                window.__cfAutoErrors.push(msg.substring(0, 300));
+                            }
+                            orig.apply(null, arguments);
+                        };
+                    });
+                })();
+            '''
+        })
+    except Exception:
+        pass
 
     print("✅ 浏览器初始化成功 (undetected-chromedriver)")
     return driver
@@ -1534,7 +1570,13 @@ def add_credit_card(driver, card_info):
 
         time.sleep(1)
 
-        # 6. 点击 "Add payment method" 提交按钮
+        # 6. 清空旧错误日志（确保只检测本次提交产生的错误）
+        try:
+            driver.execute_script("window.__cfAutoErrors = [];")
+        except Exception:
+            pass
+
+        # 7. 点击 "Add payment method" 提交按钮
         print("🔘 查找提交按钮...")
         submitted = False
 
@@ -1567,7 +1609,7 @@ def add_credit_card(driver, card_info):
             print("  ❌ 点击提交按钮失败")
             return False
 
-        # 7. 等待提交结果（含人机验证检测）
+        # 8. 等待提交结果（含人机验证检测）
         return _wait_for_payment_submit_result(driver)
 
     except Exception as e:
@@ -1759,15 +1801,102 @@ def _is_dialog_turnstile_solved(driver):
     return False
 
 
+def _check_browser_console_for_errors(driver):
+    """
+    从拦截的控制台日志中检测 Stripe/支付错误
+    通过 Page.addScriptToEvaluateOnNewDocument 在页面 JS 执行前注入拦截器，
+    捕获 Cloudflare 输出的如:
+      ⛔️ Setup intent error: Your card's CVC is incorrect.
+      ⚠️ Form error handler [There was an error processing your card...]
+    """
+    try:
+        errors = driver.execute_script("return window.__cfAutoErrors || [];")
+        if not errors:
+            return None
+        for err in errors:
+            if not isinstance(err, str) or len(err) <= 3:
+                continue
+            # 尝试提取具体错误描述
+            m = re.search(r'Setup intent error[:\s]+(.+)', err, re.IGNORECASE)
+            if m:
+                detail = m.group(1).strip().rstrip('.')
+                print(f"  [控制台拦截] {detail[:100]}")
+                return detail[:200]
+            m = re.search(r'Form error handler\s*\[(.+?)\]', err, re.IGNORECASE)
+            if m:
+                detail = m.group(1).strip()
+                print(f"  [控制台拦截] {detail[:100]}")
+                return detail[:200]
+            # 其他错误直接返回原始消息
+            print(f"  [控制台拦截] {err[:100]}")
+            return err[:200]
+    except Exception:
+        pass
+    return None
+
+    return None
+
+
 def _check_stripe_iframe_errors(driver):
     """
     检查 Stripe iframe 内的表单字段错误
     Stripe 错误元素格式: <p id="Field-cvcError" class="p-FieldError Error" role="alert">...</p>
-
-    使用 CDP DOM 穿透（pierce: True）直接遍历跨域 iframe 内容，
-    比 Selenium switch_to.frame() 更可靠
+    返回错误文本或 None
     """
-    # 方法1: CDP DOM 穿透（推荐，对跨域 iframe 最可靠）
+    # 方法1: 从浏览器控制台日志中读取错误（最可靠）
+    # Chrome 原生日志 API，不受 JS 引用缓存影响
+    console_err = _check_browser_console_for_errors(driver)
+    if console_err:
+        return console_err
+
+    # 方法2: CDP - 在每个 iframe 的独立执行上下文中查询 DOM
+    try:
+        frame_tree = driver.execute_cdp_cmd('Page.getFrameTree', {})
+        all_frames = _collect_all_child_frames(frame_tree.get('frameTree', {}))
+
+        for frame_info in all_frames:
+            try:
+                world = driver.execute_cdp_cmd('Page.createIsolatedWorld', {
+                    'frameId': frame_info['id'],
+                    'worldName': 'err_chk_' + str(int(time.time() * 1000)),
+                    'grantUniversalAccess': True,
+                })
+                ctx_id = world.get('executionContextId')
+                if not ctx_id:
+                    continue
+
+                result = driver.execute_cdp_cmd('Runtime.evaluate', {
+                    'expression': '''
+                        (function() {
+                            var sels = [
+                                '.p-FieldError',
+                                '[role="alert"]',
+                                '.Error[id*="Error"]',
+                                '[id*="Error"][role="alert"]'
+                            ];
+                            for (var s = 0; s < sels.length; s++) {
+                                var els = document.querySelectorAll(sels[s]);
+                                for (var i = 0; i < els.length; i++) {
+                                    var t = (els[i].textContent || '').trim();
+                                    if (t && t.length > 3) return t;
+                                }
+                            }
+                            return null;
+                        })()
+                    ''',
+                    'returnByValue': True,
+                    'contextId': ctx_id,
+                })
+                val = result.get('result', {}).get('value')
+                if val:
+                    print(f"  [CDP isolated world] 在 frame {frame_info.get('url', '?')[:50]} 中发现错误")
+                    return val[:200]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 方法3: CDP DOM 穿透遍历
     try:
         doc = driver.execute_cdp_cmd('DOM.getDocument', {'depth': -1, 'pierce': True})
         error_text = _find_stripe_field_errors_in_dom(doc['root'])
@@ -1776,41 +1905,38 @@ def _check_stripe_iframe_errors(driver):
     except Exception:
         pass
 
-    # 方法2: Selenium frame 切换（兜底）
+    # 方法4: Selenium frame 切换（最后兜底）
     try:
         driver.switch_to.default_content()
-        target_iframes = driver.find_elements(By.CSS_SELECTOR,
-            '[data-test-id="credit-card-form"] iframe')
-        if not target_iframes:
-            all_dialog_iframes = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"] iframe')
-            for iframe in all_dialog_iframes:
-                try:
-                    if not iframe.is_displayed():
-                        continue
-                    name = iframe.get_attribute('name') or ''
-                    src = (iframe.get_attribute('src') or '').lower()
-                    title = (iframe.get_attribute('title') or '').lower()
-                    if ('payment input' in title or
-                        (name.startswith('__privateStripeFrame') and 'express' not in src)):
-                        target_iframes.append(iframe)
-                except Exception:
+        target_iframes = []
+        all_dialog_iframes = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"] iframe')
+        for iframe in all_dialog_iframes:
+            try:
+                if not iframe.is_displayed():
                     continue
+                name = iframe.get_attribute('name') or ''
+                src = (iframe.get_attribute('src') or '').lower()
+                title = (iframe.get_attribute('title') or '').lower()
+                if ('stripe' in src or 'payment' in title.lower() or
+                    name.startswith('__privateStripeFrame')):
+                    if 'express' not in src:
+                        target_iframes.append(iframe)
+            except Exception:
+                continue
 
         for sf in target_iframes:
-            if not sf.is_displayed():
-                continue
             try:
                 driver.switch_to.default_content()
                 driver.switch_to.frame(sf)
                 field_errors = driver.find_elements(By.CSS_SELECTOR,
                     '.p-FieldError, [role="alert"][id*="Error"], '
-                    '[role="alert"].Error')
+                    '[role="alert"].Error, [id*="Error"].Error')
                 for fe in field_errors:
                     if fe.is_displayed():
                         err_text = fe.text.strip()
                         if err_text:
                             driver.switch_to.default_content()
-                            return err_text[:100]
+                            return err_text[:200]
             except Exception:
                 pass
 
@@ -1822,6 +1948,23 @@ def _check_stripe_iframe_errors(driver):
             pass
 
     return None
+
+
+def _collect_all_child_frames(frame_tree_node):
+    """从 Page.getFrameTree 结果中收集所有子 frame 信息"""
+    frames = []
+    for child in frame_tree_node.get('childFrames', []):
+        frame = child.get('frame', {})
+        frame_id = frame.get('id')
+        if frame_id:
+            frames.append({
+                'id': frame_id,
+                'url': frame.get('url', ''),
+                'name': frame.get('name', ''),
+            })
+        # 递归收集嵌套的子 frame
+        frames.extend(_collect_all_child_frames(child))
+    return frames
 
 
 def _find_stripe_field_errors_in_dom(node):
@@ -1908,6 +2051,11 @@ def _check_dialog_card_error(driver):
     检查弹窗内是否出现信用卡/表单错误信息
     返回错误描述字符串（如果有错误），否则返回 None
     """
+    # 最优先: 从浏览器控制台日志读取 Stripe 错误（最可靠的信号）
+    console_err = _check_browser_console_for_errors(driver)
+    if console_err:
+        return console_err
+
     try:
         dialog = None
         dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
@@ -2067,36 +2215,23 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     print("⏳ 等待提交结果...")
     time.sleep(5)
 
-    # 提交后短暂等待，检查按钮是否仍然可点击（说明第一次点击可能未生效）
-    retry_clicked = False
+    # 提交后先检查是否已有错误（Stripe 返回快的话 5 秒内就有结果）
+    card_error = _check_dialog_card_error(driver)
+    if card_error:
+        print(f"  ❌ 添加失败: {card_error}")
+        _close_payment_dialog(driver)
+        return False
+
+    # 检查弹窗是否已关闭（提交成功）
     try:
-        retry_btn = _find_payment_submit_button(driver)
-        if retry_btn and retry_btn.is_displayed() and retry_btn.is_enabled():
-            # 检查按钮是否处于 loading 状态
-            btn_classes = retry_btn.get_attribute('class') or ''
-            btn_disabled = retry_btn.get_attribute('disabled')
-            aria_busy = retry_btn.get_attribute('aria-busy')
-            if not btn_disabled and 'loading' not in btn_classes.lower() and aria_busy != 'true':
-                print("  ⚠️ 提交按钮仍然可用，第一次点击可能未生效，重试点击...")
-                time.sleep(1)
-                try:
-                    retry_btn.click()
-                    print("  🔘 已重试点击提交按钮 (原生点击)")
-                    retry_clicked = True
-                except Exception:
-                    try:
-                        driver.execute_script("arguments[0].click();", retry_btn)
-                        print("  🔘 已重试点击提交按钮 (JS 点击)")
-                        retry_clicked = True
-                    except Exception:
-                        pass
+        dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+        visible_dialogs = [d for d in dialogs if d.is_displayed()]
+        if not visible_dialogs:
+            print("🎉 信用卡添加成功！(弹窗已关闭)")
+            return True
     except Exception:
         pass
 
-    if not retry_clicked:
-        print("  ⏳ 提交按钮已进入处理状态，等待结果...")
-
-    time.sleep(5)
     print("  ⏳ 开始检测结果...")
 
     user_notified_captcha = False
