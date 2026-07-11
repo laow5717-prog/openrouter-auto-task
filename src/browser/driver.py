@@ -75,6 +75,9 @@ def create_driver(headless=False):
 
     options = uc.ChromeOptions()
 
+    # 窗口放到屏幕右下角，避免抢占用户焦点
+    options.add_argument("--window-position=2000,2000")
+
     if headless:
         print("  👻 使用伪无头模式 (Off-screen)...")
         options.add_argument("--window-position=-10000,-10000")
@@ -209,11 +212,7 @@ def check_and_handle_cf_challenge(driver, max_wait=120):
             print("  " + "=" * 50)
             print("")
 
-            try:
-                driver.set_window_position(100, 100)
-                driver.execute_script("window.focus();")
-            except Exception:
-                pass
+            pass
 
         time.sleep(2)
 
@@ -632,12 +631,6 @@ def _handle_inline_turnstile(driver, max_wait=120):
     print(f"  ⏰ 等待时间: 最长 {max_wait} 秒")
     print("  " + "=" * 50)
     print("")
-
-    try:
-        driver.set_window_position(100, 100)
-        driver.execute_script("window.focus();")
-    except Exception:
-        pass
 
     start = time.time()
     while time.time() - start < max_wait:
@@ -1669,12 +1662,6 @@ def _handle_dialog_turnstile(driver, max_wait=120):
     print("  " + "=" * 50)
     print("")
 
-    try:
-        driver.set_window_position(100, 100)
-        driver.execute_script("window.focus();")
-    except Exception:
-        pass
-
     start = time.time()
     while time.time() - start < max_wait:
         if _is_dialog_turnstile_solved(driver):
@@ -2256,11 +2243,6 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                 print(f"  ⏰ 等待时间: 最长 {remaining} 秒")
                 print("  " + "=" * 50)
                 print("")
-                try:
-                    driver.set_window_position(100, 100)
-                    driver.execute_script("window.focus();")
-                except Exception:
-                    pass
             time.sleep(3)
             continue
 
