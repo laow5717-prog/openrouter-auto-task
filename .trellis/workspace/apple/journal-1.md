@@ -240,3 +240,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: 清理绑卡历史脏数据并添加自动/手动清理机制
+
+**Date**: 2026-07-11
+**Task**: 清理绑卡历史脏数据并添加自动/手动清理机制
+**Branch**: `main`
+
+### Summary
+
+发现 card_bindings 表积累了 606 条记录（470 条 pending 属于已停止任务）。删除了现有 470 条无效 pending 记录；新增 delete_pending_by_task / cleanup_stale_pending 模型方法；任务结束 finally 块中自动清理本任务遗留 pending（报告导出后）；新增 POST /api/card/history/cleanup 接口；前端 CardHistory 页面新增红色清理无效数据按钮。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6cb0dfa` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
