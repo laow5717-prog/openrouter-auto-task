@@ -286,6 +286,15 @@ def get_card_history():
     })
 
 
+@api.route('/api/card/history/cleanup', methods=['POST'])
+def cleanup_card_history():
+    state = get_app_state()
+    models = get_models()
+    active_task_id = state.current_card_task_id if state.is_running else None
+    deleted = models['card_binding'].cleanup_stale_pending(active_task_id)
+    return jsonify({"deleted": deleted})
+
+
 @api.route('/api/card/history/export', methods=['POST'])
 def export_card_history():
     models = get_models()

@@ -24,6 +24,7 @@
       <div style="display:flex;gap:8px;align-items:center">
         <button class="action-btn" @click="handleExport">导出</button>
         <button class="action-btn" @click="loadData">刷新</button>
+        <button class="action-btn action-btn-danger" @click="handleCleanup">清理无效数据</button>
       </div>
     </div>
 
@@ -100,7 +101,7 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { getCardHistory, exportCardHistory } from '../api'
+import { getCardHistory, exportCardHistory, cleanupCardHistory } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 
@@ -166,10 +167,28 @@ async function handleExport() {
   }
 }
 
+async function handleCleanup() {
+  if (!confirm('将删除所有属于已停止/已完成任务的"待处理"记录，此操作不可撤销，确认继续？')) return
+  try {
+    const res = await cleanupCardHistory()
+    alert(`已清理 ${res.deleted} 条无效 pending 记录`)
+    loadData()
+  } catch (e) {
+    alert('清理失败: ' + e.message)
+  }
+}
+
 onMounted(loadData)
 </script>
 
 <style scoped>
+.action-btn-danger {
+  background: #c0392b;
+  color: #fff;
+}
+.action-btn-danger:hover {
+  background: #a93226;
+}
 .history-table {
   white-space: nowrap;
 }

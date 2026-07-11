@@ -65,3 +65,4 @@ export const getCardStatus = (params) => get('/api/card/status', params)
 // Card history
 export const getCardHistory = (params) => get('/api/card/history', params)
 export const exportCardHistory = (body) => postBlob('/api/card/history/export', body)
+export const cleanupCardHistory = () => post('/api/card/history/cleanup')

@@ -196,6 +196,31 @@ class CardBindingModel:
         )
         return [dict(r) for r in rows]
 
+    def delete_pending_by_task(self, task_id):
+        """删除指定任务的所有 pending 记录，返回删除行数"""
+        cursor = self.db.execute(
+            "DELETE FROM card_bindings WHERE task_id=? AND status='pending'",
+            (task_id,)
+        )
+        return cursor.rowcount
+
+    def cleanup_stale_pending(self, active_task_id=None):
+        """清理属于已完成/停止/僵尸任务的 pending 记录，返回删除行数"""
+        if active_task_id is not None:
+            cursor = self.db.execute(
+                """DELETE FROM card_bindings
+                   WHERE status='pending' AND (
+                       task_id IN (SELECT id FROM tasks WHERE status IN ('stopped', 'completed'))
+                       OR (task_id IN (SELECT id FROM tasks WHERE status='running') AND task_id != ?)
+                   )""",
+                (active_task_id,)
+            )
+        else:
+            cursor = self.db.execute(
+                "DELETE FROM card_bindings WHERE status='pending'"
+            )
+        return cursor.rowcount
+
     def get_summary(self, task_id):
         row = self.db.fetchone(
             """SELECT

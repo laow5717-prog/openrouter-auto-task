@@ -313,6 +313,14 @@ class AppState:
             except Exception as e:
                 self._hooked_print(f"报告导出失败: {e}")
 
+            # 清理本任务遗留的 pending 记录（未处理的卡不会再被此任务处理）
+            try:
+                deleted = card_binding_model.delete_pending_by_task(task_id)
+                if deleted > 0:
+                    self._hooked_print(f"已清理 {deleted} 条未处理记录")
+            except Exception as e:
+                self._hooked_print(f"清理 pending 记录失败: {e}")
+
     def _patch_prints(self):
         """劫持相关模块的 print 函数以捕获日志"""
         hooked = self._hooked_print
