@@ -1775,10 +1775,15 @@ def _check_dialog_card_error(driver):
 
         # 中文错误信息检测
         cn_error_keywords = [
-            '安全码错误', '卡号错误', '卡号无效', '银行卡被拒',
-            '交易被拒绝', '卡片被拒绝', '信用卡被拒', '付款失败',
-            '无法处理', '请检查您的', '卡已过期',
-            '资金不足', '卡号不正确', '有效期错误', '信息不正确',
+            '安全码错误', '安全码不正确', '安全码无效', 'CVC错误',
+            '卡号错误', '卡号无效', '卡号不正确', '卡号不完整',
+            '有效期错误', '有效期无效', '有效期已过', '卡已过期',
+            '银行卡被拒', '交易被拒绝', '卡片被拒绝', '信用卡被拒',
+            '付款失败', '支付失败', '处理失败',
+            '无法处理', '请检查您的', '信息不正确',
+            '资金不足', '余额不足',
+            '地址错误', '邮编错误', '邮政编码',
+            '发生错误', '请重试', '不支持',
         ]
         for kw in cn_error_keywords:
             if kw in dialog_text:
@@ -1788,18 +1793,38 @@ def _check_dialog_card_error(driver):
         dialog_text_lower = dialog_text.lower()
         # 精确的卡片错误短语（不会误匹配正常 UI 文本）
         card_error_phrases = [
+            # 安全码/CVC 错误
             "your card's security code is incorrect",
-            'security code is incorrect', 'card was declined',
-            'card number is invalid', 'card has expired',
-            'card number is incomplete', 'expiration date is incomplete',
+            'security code is incorrect', 'incorrect cvc',
+            'incorrect security code', "your card's cvc is invalid",
+            'cvc is incomplete',
+            # 卡号错误
+            'card number is invalid', 'card number is incomplete',
+            'is not a valid card number', 'invalid card number',
+            # 有效期错误
+            'expiration date is incomplete', 'expiry date is incomplete',
             "your card's expiration date is in the past",
             "your card's expiration year is invalid",
-            'insufficient funds', 'transaction declined',
-            'payment failed', 'unable to process',
-            'incorrect cvc', 'incorrect security code',
-            'card has been declined', 'do not honor',
+            "your card's expiration month is invalid",
+            'expiration date is invalid', 'expiry date is invalid',
+            'card has expired',
+            # 卡被拒/交易失败
+            'card was declined', 'card has been declined',
+            'transaction declined', 'payment failed',
+            'do not honor', 'insufficient funds',
             'lost or stolen', 'pickup card',
-            'processing error', 'try again later',
+            'unable to process', 'processing error',
+            'generic decline', 'call issuer',
+            'restricted card', 'not permitted',
+            'try again later', 'try again',
+            # 账单地址错误
+            'zip code is incomplete', 'postal code is incomplete',
+            'address is incomplete', 'invalid zip', 'invalid postal',
+            'billing address', 'address verification failed',
+            # 通用 Stripe 错误
+            'an error occurred', 'something went wrong',
+            'could not be processed', 'please try again',
+            'not supported', 'not accepted',
         ]
         for phrase in card_error_phrases:
             if phrase in dialog_text_lower:
