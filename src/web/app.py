@@ -155,17 +155,38 @@ class AppState:
 
         self._patch_prints()
 
+        # 过滤已成功绑定过的卡
+        card_binding_model = self.models['card_binding']
+        already_bound_numbers = card_binding_model.get_successfully_bound_card_numbers()
+        filtered_cards = []
+        skipped = 0
+        for c in cards:
+            if c.get('number') in already_bound_numbers:
+                skipped += 1
+            else:
+                filtered_cards.append(c)
+
+        if skipped > 0:
+            self._hooked_print(f"Skipped {skipped} already-bound cards")
+
+        if not filtered_cards:
+            self._hooked_print("All cards already bound, nothing to do")
+            self.is_running = False
+            self.current_action = "All cards already bound"
+            return
+
         # 创建任务和绑定记录
         task_id = self.models['task'].create('card_driven', config={
-            'total_cards': len(cards), 'max_bindable': max_bindable_cards,
+            'total_cards': len(filtered_cards), 'max_bindable': max_bindable_cards,
         })
         self.current_card_task_id = task_id
-        binding_ids = self.models['card_binding'].create_batch(task_id, cards)
+        binding_ids = card_binding_model.create_batch(task_id, filtered_cards)
 
-        self._hooked_print(f"Card-driven mode: {len(cards)} cards to process")
+        self._hooked_print(f"Card-driven mode: {len(filtered_cards)} cards to process")
 
         account_index = 0
-        card_binding_model = self.models['card_binding']
+        consecutive_failures = 0
+        max_consecutive_failures = 3
 
         try:
             while True:
@@ -178,7 +199,12 @@ class AppState:
                     self._hooked_print("All cards processed!")
                     break
 
-                batch = pending[:max_bindable_cards]
+                if consecutive_failures >= max_consecutive_failures:
+                    self._hooked_print(f"Consecutive failures reached {max_consecutive_failures}, stopping")
+                    break
+
+                # 传所有 pending 卡，让注册函数尝试到绑够 max_bindable_cards 为止
+                batch = pending
                 account_index += 1
 
                 summary = card_binding_model.get_summary(task_id)
@@ -205,19 +231,14 @@ class AppState:
 
                     if email and bound_count > 0:
                         self.success_count += bound_count
+                        consecutive_failures = 0
                         self._hooked_print(f"Bound {bound_count} cards this round")
                     elif not email:
-                        for r in batch:
-                            if r['status'] == 'pending':
-                                card_binding_model.mark_failed(r['id'], "account registration failed")
-                        self.fail_count += len(batch)
-                        self._hooked_print(f"Registration failed, {len(batch)} cards marked failed")
+                        consecutive_failures += 1
+                        self._hooked_print(f"Registration failed ({consecutive_failures}/{max_consecutive_failures}), cards remain pending for next account")
                     else:
-                        failed_in_batch = sum(
-                            1 for r in batch
-                            if (card_binding_model.get_pending(task_id) is not None)
-                        )
-                        # Re-check from DB for accurate count
+                        consecutive_failures += 1
+                        # 注册成功但没绑上卡，从 DB 刷新计数
                         updated_summary = card_binding_model.get_summary(task_id)
                         self.fail_count = updated_summary['failed']
                         self.success_count = updated_summary['success']
@@ -226,11 +247,12 @@ class AppState:
                     self._hooked_print("Task interrupted")
                     break
                 except Exception as e:
+                    consecutive_failures += 1
                     self._hooked_print(f"Error: {str(e)}")
-                    for r in batch:
-                        if r['status'] == 'pending':
-                            card_binding_model.mark_failed(r['id'], str(e)[:50])
-                    self.fail_count += len(batch)
+                    # 异常时不标记所有卡为 failed，留待下一轮重试
+                    updated_summary = card_binding_model.get_summary(task_id)
+                    self.fail_count = updated_summary['failed']
+                    self.success_count = updated_summary['success']
 
                 # 间隔等待
                 remaining = card_binding_model.get_pending(task_id)

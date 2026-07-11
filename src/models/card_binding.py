@@ -53,6 +53,149 @@ class CardBindingModel:
         )
         return [dict(r) for r in rows]
 
+    def get_successfully_bound_card_numbers(self):
+        """获取所有已成功绑定的卡号（跨所有任务）"""
+        rows = self.db.fetchall(
+            "SELECT card_data_json FROM card_bindings WHERE status='success' AND card_data_json IS NOT NULL"
+        )
+        numbers = set()
+        for r in rows:
+            try:
+                card = json.loads(r['card_data_json'])
+                if card.get('number'):
+                    numbers.add(card['number'])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return numbers
+
+    def get_paginated_by_task(self, task_id, page=1, page_size=20, status='', keyword=''):
+        conditions = ["task_id=?"]
+        params = [task_id]
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if keyword:
+            conditions.append("(card_display LIKE ? OR bound_to_email LIKE ?)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+
+        where = " WHERE " + " AND ".join(conditions)
+        offset = (page - 1) * page_size
+
+        total_row = self.db.fetchone(
+            f"SELECT COUNT(*) as cnt FROM card_bindings{where}", params
+        )
+        total = total_row['cnt'] if total_row else 0
+
+        rows = self.db.fetchall(
+            f"SELECT id, task_id, card_display, status, bound_to_email, error, attempted_at FROM card_bindings{where} ORDER BY id LIMIT ? OFFSET ?",
+            params + [page_size, offset],
+        )
+        return [dict(r) for r in rows], total
+
+    def get_by_email(self, email):
+        rows = self.db.fetchall(
+            "SELECT id, card_display, status, error, attempted_at, card_data_json FROM card_bindings WHERE bound_to_email=? ORDER BY id",
+            (email,),
+        )
+        result = []
+        for r in rows:
+            d = dict(r)
+            card = {}
+            if d.get('card_data_json'):
+                try:
+                    card = json.loads(d['card_data_json'])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            d['card_number'] = card.get('number', '')
+            d['card_holder'] = f"{card.get('first_name', '')} {card.get('last_name', '')}".strip()
+            d['expiry_month'] = card.get('expiry_month', '')
+            d['expiry_year'] = card.get('expiry_year', '')
+            d['cvc'] = card.get('cvc', '')
+            d['country'] = card.get('country', '')
+            d['address'] = card.get('address', '')
+            d['address2'] = card.get('address2', '')
+            d['city'] = card.get('city', '')
+            d['state'] = card.get('state', '')
+            d['zip'] = card.get('zip', '')
+            d['company'] = card.get('company', '')
+            del d['card_data_json']
+            result.append(d)
+        return result
+
+    def count_by_emails(self, emails):
+        if not emails:
+            return {}
+        placeholders = ','.join(['?'] * len(emails))
+        rows = self.db.fetchall(
+            f"SELECT bound_to_email, COUNT(*) as cnt FROM card_bindings WHERE status='success' AND bound_to_email IN ({placeholders}) GROUP BY bound_to_email",
+            list(emails),
+        )
+        return {r['bound_to_email']: r['cnt'] for r in rows}
+
+    def get_all_paginated(self, page=1, page_size=20, status='', keyword='', date_from='', date_to=''):
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if keyword:
+            conditions.append("(card_display LIKE ? OR bound_to_email LIKE ?)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+        if date_from:
+            conditions.append("attempted_at >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("attempted_at <= ?")
+            params.append(f"{date_to} 23:59:59")
+
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        offset = (page - 1) * page_size
+
+        total_row = self.db.fetchone(
+            f"SELECT COUNT(*) as cnt FROM card_bindings{where}", params
+        )
+        total = total_row['cnt'] if total_row else 0
+
+        rows = self.db.fetchall(
+            f"SELECT id, task_id, card_display, card_data_json, status, bound_to_email, error, attempted_at FROM card_bindings{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [page_size, offset],
+        )
+        return [dict(r) for r in rows], total
+
+    def get_global_summary(self):
+        row = self.db.fetchone(
+            """SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending
+            FROM card_bindings"""
+        )
+        return dict(row) if row else {"total": 0, "success": 0, "failed": 0, "pending": 0}
+
+    def get_all_filtered(self, status='', keyword='', date_from='', date_to=''):
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if keyword:
+            conditions.append("(card_display LIKE ? OR bound_to_email LIKE ?)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+        if date_from:
+            conditions.append("attempted_at >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("attempted_at <= ?")
+            params.append(f"{date_to} 23:59:59")
+
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = self.db.fetchall(
+            f"SELECT id, task_id, card_display, card_data_json, status, bound_to_email, error, attempted_at FROM card_bindings{where} ORDER BY id DESC",
+            params,
+        )
+        return [dict(r) for r in rows]
+
     def get_summary(self, task_id):
         row = self.db.fetchone(
             """SELECT

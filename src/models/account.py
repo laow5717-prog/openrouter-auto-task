@@ -43,3 +43,31 @@ class AccountModel:
     def count(self):
         row = self.db.fetchone("SELECT COUNT(*) as cnt FROM accounts")
         return row['cnt']
+
+    def get_paginated(self, page=1, page_size=20, keyword='', status='', date_from='', date_to=''):
+        conditions = []
+        params = []
+        if keyword:
+            conditions.append("email LIKE ?")
+            params.append(f"%{keyword}%")
+        if status:
+            conditions.append("status LIKE ?")
+            params.append(f"%{status}%")
+        if date_from:
+            conditions.append("created_at >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("created_at <= ?")
+            params.append(date_to + " 23:59:59")
+
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        offset = (page - 1) * page_size
+
+        total_row = self.db.fetchone(f"SELECT COUNT(*) as cnt FROM accounts{where}", params)
+        total = total_row['cnt'] if total_row else 0
+
+        rows = self.db.fetchall(
+            f"SELECT * FROM accounts{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [page_size, offset],
+        )
+        return [dict(r) for r in rows], total

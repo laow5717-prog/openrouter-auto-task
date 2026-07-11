@@ -19,6 +19,25 @@ from selenium_stealth import stealth
 from src.config import cfg
 import src.services.captcha as captcha_solver
 
+# US 州名缩写 → 全称映射
+US_STATE_ABBR = {
+    'AL': 'Alabama', 'AK': 'Alaska', 'AZ': 'Arizona', 'AR': 'Arkansas',
+    'CA': 'California', 'CO': 'Colorado', 'CT': 'Connecticut', 'DE': 'Delaware',
+    'FL': 'Florida', 'GA': 'Georgia', 'HI': 'Hawaii', 'ID': 'Idaho',
+    'IL': 'Illinois', 'IN': 'Indiana', 'IA': 'Iowa', 'KS': 'Kansas',
+    'KY': 'Kentucky', 'LA': 'Louisiana', 'ME': 'Maine', 'MD': 'Maryland',
+    'MA': 'Massachusetts', 'MI': 'Michigan', 'MN': 'Minnesota', 'MS': 'Mississippi',
+    'MO': 'Missouri', 'MT': 'Montana', 'NE': 'Nebraska', 'NV': 'Nevada',
+    'NH': 'New Hampshire', 'NJ': 'New Jersey', 'NM': 'New Mexico', 'NY': 'New York',
+    'NC': 'North Carolina', 'ND': 'North Dakota', 'OH': 'Ohio', 'OK': 'Oklahoma',
+    'OR': 'Oregon', 'PA': 'Pennsylvania', 'RI': 'Rhode Island', 'SC': 'South Carolina',
+    'SD': 'South Dakota', 'TN': 'Tennessee', 'TX': 'Texas', 'UT': 'Utah',
+    'VT': 'Vermont', 'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia',
+    'WI': 'Wisconsin', 'WY': 'Wyoming', 'DC': 'District of Columbia',
+    'PR': 'Puerto Rico', 'VI': 'Virgin Islands', 'GU': 'Guam',
+    'AS': 'American Samoa', 'MP': 'Northern Mariana Islands',
+}
+
 MAX_WAIT_TIME = cfg.browser.max_wait_time
 SHORT_WAIT_TIME = cfg.browser.short_wait_time
 ERROR_PAGE_MAX_RETRIES = cfg.retry.error_page_max_retries
@@ -144,10 +163,12 @@ def check_and_handle_cf_challenge(driver, max_wait=120):
             auto_click_attempted = True
             print("  🤖 尝试自动点击验证框...")
             if _try_click_turnstile(driver):
-                time.sleep(8)
-                if not _is_challenge_page(driver):
-                    print("  ✅ 自动点击成功，验证已通过！")
-                    return True
+                # 等待最多 20 秒，每 2 秒检查一次
+                for wait_i in range(10):
+                    time.sleep(2)
+                    if not _is_challenge_page(driver):
+                        print("  ✅ 自动点击成功，验证已通过！")
+                        return True
                 print("  ⚠️ 自动点击未能通过验证")
 
             # 阶段2.5: 使用 2Captcha 自动解决
@@ -368,6 +389,104 @@ def _click_turnstile_via_cdp(driver):
         return True
     except Exception as e:
         print(f"    ⚠️ CDP 点击失败: {e}")
+        return False
+
+
+def _click_hcaptcha_via_cdp(driver):
+    """
+    使用 CDP 找到 hCaptcha iframe 并模拟点击其 checkbox 区域
+    hCaptcha 通常出现在 LightboxModal 弹窗中的 .HCaptcha-container 内
+    """
+    try:
+        # 方法1: 直接通过 Selenium 找到 hCaptcha iframe 并用 CDP 点击
+        hcaptcha_iframes = driver.find_elements(
+            By.CSS_SELECTOR,
+            '#HCaptcha-root iframe[src*="hcaptcha"], '
+            '.HCaptcha-container iframe[src*="hcaptcha"], '
+            'iframe[data-hcaptcha-widget-id], '
+            'iframe[src*="hcaptcha.com"]'
+        )
+        for iframe in hcaptcha_iframes:
+            if not iframe.is_displayed():
+                continue
+            rect = iframe.rect
+            # hCaptcha checkbox 在 iframe 左侧约 30px，垂直居中
+            click_x = rect['x'] + 30
+            click_y = rect['y'] + rect['height'] / 2
+
+            print(f"    → CDP: 找到 hCaptcha iframe, 点击坐标 ({click_x:.0f}, {click_y:.0f})")
+
+            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed',
+                'x': click_x,
+                'y': click_y,
+                'button': 'left',
+                'clickCount': 1,
+            })
+            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased',
+                'x': click_x,
+                'y': click_y,
+                'button': 'left',
+                'clickCount': 1,
+            })
+            print("    ✅ CDP: 已模拟点击 hCaptcha checkbox")
+            return True
+
+        # 方法2: CDP DOM 遍历查找（包括 shadow DOM）
+        doc = driver.execute_cdp_cmd('DOM.getDocument', {'depth': -1, 'pierce': True})
+        root = doc['root']
+
+        def find_hcaptcha_iframe(node):
+            if node.get('nodeName', '').lower() == 'iframe':
+                attrs = node.get('attributes', [])
+                attr_dict = dict(zip(attrs[::2], attrs[1::2])) if attrs else {}
+                src = attr_dict.get('src', '')
+                widget_id = attr_dict.get('data-hcaptcha-widget-id', '')
+                if 'hcaptcha.com' in src or 'hcaptcha' in src or widget_id:
+                    return node
+            for child in node.get('children', []):
+                result = find_hcaptcha_iframe(child)
+                if result:
+                    return result
+            for shadow in node.get('shadowRoots', []):
+                for child in shadow.get('children', []):
+                    result = find_hcaptcha_iframe(child)
+                    if result:
+                        return result
+            return None
+
+        iframe_node = find_hcaptcha_iframe(root)
+        if iframe_node:
+            backend_node_id = iframe_node.get('backendNodeId')
+            box_model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
+            content = box_model['model']['content']
+            click_x = content[0] + 30
+            click_y = (content[1] + content[5]) / 2
+
+            print(f"    → CDP(DOM): 找到 hCaptcha iframe, 点击坐标 ({click_x:.0f}, {click_y:.0f})")
+
+            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed',
+                'x': click_x,
+                'y': click_y,
+                'button': 'left',
+                'clickCount': 1,
+            })
+            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased',
+                'x': click_x,
+                'y': click_y,
+                'button': 'left',
+                'clickCount': 1,
+            })
+            print("    ✅ CDP(DOM): 已模拟点击 hCaptcha checkbox")
+            return True
+
+        print("    ⚠️ CDP: 未找到 hCaptcha iframe")
+        return False
+    except Exception as e:
+        print(f"    ⚠️ CDP hCaptcha 点击失败: {e}")
         return False
 
 
@@ -1243,10 +1362,23 @@ def _fill_billing_address_in_dialog(driver, card_info):
                 # 输入国家名称
                 type_slowly(country_input, country)
                 time.sleep(1.5)
-                # 从下拉列表选择第一项
-                country_input.send_keys(Keys.ARROW_DOWN)
-                time.sleep(0.3)
-                country_input.send_keys(Keys.ENTER)
+                # 从下拉列表中找到精确匹配的选项并点击
+                exact_matched = False
+                try:
+                    options = driver.find_elements(By.CSS_SELECTOR, '[role="option"], [role="listbox"] li, ul[id] li')
+                    for opt in options:
+                        opt_text = opt.text.strip()
+                        if opt_text.lower() == country.lower():
+                            opt.click()
+                            exact_matched = True
+                            break
+                except Exception:
+                    pass
+                if not exact_matched:
+                    # 回退：选择第一项
+                    country_input.send_keys(Keys.ARROW_DOWN)
+                    time.sleep(0.3)
+                    country_input.send_keys(Keys.ENTER)
                 print(f"  ✅ 填写 Country: {country}")
                 time.sleep(0.5)
             else:
@@ -1258,7 +1390,13 @@ def _fill_billing_address_in_dialog(driver, card_info):
     fill_input('address', card_info.get('address', ''), 'Address line 1')
     fill_input('address2', card_info.get('address2', ''), 'Address line 2')
     fill_input('city', card_info.get('city', ''), 'City')
-    fill_input('state', card_info.get('state', ''), 'State')
+    # State: 如果是缩写（如 MD），转为全称（Maryland）
+    state_val = card_info.get('state', '')
+    if state_val and state_val.upper() in US_STATE_ABBR:
+        state_full = US_STATE_ABBR[state_val.upper()]
+        print(f"  📍 State 缩写 '{state_val}' → '{state_full}'")
+        state_val = state_full
+    fill_input('state', state_val, 'State')
     fill_input('zipcode', card_info.get('zip', ''), 'ZIP code')
     fill_input('company', card_info.get('company', ''), 'Organization')
 
@@ -1413,7 +1551,8 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         bool: 是否成功添加
     """
     print("⏳ 等待提交结果...")
-    time.sleep(5)
+    time.sleep(15)
+    print("  ⏳ 数据传输完成，开始检测结果...")
 
     user_notified_captcha = False
     start = time.time()
@@ -1450,19 +1589,55 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
             if visible_turnstile:
                 captcha_type = 'turnstile'
 
-            # hCaptcha
+            # hCaptcha (主文档 + 所有 iframe 内部)
             if not captcha_type:
                 hcaptcha = driver.find_elements(
                     By.CSS_SELECTOR,
                     'iframe[src*="hcaptcha.com"], '
+                    'iframe[src*="hcaptcha"], '
                     '.HCaptcha-container, '
                     '.h-captcha, '
                     '#HCaptcha-root, '
-                    'iframe[title*="hCaptcha"]'
+                    'iframe[title*="hCaptcha"], '
+                    'iframe[title*="hcaptcha"], '
+                    'iframe[data-hcaptcha-widget-id], '
+                    '[data-hcaptcha-widget-id]'
                 )
                 visible_hcaptcha = [el for el in hcaptcha if el.is_displayed()]
                 if visible_hcaptcha:
                     captcha_type = 'hcaptcha'
+
+                # 在嵌套 iframe 中查找 hCaptcha
+                if not captcha_type:
+                    try:
+                        all_iframes = driver.find_elements(By.TAG_NAME, 'iframe')
+                        for iframe in all_iframes:
+                            try:
+                                if not iframe.is_displayed():
+                                    continue
+                                driver.switch_to.frame(iframe)
+                                inner_hcaptcha = driver.find_elements(
+                                    By.CSS_SELECTOR,
+                                    'iframe[src*="hcaptcha.com"], '
+                                    'iframe[src*="hcaptcha"], '
+                                    '.h-captcha, '
+                                    '[data-hcaptcha-widget-id]'
+                                )
+                                if any(el.is_displayed() for el in inner_hcaptcha):
+                                    captcha_type = 'hcaptcha'
+                                driver.switch_to.default_content()
+                                if captcha_type:
+                                    break
+                            except Exception:
+                                try:
+                                    driver.switch_to.default_content()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        try:
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
 
             # Stripe 3DS 验证弹窗
             if not captcha_type:
@@ -1505,34 +1680,99 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                 user_notified_captcha = True
                 print(f"  🔒 检测到人机验证 (类型: {captcha_type})")
 
-                # 尝试使用 2Captcha 自动解决
-                if captcha_solver.is_available():
-                    solved = False
-                    if captcha_type == 'hcaptcha':
-                        print("  🤖 尝试使用 2Captcha 解决 hCaptcha...")
+                # 处理策略：CDP 点击 checkbox → 等待图片挑战加载 → 2Captcha 解决
+                solved = False
+                if captcha_type == 'hcaptcha':
+                    # 第一步：CDP 点击 hCaptcha checkbox
+                    print("  🤖 尝试 CDP 点击 hCaptcha checkbox...")
+                    cdp_clicked = _click_hcaptcha_via_cdp(driver)
+                    if cdp_clicked:
+                        # 等待图片挑战页面加载（通常会出现新的大 iframe）
+                        print("  ⏳ 等待 hCaptcha 图片挑战加载...")
+                        challenge_loaded = False
+                        for _ in range(15):
+                            time.sleep(2)
+                            # 先检查是否意外直接通过了
+                            try:
+                                dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+                                visible_dialogs = [d for d in dialogs if d.is_displayed()]
+                                if not visible_dialogs:
+                                    print("  🎉 hCaptcha 直接通过，信用卡添加成功！")
+                                    return True
+                            except Exception:
+                                pass
+                            try:
+                                modals = driver.find_elements(By.CSS_SELECTOR,
+                                    '.LightboxModal-open, .HCaptcha-container')
+                                if not any(m.is_displayed() for m in modals):
+                                    print("  ✅ hCaptcha 验证已通过！")
+                                    solved = True
+                                    break
+                            except Exception:
+                                pass
+                            # 检测图片挑战 iframe 是否已加载
+                            try:
+                                challenge_iframes = driver.find_elements(By.CSS_SELECTOR,
+                                    'iframe[src*="hcaptcha.com/challenge"], '
+                                    'iframe[src*="hcaptcha.com/getcaptcha"], '
+                                    'iframe[src*="newassets.hcaptcha.com"][style*="position"]')
+                                # 图片挑战 iframe 通常尺寸较大（宽>300px）
+                                for cf in challenge_iframes:
+                                    if cf.is_displayed() and cf.size.get('width', 0) > 300:
+                                        challenge_loaded = True
+                                        break
+                            except Exception:
+                                pass
+                            if challenge_loaded:
+                                print("  📸 hCaptcha 图片挑战已加载")
+                                break
+
+                    # 第二步：用 2Captcha 解决图片挑战
+                    if not solved and captcha_solver.is_available():
+                        print("  🤖 尝试使用 2Captcha 解决 hCaptcha 图片挑战...")
                         solved = captcha_solver.solve_hcaptcha(driver)
-                    elif captcha_type == 'turnstile':
+
+                elif captcha_type == 'turnstile':
+                    # Turnstile: 先 CDP 点击再 2Captcha
+                    print("  🤖 尝试 CDP 点击 Turnstile...")
+                    if _click_turnstile_via_cdp(driver):
+                        for _ in range(8):
+                            time.sleep(2)
+                            try:
+                                dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+                                if not any(d.is_displayed() for d in dialogs):
+                                    print("  🎉 Turnstile 通过，信用卡添加成功！")
+                                    return True
+                            except Exception:
+                                pass
+                    if captcha_solver.is_available():
                         print("  🤖 尝试使用 2Captcha 解决 Turnstile...")
                         solved = captcha_solver.solve_turnstile(driver)
-                    else:
+                else:
+                    if captcha_solver.is_available():
                         print("  🤖 尝试使用 2Captcha 自动解决...")
-                        # 尝试两种类型
                         solved = captcha_solver.solve_hcaptcha(driver) or captcha_solver.solve_turnstile(driver)
 
-                    if solved:
-                        time.sleep(5)
-                        # 检查弹窗是否关闭
-                        try:
-                            dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
-                            visible_dialogs = [d for d in dialogs if d.is_displayed()]
-                            if not visible_dialogs:
-                                print("  🎉 2Captcha 解决成功，信用卡添加成功！")
-                                return True
-                        except Exception:
-                            pass
-                        print("  ⚠️ 2Captcha 解决后仍未完成，等待页面响应...")
+                if solved:
+                    time.sleep(5)
+                    try:
+                        dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+                        visible_dialogs = [d for d in dialogs if d.is_displayed()]
+                        if not visible_dialogs:
+                            print("  🎉 验证解决成功，信用卡添加成功！")
+                            return True
+                    except Exception:
+                        pass
+                    # 检查 LightboxModal 是否关闭
+                    try:
+                        modals = driver.find_elements(By.CSS_SELECTOR,
+                            '.LightboxModal-open, .HCaptcha-container')
+                        if not any(m.is_displayed() for m in modals):
+                            print("  ✅ 验证已通过，等待页面响应...")
+                    except Exception:
+                        pass
 
-                # 2Captcha 失败或不可用，提示用户手动操作
+                # CDP/2Captcha 都失败，提示用户手动操作
                 remaining = int(max_wait - (time.time() - start))
                 print("")
                 print("  " + "=" * 50)
@@ -1576,7 +1816,15 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         except Exception:
             pass
 
-        # 继续等待
+        # 继续等待 - 每30秒输出一次状态
+        elapsed = int(time.time() - start)
+        if elapsed % 30 < 4:
+            try:
+                iframe_count = len(driver.find_elements(By.TAG_NAME, 'iframe'))
+                dialog_count = len([d for d in driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]') if d.is_displayed()])
+                print(f"  ⏳ 等待中... ({elapsed}s) 弹窗:{dialog_count} iframe:{iframe_count}")
+            except Exception:
+                pass
         time.sleep(3)
 
     # 超时

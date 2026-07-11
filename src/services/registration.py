@@ -105,31 +105,25 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
                 cards_added = 0
 
                 for card_idx, card_info in enumerate(available_cards):
-                    if bound_count >= max_bindable_cards:
-                        print(f"Already bound {bound_count} cards, reached limit ({max_bindable_cards})")
-                        break
-
                     card_display = card_info['number'][-4:] if len(card_info['number']) >= 4 else card_info['number']
-                    print(f"\nAdding card {card_idx + 1} (ending {card_display})...")
+                    print(f"\nAdding card {card_idx + 1}/{len(available_cards)} (ending {card_display})...")
 
                     if add_credit_card(driver, card_info):
                         cards_added += 1
                         bound_count += 1
-                        print(f"Card (ending {card_display}) added! ({bound_count}/{max_bindable_cards})")
+                        print(f"Card (ending {card_display}) added! ({bound_count} bound)")
                         _report("card_added")
 
-                        if bound_count >= max_bindable_cards:
-                            print(f"Reached limit ({max_bindable_cards})")
-                            break
-
-                        print("Returning to billing page...")
-                        navigate_to_billing(driver)
-                        time.sleep(3)
+                        if card_idx < len(available_cards) - 1:
+                            print("Returning to billing page...")
+                            navigate_to_billing(driver)
+                            time.sleep(3)
                     else:
                         print(f"Card (ending {card_display}) failed, trying next")
                         _report("card_failed")
-                        navigate_to_billing(driver)
-                        time.sleep(3)
+                        if card_idx < len(available_cards) - 1:
+                            navigate_to_billing(driver)
+                            time.sleep(3)
 
                 if cards_added > 0:
                     account_model.update_status(email, f"bound_{cards_added}_cards")
@@ -230,33 +224,29 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
         print("Entered billing page")
         _report("billing_page")
 
-        # 逐张绑定信用卡
-        for record in batch_records:
-            if bound_count >= max_bindable_cards:
-                break
-
+        # 逐张绑定信用卡，失败不计数，继续尝试直到绑够 max_bindable_cards
+        for idx, record in enumerate(batch_records):
             card_info = record["card"]
             card_display = f"****{record['card_display']}"
             binding_id = record["id"]
-            print(f"\nBinding: {card_display}...")
+            print(f"\nBinding {idx + 1}/{len(batch_records)}: {card_display}...")
 
             if add_credit_card(driver, card_info):
                 bound_count += 1
                 card_binding_model.mark_success(binding_id, email)
-                print(f"{card_display} bound! ({bound_count}/{max_bindable_cards})")
+                print(f"{card_display} bound successfully! ({bound_count} bound)")
                 _report("card_added")
 
-                if bound_count >= max_bindable_cards:
-                    break
-
-                navigate_to_billing(driver)
-                time.sleep(3)
+                if idx < len(batch_records) - 1:
+                    navigate_to_billing(driver)
+                    time.sleep(3)
             else:
                 card_binding_model.mark_failed(binding_id, "bind failed")
-                print(f"{card_display} binding failed")
+                print(f"{card_display} binding failed, trying next card...")
                 _report("card_failed")
-                navigate_to_billing(driver)
-                time.sleep(3)
+                if idx < len(batch_records) - 1:
+                    navigate_to_billing(driver)
+                    time.sleep(3)
 
         if bound_count > 0:
             account_model.update_status(email, f"bound_{bound_count}_cards")
