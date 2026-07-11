@@ -57,7 +57,7 @@
             <td style="font-family:monospace">{{ acc.password }}</td>
             <td style="font-family:monospace">{{ acc.email_password || '-' }}</td>
             <td>
-              <span class="status-tag" :class="accStatusClass(acc.status)">{{ acc.status }}</span>
+              <span class="status-tag" :class="accStatusClass(acc.status)">{{ accStatusLabel(acc.status) }}</span>
             </td>
             <td>
               <span v-if="acc.card_count > 0" class="card-count-badge" @click="showCards(acc.email)">
@@ -141,6 +141,15 @@ const allChecked = computed(() => {
   return accounts.value.every(a => selected.has(a.email))
 })
 
+const statusMap = {
+  registered: '已注册',
+  bound: '已绑卡',
+  failed: '失败',
+  error: '错误',
+}
+function accStatusLabel(s) {
+  return statusMap[s] || s
+}
 function accStatusClass(s) {
   if (s.includes('bound') || s.includes('registered')) return 'success'
   if (s.includes('failed') || s.includes('error')) return 'fail'
