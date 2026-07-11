@@ -307,3 +307,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: 数据目录迁移至用户家目录
+
+**Date**: 2026-07-11
+**Task**: 数据目录迁移至用户家目录
+**Branch**: `main`
+
+### Summary
+
+新增 get_data_dir() 函数，打包后数据库、上传文件、导出报告均存储至 ~/.cloudflare-auto-task/，与程序目录分离。客户升级版本时直接替换程序包，历史数据完全保留。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f641868` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
