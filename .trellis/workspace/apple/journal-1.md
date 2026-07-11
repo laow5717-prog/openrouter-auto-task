@@ -73,3 +73,38 @@ Fixed send_from_directory 404 bug by using absolute static_dir path. Converted u
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Vue 3 frontend migration, card history page, and admin enhancements
+
+**Date**: 2026-07-11
+**Task**: Vue 3 frontend migration, card history page, and admin enhancements
+**Branch**: `main`
+
+### Summary
+
+Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filtering/export, card detail modal with full unmasked info, and new card history page with cross-task query. Created frontend/API/database code specs.
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `017409a` | (see git log) |
+| `301b6bb` | (see git log) |
+| `8cbf37f` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

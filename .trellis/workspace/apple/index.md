@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 2
+- **Total Sessions**: 3
 - **Last Active**: 2026-07-11
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~75 | Active |
+| `journal-1.md` | ~110 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 3 | 2026-07-11 | Vue 3 frontend migration, card history page, and admin enhancements | `017409a`, `301b6bb`, `8cbf37f` | `main` |
 | 2 | 2026-07-11 | Fix index 404 and convert card Excel | `fb880ab`, `97d690e` | `main` |
 | 1 | 2026-07-11 | Project maturity refactor: SQLite DB + src/ package structure | `7143d71`, `6b9740d` | `main` |
 <!-- @@@/auto:session-history -->
