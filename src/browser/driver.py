@@ -102,51 +102,64 @@ def create_driver(headless=False):
         user_data_dir=user_data_dir,
     )
 
-    # 随机窗口尺寸
-    w, h = random.choice(_WINDOW_SIZES)
-    driver.set_window_size(w, h)
-    print(f"  🖥️ 窗口: {w}x{h}, 语言: {lang.split(',')[0]}")
-
-    # 记录临时目录，关闭时清理
-    driver._cf_temp_profile = user_data_dir
-
-    # 注入控制台拦截器（在所有页面 JS 执行之前生效）
-    # 用于捕获 Cloudflare/Stripe 的错误日志
     try:
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': '''
-                window.__cfAutoErrors = [];
-                (function() {
-                    var methods = ['log', 'error', 'warn'];
-                    methods.forEach(function(method) {
-                        var orig = console[method].bind(console);
-                        console[method] = function() {
-                            var msg = '';
-                            try {
-                                msg = Array.from(arguments).map(function(a) {
-                                    return typeof a === 'string' ? a : String(a);
-                                }).join(' ');
-                            } catch(e) {}
-                            if (/setup.intent.error/i.test(msg) ||
-                                /form.error.handler/i.test(msg) ||
-                                /payment.intent.failed/i.test(msg) ||
-                                /failed.to.save.payment/i.test(msg) ||
-                                /card.*(incorrect|invalid|declined|expired|failed)/i.test(msg) ||
-                                /security.code.*(incorrect|invalid)/i.test(msg) ||
-                                /cvc.*(incorrect|invalid|incomplete)/i.test(msg)) {
-                                window.__cfAutoErrors.push(msg.substring(0, 300));
-                            }
-                            orig.apply(null, arguments);
-                        };
-                    });
-                })();
-            '''
-        })
-    except Exception:
-        pass
+        # 随机窗口尺寸
+        w, h = random.choice(_WINDOW_SIZES)
+        driver.set_window_size(w, h)
+        print(f"  🖥️ 窗口: {w}x{h}, 语言: {lang.split(',')[0]}")
 
-    print("✅ 浏览器初始化成功 (undetected-chromedriver)")
-    return driver
+        # 记录临时目录，关闭时清理
+        driver._cf_temp_profile = user_data_dir
+
+        # 注入控制台拦截器（在所有页面 JS 执行之前生效）
+        # 用于捕获 Cloudflare/Stripe 的错误日志
+        try:
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    window.__cfAutoErrors = [];
+                    (function() {
+                        var methods = ['log', 'error', 'warn'];
+                        methods.forEach(function(method) {
+                            var orig = console[method].bind(console);
+                            console[method] = function() {
+                                var msg = '';
+                                try {
+                                    msg = Array.from(arguments).map(function(a) {
+                                        return typeof a === 'string' ? a : String(a);
+                                    }).join(' ');
+                                } catch(e) {}
+                                if (/setup.intent.error/i.test(msg) ||
+                                    /form.error.handler/i.test(msg) ||
+                                    /payment.intent.failed/i.test(msg) ||
+                                    /failed.to.save.payment/i.test(msg) ||
+                                    /card.*(incorrect|invalid|declined|expired|failed)/i.test(msg) ||
+                                    /security.code.*(incorrect|invalid)/i.test(msg) ||
+                                    /cvc.*(incorrect|invalid|incomplete)/i.test(msg)) {
+                                    window.__cfAutoErrors.push(msg.substring(0, 300));
+                                }
+                                orig.apply(null, arguments);
+                            };
+                        });
+                    })();
+                '''
+            })
+        except Exception:
+            pass
+
+        print("✅ 浏览器初始化成功 (undetected-chromedriver)")
+        return driver
+    except Exception:
+        # Chrome 进程已启动但后续初始化失败，必须清理避免孤儿进程
+        print("  ❌ 浏览器初始化失败，正在清理...")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
 
 
 def close_driver(driver):
@@ -719,19 +732,6 @@ def _is_turnstile_solved(driver):
             """)
             if result:
                 return True
-        except Exception:
-            pass
-
-        # 方法3: 检查人机验证提示文字是否消失（中英文）
-        try:
-            body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-            if ('let us know you are human' not in body_text and
-                'verify you are human' not in body_text and
-                '确认您是真人' not in body_text and
-                '证明你是人类' not in body_text):
-                signup_btn = driver.find_elements(By.CSS_SELECTOR, 'button[type="submit"]')
-                if signup_btn:
-                    return True
         except Exception:
             pass
 
@@ -1506,7 +1506,7 @@ def add_credit_card(driver, card_info):
         driver: 浏览器驱动
         card_info: 信用卡信息字典
     返回:
-        bool: 是否成功添加
+        tuple[bool, str]: (是否成功添加, 错误原因字符串)
     """
     try:
         print("\n" + "=" * 50)
@@ -1519,20 +1519,20 @@ def add_credit_card(driver, card_info):
 
         if not _find_and_click_add_button(driver):
             print("  ❌ 未找到添加付款方式按钮")
-            return False
+            return False, "[操作失败] 未找到添加付款方式按钮"
 
         time.sleep(3)
 
         # 2. 等待弹窗出现
         print("⏳ 等待 Add a payment method 弹窗...")
         if not _wait_for_payment_dialog(driver):
-            return False
+            return False, "[操作失败] 支付弹窗未出现"
 
         # 3. 等待 Stripe iframe 加载
         print("⏳ 等待 Stripe 信用卡表单加载...")
         stripe_iframe = _wait_for_stripe_iframe(driver)
         if not stripe_iframe:
-            return False
+            return False, "[操作失败] Stripe表单未加载"
 
         time.sleep(2)
 
@@ -1550,7 +1550,7 @@ def add_credit_card(driver, card_info):
 
         if not card_filled:
             print("  ❌ 填写信用卡信息失败")
-            return False
+            return False, "[操作失败] 填写信用卡信息失败"
 
         time.sleep(1)
 
@@ -1564,9 +1564,10 @@ def add_credit_card(driver, card_info):
         # 同时检查卡片错误，如果卡信息有误则直接跳过
         print("🔒 检查弹窗内是否有 Turnstile 验证...")
         if not _handle_dialog_turnstile(driver):
-            # 卡片错误导致的 False，关闭弹窗并返回失败
+            # 卡片错误导致的 False，或 Turnstile 超时；先检测具体原因
+            _card_err = _check_dialog_card_error(driver)
             _close_payment_dialog(driver)
-            return False
+            return False, (_card_err if _card_err else "[验证超时] Turnstile人机验证超时")
 
         time.sleep(1)
 
@@ -1585,7 +1586,7 @@ def add_credit_card(driver, card_info):
 
         if not submit_btn:
             print("  ❌ 未找到提交按钮")
-            return False
+            return False, "[操作失败] 未找到提交按钮"
 
         # 先滚动到按钮可见
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", submit_btn)
@@ -1607,7 +1608,7 @@ def add_credit_card(driver, card_info):
 
         if not submitted:
             print("  ❌ 点击提交按钮失败")
-            return False
+            return False, "[浏览器中断] 点击提交按钮失败"
 
         # 8. 等待提交结果（含人机验证检测）
         return _wait_for_payment_submit_result(driver)
@@ -1618,7 +1619,7 @@ def add_credit_card(driver, card_info):
             driver.switch_to.default_content()
         except Exception:
             pass
-        return False
+        return False, f"[浏览器中断] {str(e)[:150]}"
 
 
 def _handle_dialog_turnstile(driver, max_wait=120):
@@ -2049,12 +2050,13 @@ def _extract_text_from_dom_node(node):
 def _check_dialog_card_error(driver):
     """
     检查弹窗内是否出现信用卡/表单错误信息
-    返回错误描述字符串（如果有错误），否则返回 None
+    返回带分类前缀的错误字符串（如果有错误），否则返回 None
+    分类前缀: [控制台表单错误] [外部原因] [表单字段错误] [支付处理错误] [页面错误] [Stripe字段错误]
     """
     # 最优先: 从浏览器控制台日志读取 Stripe 错误（最可靠的信号）
     console_err = _check_browser_console_for_errors(driver)
     if console_err:
-        return console_err
+        return f"[控制台表单错误] {console_err}"
 
     try:
         dialog = None
@@ -2068,63 +2070,65 @@ def _check_dialog_card_error(driver):
 
         dialog_text = dialog.text
 
-        # 中文错误信息检测
-        cn_error_keywords = [
+        # 中文错误信息检测 —— 按分类分组
+        cn_declined = ['银行卡被拒', '交易被拒绝', '卡片被拒绝', '信用卡被拒', '资金不足', '余额不足']
+        cn_form = [
             '安全码错误', '安全码不正确', '安全码无效', 'CVC错误',
             '卡号错误', '卡号无效', '卡号不正确', '卡号不完整',
             '有效期错误', '有效期无效', '有效期已过', '卡已过期',
-            '银行卡被拒', '交易被拒绝', '卡片被拒绝', '信用卡被拒',
-            '付款失败', '支付失败', '处理失败',
-            '无法处理', '请检查您的', '信息不正确',
-            '资金不足', '余额不足',
             '地址错误', '邮编错误', '邮政编码',
-            '发生错误', '请重试', '不支持',
         ]
-        for kw in cn_error_keywords:
+        cn_payment = ['付款失败', '支付失败', '处理失败', '无法处理', '请检查您的', '信息不正确', '发生错误', '请重试', '不支持']
+        for kw in cn_declined:
             if kw in dialog_text:
-                return kw
+                return f"[外部原因] {kw}"
+        for kw in cn_form:
+            if kw in dialog_text:
+                return f"[表单字段错误] {kw}"
+        for kw in cn_payment:
+            if kw in dialog_text:
+                return f"[支付处理错误] {kw}"
 
-        # 英文错误信息检测（精确匹配优先，避免误报）
+        # 英文错误信息检测（精确匹配优先，避免误报）—— 按分类分组
         dialog_text_lower = dialog_text.lower()
-        # 精确的卡片错误短语（不会误匹配正常 UI 文本）
-        card_error_phrases = [
-            # 安全码/CVC 错误
-            "your card's security code is incorrect",
-            'security code is incorrect', 'incorrect cvc',
-            'incorrect security code', "your card's cvc is invalid",
-            'cvc is incomplete',
-            # 卡号错误
-            'card number is invalid', 'card number is incomplete',
+
+        # 外部原因：银行/发卡机构拒绝
+        en_declined = [
+            'card was declined', 'card has been declined', 'transaction declined',
+            'do not honor', 'insufficient funds', 'lost or stolen', 'pickup card',
+            'generic decline', 'call issuer', 'restricted card', 'not permitted',
+        ]
+        # 表单字段验证错误
+        en_form = [
+            "your card's security code is incorrect", 'security code is incorrect',
+            'incorrect cvc', 'incorrect security code', "your card's cvc is invalid",
+            'cvc is incomplete', 'card number is invalid', 'card number is incomplete',
             'is not a valid card number', 'invalid card number',
-            # 有效期错误
             'expiration date is incomplete', 'expiry date is incomplete',
             "your card's expiration date is in the past",
             "your card's expiration year is invalid",
             "your card's expiration month is invalid",
-            'expiration date is invalid', 'expiry date is invalid',
-            'card has expired',
-            # 卡被拒/交易失败
-            'card was declined', 'card has been declined',
-            'transaction declined', 'payment failed',
-            'do not honor', 'insufficient funds',
-            'lost or stolen', 'pickup card',
-            'unable to process', 'processing error',
-            'generic decline', 'call issuer',
-            'restricted card', 'not permitted',
-            'try again later', 'try again',
-            # 账单地址错误
+            'expiration date is invalid', 'expiry date is invalid', 'card has expired',
             'zip code is incomplete', 'postal code is incomplete',
             'address is incomplete', 'invalid zip', 'invalid postal',
             'billing address is invalid', 'billing address is incomplete',
             'address verification failed',
-            # 通用 Stripe 错误
-            'an error occurred', 'something went wrong',
-            'could not be processed', 'please try again',
-            'not supported', 'not accepted',
         ]
-        for phrase in card_error_phrases:
+        # 通用支付处理错误
+        en_payment = [
+            'payment failed', 'unable to process', 'processing error',
+            'try again later', 'try again', 'an error occurred', 'something went wrong',
+            'could not be processed', 'please try again', 'not supported', 'not accepted',
+        ]
+        for phrase in en_declined:
             if phrase in dialog_text_lower:
-                return phrase
+                return f"[外部原因] {phrase}"
+        for phrase in en_form:
+            if phrase in dialog_text_lower:
+                return f"[表单字段错误] {phrase}"
+        for phrase in en_payment:
+            if phrase in dialog_text_lower:
+                return f"[支付处理错误] {phrase}"
 
         # 检测弹窗内的错误提示元素（role="alert" 等）
         # 排除 captcha 相关的提示（如 "Captcha is required."）
@@ -2142,7 +2146,7 @@ def _check_dialog_card_error(driver):
                 err_lower = err_text.lower()
                 if 'captcha' in err_lower or 'human' in err_lower:
                     continue
-                return err_text[:100]
+                return f"[页面错误] {err_text[:100]}"
         except Exception:
             pass
 
@@ -2150,7 +2154,7 @@ def _check_dialog_card_error(driver):
         # Stripe 的错误元素（如 p.p-FieldError）在 iframe 内，主文档读不到
         stripe_err = _check_stripe_iframe_errors(driver)
         if stripe_err:
-            return stripe_err
+            return f"[Stripe字段错误] {stripe_err}"
 
     except Exception:
         pass
@@ -2211,7 +2215,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         driver: 浏览器驱动
         max_wait: 最大等待时间（秒），默认 180 秒
     返回:
-        bool: 是否成功添加
+        tuple[bool, str]: (是否成功添加, 错误原因字符串)
     """
     print("⏳ 等待提交结果...")
     time.sleep(5)
@@ -2221,7 +2225,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     if card_error:
         print(f"  ❌ 添加失败: {card_error}")
         _close_payment_dialog(driver)
-        return False
+        return False, card_error
 
     # 检查弹窗是否已关闭（提交成功）
     try:
@@ -2229,16 +2233,17 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         visible_dialogs = [d for d in dialogs if d.is_displayed()]
         if not visible_dialogs:
             print("🎉 信用卡添加成功！(弹窗已关闭)")
-            return True
+            return True, ""
     except Exception:
         pass
 
     print("  ⏳ 开始检测结果...")
 
     user_notified_captcha = False
-    last_retry_click_time = time.time()  # 记录上次重试点击时间
+    last_retry_click_time = time.time() - 5  # 首次重试等待5秒，后续重试等待10秒
     retry_click_count = 0
     max_retry_clicks = 3
+    loading_stuck_since = None  # 按钮进入 loading 状态的时间
     start = time.time()
 
     while time.time() - start < max_wait:
@@ -2253,7 +2258,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
             visible_dialogs = [d for d in dialogs if d.is_displayed()]
             if not visible_dialogs:
                 print("🎉 信用卡添加成功！(弹窗已关闭)")
-                return True
+                return True, ""
         except Exception:
             pass
 
@@ -2262,7 +2267,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         if card_error:
             print(f"  ❌ 添加失败: {card_error}")
             _close_payment_dialog(driver)
-            return False
+            return False, card_error
 
         # 检查3: 是否出现人机验证
         captcha_type = None  # 'turnstile', 'hcaptcha', 'unknown'
@@ -2310,6 +2315,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                                 inner_hcaptcha = driver.find_elements(
                                     By.CSS_SELECTOR,
                                     'iframe[src*="hcaptcha.com"], '
+                                    'iframe[src*="hcaptcha-inner"], '
                                     'iframe[src*="hcaptcha"], '
                                     '.h-captcha, '
                                     '[data-hcaptcha-widget-id]'
@@ -2389,7 +2395,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                                 visible_dialogs = [d for d in dialogs if d.is_displayed()]
                                 if not visible_dialogs:
                                     print("  🎉 hCaptcha 直接通过，信用卡添加成功！")
-                                    return True
+                                    return True, ""
                             except Exception:
                                 pass
                             try:
@@ -2433,7 +2439,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                                 dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
                                 if not any(d.is_displayed() for d in dialogs):
                                     print("  🎉 Turnstile 通过，信用卡添加成功！")
-                                    return True
+                                    return True, ""
                             except Exception:
                                 pass
                     if captcha_solver.is_available():
@@ -2451,7 +2457,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                         visible_dialogs = [d for d in dialogs if d.is_displayed()]
                         if not visible_dialogs:
                             print("  🎉 验证解决成功，信用卡添加成功！")
-                            return True
+                            return True, ""
                     except Exception:
                         pass
                     # 检查 LightboxModal 是否关闭
@@ -2460,6 +2466,19 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                             '.LightboxModal-open, .HCaptcha-container')
                         if not any(m.is_displayed() for m in modals):
                             print("  ✅ 验证已通过，等待页面响应...")
+                    except Exception:
+                        pass
+                    # 验证完成后弹窗仍在 → 重新点击提交按钮
+                    try:
+                        resubmit_btn = _find_payment_submit_button(driver)
+                        if resubmit_btn and resubmit_btn.is_enabled():
+                            print("  🔄 验证解决后重新点击提交按钮...")
+                            try:
+                                resubmit_btn.click()
+                            except Exception:
+                                driver.execute_script("arguments[0].click();", resubmit_btn)
+                            last_retry_click_time = time.time()
+                            time.sleep(3)
                     except Exception:
                         pass
 
@@ -2477,31 +2496,42 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
 
         # (卡片错误检测已在循环开头的 _check_dialog_card_error 中处理)
 
-        # 检查4: 提交按钮仍可点击 → 说明上次点击可能没生效，重试
+        # 检查4: 提交按钮状态检测 → 可点击则重试，loading 超时则放弃
         elapsed = int(time.time() - start)
-        if (retry_click_count < max_retry_clicks and
-                time.time() - last_retry_click_time > 10):
+        if time.time() - last_retry_click_time > 7:
             try:
                 retry_btn = _find_payment_submit_button(driver)
-                if retry_btn and retry_btn.is_enabled():
-                    # 检查按钮是否处于 loading 状态（disabled 或有 loading 类）
+                if retry_btn:
+                    btn_enabled = retry_btn.is_enabled()
+                    aria_disabled = retry_btn.get_attribute('aria-disabled') == 'true'
+                    # 只依赖原生 disabled 属性和 aria-disabled 判断，避免 class 名误判
+                    is_loading = (not btn_enabled or aria_disabled)
                     btn_classes = retry_btn.get_attribute('class') or ''
-                    is_loading = ('loading' in btn_classes.lower() or
-                                  'disabled' in btn_classes.lower() or
-                                  retry_btn.get_attribute('aria-disabled') == 'true')
-                    if not is_loading:
-                        retry_click_count += 1
-                        last_retry_click_time = time.time()
-                        print(f"  🔄 提交按钮仍可点击，重试第 {retry_click_count} 次...")
-                        try:
-                            retry_btn.click()
-                        except Exception:
+                    print(f"  🔍 按钮状态: enabled={btn_enabled} aria-disabled={aria_disabled} class={btn_classes[:80]}")
+                    if is_loading:
+                        # 记录按钮首次进入 loading 状态的时间
+                        if loading_stuck_since is None:
+                            loading_stuck_since = time.time()
+                        elif time.time() - loading_stuck_since > 45:
+                            print(f"  ⚠️ 提交按钮已持续 loading {int(time.time() - loading_stuck_since)}s，判定为卡死，关闭弹窗重试")
+                            _close_payment_dialog(driver)
+                            return False, "[提交超时] 提交按钮持续loading超过45秒"
+                    else:
+                        # 按钮恢复可点击，重置 loading 计时
+                        loading_stuck_since = None
+                        if retry_click_count < max_retry_clicks:
+                            retry_click_count += 1
+                            last_retry_click_time = time.time()
+                            print(f"  🔄 提交按钮可点击，重试第 {retry_click_count} 次...")
                             try:
-                                driver.execute_script("arguments[0].click();", retry_btn)
+                                retry_btn.click()
                             except Exception:
-                                pass
-                        time.sleep(3)
-                        continue
+                                try:
+                                    driver.execute_script("arguments[0].click();", retry_btn)
+                                except Exception:
+                                    pass
+                            time.sleep(3)
+                            continue
             except Exception:
                 pass
 
@@ -2524,12 +2554,12 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         visible_dialogs = [d for d in dialogs if d.is_displayed()]
         if not visible_dialogs:
             print("🎉 信用卡添加成功！(弹窗已关闭)")
-            return True
+            return True, ""
     except Exception:
         pass
 
     _close_payment_dialog(driver)
-    return False
+    return False, f"[超时] 等待提交结果超过{max_wait}秒"
 
 
 def _fill_stripe_payment_element(driver, card_info):

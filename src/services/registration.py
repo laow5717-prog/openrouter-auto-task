@@ -109,7 +109,8 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
                     card_display = card_info['number'][-4:] if len(card_info['number']) >= 4 else card_info['number']
                     print(f"\n正在添加卡 {card_idx + 1}/{len(available_cards)} (尾号 {card_display})...")
 
-                    if add_credit_card(driver, card_info):
+                    _success, _err_reason = add_credit_card(driver, card_info)
+                    if _success:
                         cards_added += 1
                         bound_count += 1
                         print(f"卡 (尾号 {card_display}) 添加成功！(已绑 {bound_count} 张)")
@@ -120,7 +121,7 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
                             navigate_to_billing(driver)
                             time.sleep(3)
                     else:
-                        print(f"卡 (尾号 {card_display}) 绑定失败，尝试下一张")
+                        print(f"卡 (尾号 {card_display}) 绑定失败，尝试下一张: {_err_reason}")
                         _report("card_failed")
                         if card_idx < len(available_cards) - 1:
                             navigate_to_billing(driver)
@@ -227,12 +228,17 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
 
         # 逐张绑定信用卡，失败不计数，继续尝试直到绑够 max_bindable_cards
         for idx, record in enumerate(batch_records):
+            if bound_count >= max_bindable_cards:
+                print(f"账号已达到最大绑卡数 ({max_bindable_cards})，停止绑卡，剩余卡片留待下个账号处理")
+                break
+
             card_info = record["card"]
             card_display = f"****{record['card_display']}"
             binding_id = record["id"]
             print(f"\n绑定 {idx + 1}/{len(batch_records)}: {card_display}...")
 
-            if add_credit_card(driver, card_info):
+            _success, _err_reason = add_credit_card(driver, card_info)
+            if _success:
                 bound_count += 1
                 card_binding_model.mark_success(binding_id, email)
                 print(f"{card_display} 绑定成功！(已绑 {bound_count} 张)")
@@ -242,8 +248,8 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
                     navigate_to_billing(driver)
                     time.sleep(3)
             else:
-                card_binding_model.mark_failed(binding_id, "bind failed")
-                print(f"{card_display} 绑定失败，尝试下一张...")
+                card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")
+                print(f"{card_display} 绑定失败，尝试下一张... ({_err_reason})")
                 _report("card_failed")
                 if idx < len(batch_records) - 1:
                     navigate_to_billing(driver)
