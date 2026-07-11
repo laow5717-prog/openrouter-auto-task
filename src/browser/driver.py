@@ -7,10 +7,14 @@
 import os
 import time
 import random
+import logging
 import tempfile
 import shutil
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+
+# 抑制 urllib3 连接池警告（undetected-chromedriver 高频操作时触发）
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
@@ -1768,6 +1772,60 @@ def _is_dialog_turnstile_solved(driver):
     return False
 
 
+def _check_stripe_iframe_errors(driver):
+    """
+    进入 Stripe iframe 检查表单字段错误
+    Stripe 错误元素格式: <p id="Field-cvcError" class="p-FieldError Error" role="alert">...</p>
+    返回错误文本或 None
+    """
+    try:
+        driver.switch_to.default_content()
+        # 优先在 credit-card-form 容器内查找（精准范围，避免遍历全部 iframe）
+        target_iframes = driver.find_elements(By.CSS_SELECTOR,
+            '[data-test-id="credit-card-form"] iframe')
+        if not target_iframes:
+            # 回退: 在弹窗内按 name/src 匹配 Stripe iframe
+            all_dialog_iframes = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"] iframe')
+            for iframe in all_dialog_iframes:
+                try:
+                    if not iframe.is_displayed():
+                        continue
+                    name = iframe.get_attribute('name') or ''
+                    src = (iframe.get_attribute('src') or '').lower()
+                    if (name.startswith('__privateStripeFrame') or 'stripe.com' in src):
+                        if 'express' not in src:
+                            target_iframes.append(iframe)
+                except Exception:
+                    continue
+
+        for sf in target_iframes:
+            if not sf.is_displayed():
+                continue
+            try:
+                driver.switch_to.default_content()
+                driver.switch_to.frame(sf)
+                # 查找 Stripe FieldError 元素
+                field_errors = driver.find_elements(By.CSS_SELECTOR,
+                    '.p-FieldError, [role="alert"][id*="Error"], '
+                    '[role="alert"].Error')
+                for fe in field_errors:
+                    if fe.is_displayed():
+                        err_text = fe.text.strip()
+                        if err_text:
+                            driver.switch_to.default_content()
+                            return err_text[:100]
+            except Exception:
+                pass
+
+        driver.switch_to.default_content()
+    except Exception:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+    return None
+
+
 def _check_dialog_card_error(driver):
     """
     检查弹窗内是否出现信用卡/表单错误信息
@@ -1864,35 +1922,9 @@ def _check_dialog_card_error(driver):
 
         # Stripe iframe 内部错误检测
         # Stripe 的错误元素（如 p.p-FieldError）在 iframe 内，主文档读不到
-        try:
-            stripe_iframes = driver.find_elements(By.CSS_SELECTOR,
-                'iframe[src*="stripe.com"], iframe[name*="__privateStripeFrame"]')
-            for sf in stripe_iframes:
-                if not sf.is_displayed():
-                    continue
-                try:
-                    driver.switch_to.frame(sf)
-                    # 查找 Stripe 的 FieldError 元素
-                    field_errors = driver.find_elements(By.CSS_SELECTOR,
-                        'p.p-FieldError, .p-FieldError, [role="alert"].Error, '
-                        '[role="alert"][id*="Error"], .StripeElement--invalid')
-                    for fe in field_errors:
-                        if fe.is_displayed():
-                            err_text = fe.text.strip()
-                            if err_text:
-                                driver.switch_to.default_content()
-                                return err_text[:100]
-                    driver.switch_to.default_content()
-                except Exception:
-                    try:
-                        driver.switch_to.default_content()
-                    except Exception:
-                        pass
-        except Exception:
-            try:
-                driver.switch_to.default_content()
-            except Exception:
-                pass
+        stripe_err = _check_stripe_iframe_errors(driver)
+        if stripe_err:
+            return stripe_err
 
     except Exception:
         pass
