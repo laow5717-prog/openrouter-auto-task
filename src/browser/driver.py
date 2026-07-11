@@ -2115,7 +2115,8 @@ def _check_dialog_card_error(driver):
             # 账单地址错误
             'zip code is incomplete', 'postal code is incomplete',
             'address is incomplete', 'invalid zip', 'invalid postal',
-            'billing address', 'address verification failed',
+            'billing address is invalid', 'billing address is incomplete',
+            'address verification failed',
             # 通用 Stripe 错误
             'an error occurred', 'something went wrong',
             'could not be processed', 'please try again',
@@ -2235,6 +2236,9 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     print("  ⏳ 开始检测结果...")
 
     user_notified_captcha = False
+    last_retry_click_time = time.time()  # 记录上次重试点击时间
+    retry_click_count = 0
+    max_retry_clicks = 3
     start = time.time()
 
     while time.time() - start < max_wait:
@@ -2472,6 +2476,34 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
             continue
 
         # (卡片错误检测已在循环开头的 _check_dialog_card_error 中处理)
+
+        # 检查4: 提交按钮仍可点击 → 说明上次点击可能没生效，重试
+        elapsed = int(time.time() - start)
+        if (retry_click_count < max_retry_clicks and
+                time.time() - last_retry_click_time > 10):
+            try:
+                retry_btn = _find_payment_submit_button(driver)
+                if retry_btn and retry_btn.is_enabled():
+                    # 检查按钮是否处于 loading 状态（disabled 或有 loading 类）
+                    btn_classes = retry_btn.get_attribute('class') or ''
+                    is_loading = ('loading' in btn_classes.lower() or
+                                  'disabled' in btn_classes.lower() or
+                                  retry_btn.get_attribute('aria-disabled') == 'true')
+                    if not is_loading:
+                        retry_click_count += 1
+                        last_retry_click_time = time.time()
+                        print(f"  🔄 提交按钮仍可点击，重试第 {retry_click_count} 次...")
+                        try:
+                            retry_btn.click()
+                        except Exception:
+                            try:
+                                driver.execute_script("arguments[0].click();", retry_btn)
+                            except Exception:
+                                pass
+                        time.sleep(3)
+                        continue
+            except Exception:
+                pass
 
         # 继续等待 - 每30秒输出一次状态
         elapsed = int(time.time() - start)
