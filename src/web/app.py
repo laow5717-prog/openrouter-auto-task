@@ -40,6 +40,11 @@ class AppState:
         self.last_frame = None
         self.frame_lock = threading.Lock()
 
+        # 持续截图线程
+        self._screenshot_driver = None
+        self._screenshot_thread = None
+        self._screenshot_stop = threading.Event()
+
         # 当前信用卡驱动任务 ID
         self.current_card_task_id = None
 
@@ -62,6 +67,32 @@ class AppState:
         with self.frame_lock:
             return self.last_frame
 
+    def _start_screenshot_loop(self, driver):
+        """启动后台持续截图线程"""
+        self._screenshot_driver = driver
+        self._screenshot_stop.clear()
+        if self._screenshot_thread and self._screenshot_thread.is_alive():
+            return
+
+        def _loop():
+            while not self._screenshot_stop.is_set():
+                try:
+                    d = self._screenshot_driver
+                    if d:
+                        png = d.get_screenshot_as_png()
+                        self.update_frame(png)
+                except Exception:
+                    pass
+                self._screenshot_stop.wait(0.3)
+
+        self._screenshot_thread = threading.Thread(target=_loop, daemon=True)
+        self._screenshot_thread.start()
+
+    def _stop_screenshot_loop(self):
+        """停止后台截图线程"""
+        self._screenshot_stop.set()
+        self._screenshot_driver = None
+
     def _hooked_print(self, *args, **kwargs):
         sep = kwargs.get('sep', ' ')
         msg = sep.join(map(str, args))
@@ -74,11 +105,9 @@ class AppState:
         if self.stop_requested:
             self._hooked_print("收到停止请求，正在中断...")
             raise InterruptedError("User requested stop")
-        try:
-            png_bytes = driver.get_screenshot_as_png()
-            self.update_frame(png_bytes)
-        except Exception:
-            pass
+        # 首次调用时启动持续截图线程
+        if self._screenshot_driver is not driver:
+            self._start_screenshot_loop(driver)
 
     def run_batch_task(self, count, card_info_list, cf_password, max_bindable_cards, captcha_api_key):
         self.is_running = True
@@ -139,6 +168,7 @@ class AppState:
         except Exception as e:
             self._hooked_print(f"严重错误: {e}")
         finally:
+            self._stop_screenshot_loop()
             self.is_running = False
             self.current_action = "任务已完成"
             self.models['task'].update_counts(task_id, self.success_count, self.fail_count)
@@ -267,6 +297,7 @@ class AppState:
         except Exception as e:
             self._hooked_print(f"严重错误: {e}")
         finally:
+            self._stop_screenshot_loop()
             self.is_running = False
             final_summary = card_binding_model.get_summary(task_id)
             self.current_action = f"已完成 (成功 {final_summary['success']} / 失败 {final_summary['failed']})"
@@ -309,7 +340,7 @@ def gen_frames(state):
         if frame:
             yield (b'--frame\r\n'
                    b'Content-Type: image/png\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.5)
+        time.sleep(0.15)
 
 
 def create_app(db_path=None):
