@@ -1528,8 +1528,12 @@ def add_credit_card(driver, card_info):
         time.sleep(2)
 
         # 5.5 处理弹窗内的 Turnstile 验证（"Let us know you're human"）
+        # 同时检查卡片错误，如果卡信息有误则直接跳过
         print("🔒 检查弹窗内是否有 Turnstile 验证...")
-        _handle_dialog_turnstile(driver)
+        if not _handle_dialog_turnstile(driver):
+            # 卡片错误导致的 False，关闭弹窗并返回失败
+            _close_payment_dialog(driver)
+            return False
 
         time.sleep(1)
 
@@ -1583,8 +1587,16 @@ def _handle_dialog_turnstile(driver, max_wait=120):
     处理 Add payment method 弹窗内的 Turnstile 验证
     弹窗中可能出现 "Let us know you're human" + Turnstile checkbox
     需要在点击提交按钮之前完成验证
+
+    注意: 卡片错误可能和 Turnstile 同时出现，优先检测卡片错误
     """
     driver.switch_to.default_content()
+
+    # 优先检查是否已有卡片错误（卡信息有误时过验证码也没用）
+    card_error = _check_dialog_card_error(driver)
+    if card_error:
+        print(f"  ❌ 检测到卡片错误，跳过 Turnstile: {card_error}")
+        return False
 
     # 检查弹窗内是否存在 Turnstile
     has_turnstile = False
@@ -1850,13 +1862,37 @@ def _check_dialog_card_error(driver):
         except Exception:
             pass
 
-        # Stripe 表单验证错误
+        # Stripe iframe 内部错误检测
+        # Stripe 的错误元素（如 p.p-FieldError）在 iframe 内，主文档读不到
         try:
-            stripe_errors = driver.find_elements(By.CSS_SELECTOR, '.StripeElement--invalid')
-            if any(e.is_displayed() for e in stripe_errors):
-                return 'Stripe 表单验证错误'
+            stripe_iframes = driver.find_elements(By.CSS_SELECTOR,
+                'iframe[src*="stripe.com"], iframe[name*="__privateStripeFrame"]')
+            for sf in stripe_iframes:
+                if not sf.is_displayed():
+                    continue
+                try:
+                    driver.switch_to.frame(sf)
+                    # 查找 Stripe 的 FieldError 元素
+                    field_errors = driver.find_elements(By.CSS_SELECTOR,
+                        'p.p-FieldError, .p-FieldError, [role="alert"].Error, '
+                        '[role="alert"][id*="Error"], .StripeElement--invalid')
+                    for fe in field_errors:
+                        if fe.is_displayed():
+                            err_text = fe.text.strip()
+                            if err_text:
+                                driver.switch_to.default_content()
+                                return err_text[:100]
+                    driver.switch_to.default_content()
+                except Exception:
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
         except Exception:
-            pass
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
 
     except Exception:
         pass
