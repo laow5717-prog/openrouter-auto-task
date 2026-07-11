@@ -118,6 +118,31 @@ def upload_card_excel():
     })
 
 
+@api.route('/api/card/check-unfinished')
+def check_unfinished_cards():
+    """检测是否有上次未完成的卡"""
+    models = get_models()
+    base_dir = str(card_service.get_base_dir())
+    upload_path = os.path.join(base_dir, "data", "uploads", "uploaded_cards.xlsx")
+    if not os.path.exists(upload_path):
+        return jsonify({"has_unfinished": False, "remaining": 0, "total": 0})
+
+    cards, _ = card_service.parse_excel(upload_path)
+    if not cards:
+        return jsonify({"has_unfinished": False, "remaining": 0, "total": 0})
+
+    already_bound = models['card_binding'].get_successfully_bound_card_numbers()
+    remaining = [c for c in cards if c.get('number') not in already_bound]
+
+    has_unfinished = 0 < len(remaining) < len(cards)
+    return jsonify({
+        "has_unfinished": has_unfinished,
+        "remaining": len(remaining),
+        "total": len(cards),
+        "bound": len(cards) - len(remaining),
+    })
+
+
 @api.route('/api/card/start', methods=['POST'])
 def start_card_driven_task():
     state = get_app_state()
@@ -372,6 +397,24 @@ def get_accounts():
         })
 
     return jsonify({"data": data, "total": total, "page": page, "page_size": page_size})
+
+
+@api.route('/api/accounts/delete', methods=['POST'])
+def delete_accounts():
+    models = get_models()
+    data = request.json or {}
+    emails = data.get('emails', [])
+    if not emails:
+        return jsonify({"error": "没有指定要删除的账号"}), 400
+
+    # 删除关联的卡片绑定记录
+    placeholders = ','.join(['?'] * len(emails))
+    models['card_binding'].db.execute(
+        f"DELETE FROM card_bindings WHERE bound_to_email IN ({placeholders})", emails
+    )
+
+    count = models['account'].delete_by_emails(emails)
+    return jsonify({"deleted": count})
 
 
 @api.route('/api/accounts/<email>/cards')

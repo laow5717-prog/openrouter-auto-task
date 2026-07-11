@@ -18,6 +18,12 @@
     </div>
   </div>
 
+  <!-- 未完成提示 -->
+  <div v-if="unfinishedInfo.show && !appStore.isRunning" class="unfinished-banner">
+    <span>检测到上次导入的 {{ unfinishedInfo.total }} 张卡中，已绑定 {{ unfinishedInfo.bound }} 张，还剩 <strong>{{ unfinishedInfo.remaining }}</strong> 张未处理。可直接点击「启动信用卡驱动任务」继续处理（无需重新上传）。</span>
+    <button class="banner-close" @click="unfinishedInfo.show = false">&times;</button>
+  </div>
+
   <!-- 上传区 -->
   <div class="panel" style="margin-bottom:16px">
     <div class="panel-header">
@@ -33,6 +39,17 @@
         <button class="action-btn" @click="handleUpload">上传并解析</button>
       </div>
       <div v-if="uploadMsg" style="margin-top:10px;font-size:12px" v-html="uploadMsg"></div>
+
+      <div class="settings-row">
+        <div class="setting-item">
+          <label class="setting-label">Cloudflare 统一密码</label>
+          <input type="text" v-model="settings.cfPassword" class="ctrl-input" placeholder="留空则每个账号随机生成">
+        </div>
+        <div class="setting-item">
+          <label class="setting-label">2Captcha API Key</label>
+          <input type="text" v-model="settings.captchaApiKey" class="ctrl-input" placeholder="用于自动解决人机验证">
+        </div>
+      </div>
 
       <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
         <button v-if="!appStore.isRunning" class="btn btn-primary" style="width:auto;padding:8px 20px" @click="handleStartCardTask">
@@ -108,7 +125,7 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
-import { getCardStatus, uploadCardExcel, startCardTask, stopTask } from '../api'
+import { getCardStatus, uploadCardExcel, startCardTask, stopTask, checkUnfinishedCards } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 
@@ -124,6 +141,7 @@ const summary = reactive({ total: 0, success: 0, failed: 0, pending: 0 })
 const filters = reactive({ keyword: '', status: '' })
 const uploadMsg = ref('')
 const fileInput = ref(null)
+const unfinishedInfo = reactive({ show: false, remaining: 0, total: 0, bound: 0 })
 
 let refreshTimer = null
 
@@ -192,10 +210,64 @@ async function handleStop() {
   try { await stopTask() } catch (e) { console.error(e) }
 }
 
+async function checkUnfinished() {
+  try {
+    const data = await checkUnfinishedCards()
+    if (data.has_unfinished) {
+      unfinishedInfo.show = true
+      unfinishedInfo.remaining = data.remaining
+      unfinishedInfo.total = data.total
+      unfinishedInfo.bound = data.bound
+    }
+  } catch (e) {
+    console.error(e)
+  }
+}
+
 onMounted(() => {
   loadData()
+  checkUnfinished()
   refreshTimer = setInterval(() => { if (appStore.isRunning) loadData() }, 2000)
 })
 
 onUnmounted(() => { if (refreshTimer) clearInterval(refreshTimer) })
 </script>
+
+<style scoped>
+.unfinished-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background: #fff8e1;
+  border: 1px solid #ffe082;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #6d4c00;
+  line-height: 1.5;
+}
+.banner-close {
+  background: none;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  color: #999;
+  flex-shrink: 0;
+}
+.banner-close:hover { color: #333; }
+.settings-row {
+  display: flex;
+  gap: 16px;
+  margin-top: 14px;
+}
+.setting-item { flex: 1; }
+.setting-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 4px;
+  color: #555;
+}
+</style>

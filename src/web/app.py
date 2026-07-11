@@ -32,7 +32,7 @@ class AppState:
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
-        self.current_action = "Idle"
+        self.current_action = "空闲"
         self.logs = []
         self.lock = threading.Lock()
 
@@ -72,7 +72,7 @@ class AppState:
 
     def _monitor(self, driver, step):
         if self.stop_requested:
-            self._hooked_print("Stop requested, interrupting...")
+            self._hooked_print("收到停止请求，正在中断...")
             raise InterruptedError("User requested stop")
         try:
             png_bytes = driver.get_screenshot_as_png()
@@ -96,15 +96,15 @@ class AppState:
             'count': count, 'has_cards': bool(card_info_list),
         })
 
-        self._hooked_print(f"Starting batch task, target: {count}")
+        self._hooked_print(f"开始批量任务，目标: {count}")
 
         try:
             for i in range(count):
                 if self.stop_requested:
-                    self._hooked_print("User stopped task")
+                    self._hooked_print("用户停止了任务")
                     break
 
-                self.current_action = f"Registering ({i+1}/{count})..."
+                self.current_action = f"注册中 ({i+1}/{count})..."
 
                 try:
                     email, password, success = registration.register_one_account(
@@ -122,35 +122,35 @@ class AppState:
                     else:
                         self.fail_count += 1
                 except InterruptedError:
-                    self._hooked_print("Task interrupted")
+                    self._hooked_print("任务已中断")
                     break
                 except Exception as e:
                     self.fail_count += 1
-                    self._hooked_print(f"Error: {str(e)}")
+                    self._hooked_print(f"错误: {str(e)}")
 
                 if i < count - 1 and not self.stop_requested:
                     wait_time = random.randint(cfg.batch.interval_min, cfg.batch.interval_max)
-                    self._hooked_print(f"Cooling down, waiting {wait_time}s...")
+                    self._hooked_print(f"冷却中，等待 {wait_time} 秒...")
                     for _ in range(wait_time):
                         if self.stop_requested:
                             break
                         time.sleep(1)
 
         except Exception as e:
-            self._hooked_print(f"Critical error: {e}")
+            self._hooked_print(f"严重错误: {e}")
         finally:
             self.is_running = False
-            self.current_action = "Task completed"
+            self.current_action = "任务已完成"
             self.models['task'].update_counts(task_id, self.success_count, self.fail_count)
             self.models['task'].finish(task_id, 'completed' if not self.stop_requested else 'stopped')
-            self._hooked_print("Task finished")
+            self._hooked_print("任务完成")
 
     def run_card_driven_task(self, cards, cf_password, max_bindable_cards, captcha_api_key):
         self.is_running = True
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
-        self.current_action = "Card-driven mode starting"
+        self.current_action = "信用卡驱动模式启动中"
         self.update_frame(None)
 
         self._patch_prints()
@@ -167,12 +167,12 @@ class AppState:
                 filtered_cards.append(c)
 
         if skipped > 0:
-            self._hooked_print(f"Skipped {skipped} already-bound cards")
+            self._hooked_print(f"跳过 {skipped} 张已绑定的卡")
 
         if not filtered_cards:
-            self._hooked_print("All cards already bound, nothing to do")
+            self._hooked_print("所有卡已绑定，无需处理")
             self.is_running = False
-            self.current_action = "All cards already bound"
+            self.current_action = "所有卡已绑定"
             return
 
         # 创建任务和绑定记录
@@ -182,7 +182,7 @@ class AppState:
         self.current_card_task_id = task_id
         binding_ids = card_binding_model.create_batch(task_id, filtered_cards)
 
-        self._hooked_print(f"Card-driven mode: {len(filtered_cards)} cards to process")
+        self._hooked_print(f"信用卡驱动模式: 共 {len(filtered_cards)} 张卡待处理")
 
         account_index = 0
         consecutive_failures = 0
@@ -191,16 +191,16 @@ class AppState:
         try:
             while True:
                 if self.stop_requested:
-                    self._hooked_print("User stopped task")
+                    self._hooked_print("用户停止了任务")
                     break
 
                 pending = card_binding_model.get_pending(task_id)
                 if not pending:
-                    self._hooked_print("All cards processed!")
+                    self._hooked_print("所有卡已处理完毕！")
                     break
 
                 if consecutive_failures >= max_consecutive_failures:
-                    self._hooked_print(f"Consecutive failures reached {max_consecutive_failures}, stopping")
+                    self._hooked_print(f"连续失败达到 {max_consecutive_failures} 次，停止任务")
                     break
 
                 # 传所有 pending 卡，让注册函数尝试到绑够 max_bindable_cards 为止
@@ -208,12 +208,12 @@ class AppState:
                 account_index += 1
 
                 summary = card_binding_model.get_summary(task_id)
-                self.current_action = f"Registering account {account_index} ({summary['pending']} cards remaining)"
+                self.current_action = f"正在注册账号 {account_index} (剩余 {summary['pending']} 张卡)"
 
                 self._hooked_print(f"\n{'=' * 50}")
-                self._hooked_print(f"Registering account {account_index}")
-                self._hooked_print(f"   Cards: {', '.join('****' + r['card_display'] for r in batch)}")
-                self._hooked_print(f"   Progress: success {summary['success']} / failed {summary['failed']} / pending {summary['pending']}")
+                self._hooked_print(f"正在注册账号 {account_index}")
+                self._hooked_print(f"   卡片: {', '.join('****' + r['card_display'] for r in batch)}")
+                self._hooked_print(f"   进度: 成功 {summary['success']} / 失败 {summary['failed']} / 待处理 {summary['pending']}")
                 self._hooked_print(f"{'=' * 50}")
 
                 try:
@@ -232,10 +232,10 @@ class AppState:
                     if email and bound_count > 0:
                         self.success_count += bound_count
                         consecutive_failures = 0
-                        self._hooked_print(f"Bound {bound_count} cards this round")
+                        self._hooked_print(f"本轮绑定了 {bound_count} 张卡")
                     elif not email:
                         consecutive_failures += 1
-                        self._hooked_print(f"Registration failed ({consecutive_failures}/{max_consecutive_failures}), cards remain pending for next account")
+                        self._hooked_print(f"注册失败 ({consecutive_failures}/{max_consecutive_failures})，卡片保留待下个账号处理")
                     else:
                         consecutive_failures += 1
                         # 注册成功但没绑上卡，从 DB 刷新计数
@@ -244,11 +244,11 @@ class AppState:
                         self.success_count = updated_summary['success']
 
                 except InterruptedError:
-                    self._hooked_print("Task interrupted")
+                    self._hooked_print("任务已中断")
                     break
                 except Exception as e:
                     consecutive_failures += 1
-                    self._hooked_print(f"Error: {str(e)}")
+                    self._hooked_print(f"错误: {str(e)}")
                     # 异常时不标记所有卡为 failed，留待下一轮重试
                     updated_summary = card_binding_model.get_summary(task_id)
                     self.fail_count = updated_summary['failed']
@@ -258,29 +258,29 @@ class AppState:
                 remaining = card_binding_model.get_pending(task_id)
                 if remaining and not self.stop_requested:
                     wait_time = random.randint(cfg.batch.interval_min, cfg.batch.interval_max)
-                    self._hooked_print(f"Waiting {wait_time}s before next account...")
+                    self._hooked_print(f"等待 {wait_time} 秒后注册下一个账号...")
                     for _ in range(wait_time):
                         if self.stop_requested:
                             break
                         time.sleep(1)
 
         except Exception as e:
-            self._hooked_print(f"Critical error: {e}")
+            self._hooked_print(f"严重错误: {e}")
         finally:
             self.is_running = False
             final_summary = card_binding_model.get_summary(task_id)
-            self.current_action = f"Completed (success {final_summary['success']} / failed {final_summary['failed']})"
+            self.current_action = f"已完成 (成功 {final_summary['success']} / 失败 {final_summary['failed']})"
             self.models['task'].update_counts(task_id, final_summary['success'], final_summary['failed'])
             self.models['task'].finish(task_id, 'completed' if not self.stop_requested else 'stopped')
-            self._hooked_print(f"Task finished - Total: {final_summary['total']}, Success: {final_summary['success']}, Failed: {final_summary['failed']}")
+            self._hooked_print(f"任务完成 - 总计: {final_summary['total']}，成功: {final_summary['success']}，失败: {final_summary['failed']}")
 
             # 导出报告
             try:
                 records = card_binding_model.get_all_by_task(task_id)
                 report_path = card_service.export_report(records)
-                self._hooked_print(f"Report exported: {report_path}")
+                self._hooked_print(f"报告已导出: {report_path}")
             except Exception as e:
-                self._hooked_print(f"Report export failed: {e}")
+                self._hooked_print(f"报告导出失败: {e}")
 
     def _patch_prints(self):
         """劫持相关模块的 print 函数以捕获日志"""

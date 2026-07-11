@@ -44,6 +44,13 @@ class AccountModel:
         row = self.db.fetchone("SELECT COUNT(*) as cnt FROM accounts")
         return row['cnt']
 
+    def delete_by_emails(self, emails):
+        if not emails:
+            return 0
+        placeholders = ','.join(['?'] * len(emails))
+        self.db.execute(f"DELETE FROM accounts WHERE email IN ({placeholders})", emails)
+        return len(emails)
+
     def get_paginated(self, page=1, page_size=20, keyword='', status='', date_from='', date_to=''):
         conditions = []
         params = []

@@ -48,7 +48,6 @@ export const useAppStore = defineStore('app', () => {
 
   function clearLogs() {
     logs.value = []
-    logIndex.value = 0
   }
 
   return {

@@ -25,11 +25,11 @@ def _get_available_domain():
             if domains and len(domains) > 0:
                 domain = domains[0].get('domain', '')
                 if domain:
-                    print(f"  Got available domain: {domain}")
+                    print(f"  获取到可用域名: {domain}")
                     return domain
-        print(f"  Failed to get domain: HTTP {response.status_code}")
+        print(f"  获取域名失败: HTTP {response.status_code}")
     except Exception as e:
-        print(f"  Failed to get domain: {e}")
+        print(f"  获取域名失败: {e}")
     return None
 
 
@@ -38,7 +38,7 @@ def create_temp_email():
     创建邮箱（使用 mail.tm）
     返回: (邮箱地址, 邮箱密码, token) 或 (None, None, None)
     """
-    print("Creating temp email (mail.tm)...")
+    print("正在创建临时邮箱 (mail.tm)...")
 
     domain = _get_available_domain()
     if not domain:
@@ -59,13 +59,13 @@ def create_temp_email():
         )
 
         if response.status_code not in (200, 201):
-            print(f"  Failed to create account: HTTP {response.status_code} - {response.text[:200]}")
+            print(f"  创建账户失败: HTTP {response.status_code} - {response.text[:200]}")
             return None, None, None
 
-        print(f"  Account created: {address}")
+        print(f"  账户已创建: {address}")
 
     except Exception as e:
-        print(f"  Failed to create account: {e}")
+        print(f"  创建账户失败: {e}")
         return None, None, None
 
     try:
@@ -79,15 +79,15 @@ def create_temp_email():
         if response.status_code == 200:
             token = response.json().get('token', '')
             if token:
-                print(f"Email created: {address}")
+                print(f"邮箱已创建: {address}")
                 return address, password, token
             else:
-                print("  No token in response")
+                print("  响应中无 token")
         else:
-            print(f"  Failed to get token: HTTP {response.status_code}")
+            print(f"  获取 token 失败: HTTP {response.status_code}")
 
     except Exception as e:
-        print(f"  Failed to get token: {e}")
+        print(f"  获取 token 失败: {e}")
 
     return None, None, None
 
@@ -107,10 +107,10 @@ def fetch_emails(token: str):
             messages = data.get('hydra:member', data) if isinstance(data, dict) else data
             return messages if isinstance(messages, list) else []
         else:
-            print(f"  Fetch emails error: HTTP {response.status_code}")
+            print(f"  获取邮件失败: HTTP {response.status_code}")
 
     except Exception as e:
-        print(f"  Fetch emails error: {e}")
+        print(f"  获取邮件失败: {e}")
 
     return None
 
@@ -129,7 +129,7 @@ def get_email_detail(token: str, message_id: str):
             return response.json()
 
     except Exception as e:
-        print(f"  Get email detail error: {e}")
+        print(f"  获取邮件详情失败: {e}")
 
     return None
 
@@ -158,7 +158,7 @@ def wait_for_verification_email(token: str, timeout: int = None):
     if timeout is None:
         timeout = cfg.email.wait_timeout
 
-    print(f"Waiting for verification email (max {timeout}s)...")
+    print(f"等待验证邮件 (最长 {timeout} 秒)...")
     start_time = time.time()
 
     while time.time() - start_time < timeout:
@@ -170,8 +170,8 @@ def wait_for_verification_email(token: str, timeout: int = None):
                 subject = _to_str(msg.get('subject', ''))
 
                 if 'cloudflare' in sender or 'cloudflare' in subject.lower():
-                    print(f"\nReceived Cloudflare verification email!")
-                    print(f"   Subject: {subject}")
+                    print(f"\n收到 Cloudflare 验证邮件！")
+                    print(f"   主题: {subject}")
 
                     message_id = msg.get('id', '')
                     if message_id:
@@ -193,9 +193,9 @@ def wait_for_verification_email(token: str, timeout: int = None):
                                     if code:
                                         return code
 
-                            print(f"   Could not extract verification info from email")
+                            print(f"   无法从邮件中提取验证信息")
                             if text_content:
-                                print(f"   Text preview: {text_content[:300]}")
+                                print(f"   文本预览: {text_content[:300]}")
 
                     intro = _to_str(msg.get('intro', ''))
                     if intro:
@@ -204,8 +204,8 @@ def wait_for_verification_email(token: str, timeout: int = None):
                             return link
 
         elapsed = int(time.time() - start_time)
-        print(f"  Waiting... ({elapsed}s)", end='\r')
+        print(f"  等待中... ({elapsed}秒)", end='\r')
         time.sleep(cfg.email.poll_interval)
 
-    print("\nVerification email timeout")
+    print("\n等待验证邮件超时")
     return None

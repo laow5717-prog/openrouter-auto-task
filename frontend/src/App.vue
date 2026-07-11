@@ -7,10 +7,10 @@
 
     <nav class="nav-menu">
       <router-link to="/" class="nav-item" active-class="active" exact-active-class="active">
-        <span>&#128202;</span> 仪表盘
+        <span>&#128202;</span> 运行监控
       </router-link>
       <router-link to="/cardmode" class="nav-item" active-class="active">
-        <span>&#128179;</span> 信用卡模式
+        <span>&#128179;</span> 导入绑卡
       </router-link>
       <router-link to="/accounts" class="nav-item" active-class="active">
         <span>&#128101;</span> 账号管理
@@ -20,7 +20,6 @@
       </router-link>
     </nav>
 
-    <SidebarControls />
   </aside>
 
   <main class="main-view">
@@ -40,12 +39,10 @@
 import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAppStore } from './stores/app'
-import SidebarControls from './components/SidebarControls.vue'
-
 const store = useAppStore()
 const route = useRoute()
 
-const titleMap = { dashboard: '系统概览', cardmode: '信用卡模式', accounts: '账号管理', cardHistory: '绑卡记录' }
+const titleMap = { dashboard: '运行监控', cardmode: '导入绑卡', accounts: '账号管理', cardHistory: '绑卡记录' }
 const pageTitle = computed(() => titleMap[route.name] || '系统概览')
 
 onMounted(() => store.startPolling())

@@ -36,16 +36,16 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
             monitor_callback(driver, step_name)
 
     try:
-        print("Creating email...")
+        print("正在创建邮箱...")
         email, email_password, jwt_token = create_temp_email()
         if not email:
-            print("Failed to create email, aborting")
+            print("创建邮箱失败，终止")
             return None, None, False
-        print(f"Email password: {email_password} (login at mail.tm)")
+        print(f"邮箱密码: {email_password} (登录 mail.tm)")
 
         if cf_password:
             password = cf_password
-            print("Using custom password")
+            print("使用自定义密码")
         else:
             password = generate_random_password()
 
@@ -56,7 +56,7 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
             captcha_solver.init_solver(captcha_api_key)
 
         if not fill_signup_form(driver, email, password):
-            print("Failed to fill signup form")
+            print("填写注册表单失败")
             return email, password, False
         _report("fill_form")
 
@@ -64,11 +64,11 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
         verification_data = wait_for_verification_email(jwt_token)
 
         if not verification_data:
-            print("No verification data received, aborting")
+            print("未收到验证数据，终止")
             return email, password, False
 
         if not handle_email_verification(driver, verification_data):
-            print("Email verification failed")
+            print("邮箱验证失败")
             return email, password, False
         _report("email_verified")
 
@@ -76,21 +76,21 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
         account_model.upsert(email, password, email_password, "registered")
 
         print("\n" + "=" * 50)
-        print(f"Registration successful! Email: {email}")
+        print(f"注册成功！邮箱: {email}")
         print("=" * 50)
 
         success = True
-        print("Waiting for page to stabilize...")
+        print("等待页面稳定...")
         time.sleep(5)
         _report("registered")
 
         # 导航到账单页面
         print("\n" + "-" * 30)
-        print("Navigating to billing page")
+        print("正在导航到账单页面")
         print("-" * 30)
 
         if navigate_to_billing(driver):
-            print("Entered billing page")
+            print("已进入账单页面")
             account_model.update_status(email, "billing_page")
             _report("billing_page")
 
@@ -98,7 +98,7 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
             available_cards = [c for c in (card_info_list or []) if c.get('number')]
             if available_cards:
                 print("\n" + "-" * 30)
-                print("Starting credit card binding")
+                print("开始绑定信用卡")
                 print("-" * 30)
 
                 bound_count = get_bound_card_count(driver)
@@ -106,20 +106,20 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
 
                 for card_idx, card_info in enumerate(available_cards):
                     card_display = card_info['number'][-4:] if len(card_info['number']) >= 4 else card_info['number']
-                    print(f"\nAdding card {card_idx + 1}/{len(available_cards)} (ending {card_display})...")
+                    print(f"\n正在添加卡 {card_idx + 1}/{len(available_cards)} (尾号 {card_display})...")
 
                     if add_credit_card(driver, card_info):
                         cards_added += 1
                         bound_count += 1
-                        print(f"Card (ending {card_display}) added! ({bound_count} bound)")
+                        print(f"卡 (尾号 {card_display}) 添加成功！(已绑 {bound_count} 张)")
                         _report("card_added")
 
                         if card_idx < len(available_cards) - 1:
-                            print("Returning to billing page...")
+                            print("返回账单页面...")
                             navigate_to_billing(driver)
                             time.sleep(3)
                     else:
-                        print(f"Card (ending {card_display}) failed, trying next")
+                        print(f"卡 (尾号 {card_display}) 绑定失败，尝试下一张")
                         _report("card_failed")
                         if card_idx < len(available_cards) - 1:
                             navigate_to_billing(driver)
@@ -130,10 +130,10 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
                 else:
                     account_model.update_status(email, "card_bind_failed")
             else:
-                print("No card info provided, skipping binding")
+                print("未提供信用卡信息，跳过绑定")
                 _report("no_card_info")
         else:
-            print("Failed to navigate to billing page")
+            print("导航到账单页面失败")
             account_model.update_status(email, "billing_navigation_failed")
             _report("billing_failed")
 
@@ -141,19 +141,19 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
         time.sleep(5)
 
     except InterruptedError:
-        print("Task interrupted by user")
+        print("任务被用户中断")
         if email:
             account_model.update_status(email, "interrupted")
         return email, password, False
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"错误: {e}")
         if email and password:
             account_model.update_status(email, f"error: {str(e)[:50]}")
 
     finally:
         if driver:
-            print("Closing browser...")
+            print("正在关闭浏览器...")
             driver.quit()
 
     return email, password, success
@@ -177,12 +177,12 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
             monitor_callback(driver, step_name)
 
     try:
-        print("Creating email...")
+        print("正在创建邮箱...")
         email, email_password, jwt_token = create_temp_email()
         if not email:
-            print("Failed to create email")
+            print("创建邮箱失败")
             return None, None, 0
-        print(f"Email password: {email_password}")
+        print(f"邮箱密码: {email_password}")
 
         if cf_password:
             password = cf_password
@@ -196,32 +196,32 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
             captcha_solver.init_solver(captcha_api_key)
 
         if not fill_signup_form(driver, email, password):
-            print("Signup form failed")
+            print("注册表单填写失败")
             return email, password, 0
         _report("fill_form")
 
         time.sleep(5)
         verification_data = wait_for_verification_email(jwt_token)
         if not verification_data:
-            print("No verification data")
+            print("未收到验证数据")
             return email, password, 0
 
         if not handle_email_verification(driver, verification_data):
-            print("Email verification failed")
+            print("邮箱验证失败")
             return email, password, 0
         _report("email_verified")
 
         account_model.upsert(email, password, email_password, "registered")
-        print(f"Registration successful! Email: {email}")
+        print(f"注册成功！邮箱: {email}")
 
         time.sleep(5)
         _report("registered")
 
         if not navigate_to_billing(driver):
-            print("Failed to navigate to billing")
+            print("导航到账单页面失败")
             account_model.update_status(email, "billing_navigation_failed")
             return email, password, 0
-        print("Entered billing page")
+        print("已进入账单页面")
         _report("billing_page")
 
         # 逐张绑定信用卡，失败不计数，继续尝试直到绑够 max_bindable_cards
@@ -229,12 +229,12 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
             card_info = record["card"]
             card_display = f"****{record['card_display']}"
             binding_id = record["id"]
-            print(f"\nBinding {idx + 1}/{len(batch_records)}: {card_display}...")
+            print(f"\n绑定 {idx + 1}/{len(batch_records)}: {card_display}...")
 
             if add_credit_card(driver, card_info):
                 bound_count += 1
                 card_binding_model.mark_success(binding_id, email)
-                print(f"{card_display} bound successfully! ({bound_count} bound)")
+                print(f"{card_display} 绑定成功！(已绑 {bound_count} 张)")
                 _report("card_added")
 
                 if idx < len(batch_records) - 1:
@@ -242,7 +242,7 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
                     time.sleep(3)
             else:
                 card_binding_model.mark_failed(binding_id, "bind failed")
-                print(f"{card_display} binding failed, trying next card...")
+                print(f"{card_display} 绑定失败，尝试下一张...")
                 _report("card_failed")
                 if idx < len(batch_records) - 1:
                     navigate_to_billing(driver)
@@ -254,16 +254,16 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
             account_model.update_status(email, "all_bindings_failed")
 
     except InterruptedError:
-        print("Task interrupted by user")
+        print("任务被用户中断")
         if email:
             account_model.update_status(email, "interrupted")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"错误: {e}")
         if email:
             account_model.update_status(email, f"error: {str(e)[:50]}")
     finally:
         if driver:
-            print("Closing browser...")
+            print("正在关闭浏览器...")
             driver.quit()
 
     return email, password, bound_count

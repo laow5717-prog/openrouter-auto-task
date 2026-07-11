@@ -3,6 +3,7 @@
     <div class="panel-header">
       <div class="panel-title"><span>&#128101;</span> 账号列表</div>
       <div style="display:flex;gap:8px;align-items:center">
+        <button class="action-btn danger" @click="handleDelete" :disabled="selected.size === 0">删除选中</button>
         <button class="action-btn" @click="handleExport('selected')">导出选中</button>
         <button class="action-btn" @click="handleExport('filtered')">导出搜索结果</button>
         <button class="action-btn" @click="loadData">刷新</button>
@@ -40,14 +41,15 @@
             <th style="white-space:nowrap">状态</th>
             <th style="white-space:nowrap">绑定卡片</th>
             <th style="white-space:nowrap">时间</th>
+            <th style="white-space:nowrap">操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="7" class="table-loading">加载中...</td>
+            <td colspan="8" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="accounts.length === 0">
-            <td colspan="7" class="table-empty">暂无数据</td>
+            <td colspan="8" class="table-empty">暂无数据</td>
           </tr>
           <tr v-for="acc in accounts" :key="acc.email">
             <td><input type="checkbox" :checked="selected.has(acc.email)" @change="toggleSelect(acc.email, $event.target.checked)"></td>
@@ -64,6 +66,9 @@
               <span v-else class="card-count-badge empty">无</span>
             </td>
             <td>{{ acc.time }}</td>
+            <td>
+              <button class="row-delete-btn" @click="handleDeleteOne(acc.email)">删除</button>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -112,7 +117,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts } from '../api'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 import Modal from '../components/Modal.vue'
@@ -180,6 +185,30 @@ function toggleAll(checked) {
     if (checked) selected.add(a.email)
     else selected.delete(a.email)
   })
+}
+
+async function handleDelete() {
+  if (selected.size === 0) return
+  const count = selected.size
+  if (!confirm(`确定要删除选中的 ${count} 个账号吗？\n\n此操作将永久删除账号及其关联的卡片绑定记录，不可恢复！`)) return
+  try {
+    await deleteAccounts(Array.from(selected))
+    selected.clear()
+    await loadData()
+  } catch (e) {
+    alert('删除失败: ' + e.message)
+  }
+}
+
+async function handleDeleteOne(email) {
+  if (!confirm(`确定要删除账号 ${email} 吗？\n\n此操作将永久删除该账号及其关联的卡片绑定记录，不可恢复！`)) return
+  try {
+    await deleteAccounts([email])
+    selected.delete(email)
+    await loadData()
+  } catch (e) {
+    alert('删除失败: ' + e.message)
+  }
 }
 
 async function handleExport(mode) {
@@ -300,6 +329,22 @@ onMounted(loadData)
 }
 .card-field.full { grid-column: span 3; }
 .card-field-label { font-size: 11px; color: var(--text-sub); }
+.action-btn.danger { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
+.action-btn.danger:hover:not(:disabled) { background: #fee2e2; }
+.action-btn.danger:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.row-delete-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border: 1px solid #fecaca;
+  border-radius: 4px;
+  background: #fff;
+  color: #dc2626;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.row-delete-btn:hover { background: #fef2f2; }
+
 .card-detail-error {
   margin-top: 10px;
   padding: 8px 12px;

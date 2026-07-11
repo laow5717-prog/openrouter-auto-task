@@ -50,6 +50,7 @@ export const stopTask = () => post('/api/stop')
 export const getAccounts = (params) => get('/api/accounts', params)
 export const getAccountCards = (email) => get(`/api/accounts/${encodeURIComponent(email)}/cards`)
 export const exportAccounts = (body) => postBlob('/api/accounts/export', body)
+export const deleteAccounts = (emails) => post('/api/accounts/delete', { emails })
 
 // Card mode
 export const uploadCardExcel = (file) => {
@@ -57,6 +58,7 @@ export const uploadCardExcel = (file) => {
   fd.append('file', file)
   return postFile('/api/card/upload', fd)
 }
+export const checkUnfinishedCards = () => get('/api/card/check-unfinished')
 export const startCardTask = (data) => post('/api/card/start', data)
 export const getCardStatus = (params) => get('/api/card/status', params)
 
