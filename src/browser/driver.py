@@ -6,6 +6,9 @@
 
 import os
 import time
+import random
+import tempfile
+import shutil
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -41,9 +44,23 @@ ERROR_PAGE_MAX_RETRIES = cfg.retry.error_page_max_retries
 BUTTON_CLICK_MAX_RETRIES = cfg.retry.button_click_max_retries
 
 
+# 常用窗口尺寸（模拟不同设备）
+_WINDOW_SIZES = [
+    (1280, 800), (1280, 900), (1366, 768), (1440, 900),
+    (1536, 864), (1600, 900), (1920, 1080), (1680, 1050),
+]
+
+# 常用语言组合
+_LANGUAGES = [
+    "en-US,en", "en-GB,en", "en-US,en;q=0.9",
+    "en-US,en;q=0.9,zh-CN;q=0.8", "en,en-US;q=0.9",
+]
+
+
 def create_driver(headless=False):
     """
     创建带有反检测的 Chrome 浏览器驱动（使用 undetected-chromedriver）
+    每次启动使用全新的浏览器环境（独立 profile + 随机指纹）
 
     参数:
         headless: 是否使用无头模式
@@ -58,15 +75,51 @@ def create_driver(headless=False):
         print("  👻 使用伪无头模式 (Off-screen)...")
         options.add_argument("--window-position=-10000,-10000")
 
+    # 每次使用全新的临时 profile，避免指纹关联
+    user_data_dir = tempfile.mkdtemp(prefix="cf_chrome_")
+    print(f"  🔄 使用全新浏览器 profile: ...{os.path.basename(user_data_dir)}")
+
+    # 随机语言
+    lang = random.choice(_LANGUAGES)
+    options.add_argument(f"--lang={lang.split(',')[0]}")
+    options.add_argument(f"--accept-lang={lang}")
+
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--disable-popup-blocking")
 
-    driver = uc.Chrome(options=options, use_subprocess=True)
-    driver.set_window_size(1280, 900)
+    driver = uc.Chrome(
+        options=options,
+        use_subprocess=True,
+        user_data_dir=user_data_dir,
+    )
+
+    # 随机窗口尺寸
+    w, h = random.choice(_WINDOW_SIZES)
+    driver.set_window_size(w, h)
+    print(f"  🖥️ 窗口: {w}x{h}, 语言: {lang.split(',')[0]}")
+
+    # 记录临时目录，关闭时清理
+    driver._cf_temp_profile = user_data_dir
 
     print("✅ 浏览器初始化成功 (undetected-chromedriver)")
     return driver
+
+
+def close_driver(driver):
+    """安全关闭浏览器并清理临时 profile"""
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    # 清理临时 profile 目录
+    temp_dir = getattr(driver, '_cf_temp_profile', None)
+    if temp_dir and os.path.exists(temp_dir):
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print(f"  🧹 已清理临时 profile: ...{os.path.basename(temp_dir)}")
+        except Exception:
+            pass
 
 
 def type_slowly(element, text, delay=0.05):

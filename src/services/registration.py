@@ -10,6 +10,7 @@ from src.utils import generate_random_password
 from src.services.email import create_temp_email, wait_for_verification_email
 from src.browser.driver import (
     create_driver,
+    close_driver,
     fill_signup_form,
     handle_email_verification,
     navigate_to_billing,
@@ -154,7 +155,7 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
     finally:
         if driver:
             print("正在关闭浏览器...")
-            driver.quit()
+            close_driver(driver)
 
     return email, password, success
 
@@ -264,6 +265,6 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
     finally:
         if driver:
             print("正在关闭浏览器...")
-            driver.quit()
+            close_driver(driver)
 
     return email, password, bound_count
