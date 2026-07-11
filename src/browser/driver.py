@@ -76,8 +76,8 @@ def create_driver(headless=False):
 
     options = uc.ChromeOptions()
 
-    # 窗口放到屏幕右下角，避免抢占用户焦点
-    options.add_argument("--window-position=2000,2000")
+    # 最小化启动，不抢占用户焦点；需要干预时点 Dock 图标即可还原
+    options.add_argument("--start-minimized")
 
     if headless:
         print("  👻 使用伪无头模式 (Off-screen)...")
@@ -107,6 +107,10 @@ def create_driver(headless=False):
         w, h = random.choice(_WINDOW_SIZES)
         driver.set_window_size(w, h)
         print(f"  🖥️ 窗口: {w}x{h}, 语言: {lang.split(',')[0]}")
+
+        # macOS 上 --start-minimized 不可靠，直接发 WebDriver 命令最小化
+        if not headless:
+            driver.minimize_window()
 
         # 记录临时目录，关闭时清理
         driver._cf_temp_profile = user_data_dir

@@ -185,19 +185,25 @@ class AppState:
 
         self._patch_prints()
 
-        # 过滤已成功绑定过的卡
+        # 过滤已成功绑定过的卡，以及因 Stripe 字段错误失败的卡（数据本身有问题，重试无意义）
         card_binding_model = self.models['card_binding']
         already_bound_numbers = card_binding_model.get_successfully_bound_card_numbers()
+        stripe_error_numbers = card_binding_model.get_stripe_field_error_card_numbers()
         filtered_cards = []
         skipped = 0
+        skipped_stripe_err = 0
         for c in cards:
             if c.get('number') in already_bound_numbers:
                 skipped += 1
+            elif c.get('number') in stripe_error_numbers:
+                skipped_stripe_err += 1
             else:
                 filtered_cards.append(c)
 
         if skipped > 0:
             self._hooked_print(f"跳过 {skipped} 张已绑定的卡")
+        if skipped_stripe_err > 0:
+            self._hooked_print(f"跳过 {skipped_stripe_err} 张 Stripe 字段错误的卡（卡数据无效，无法绑定）")
 
         if not filtered_cards:
             self._hooked_print("所有卡已绑定，无需处理")

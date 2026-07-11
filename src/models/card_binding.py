@@ -53,6 +53,21 @@ class CardBindingModel:
         )
         return [dict(r) for r in rows]
 
+    def get_stripe_field_error_card_numbers(self):
+        """获取所有因 Stripe 字段错误而失败的卡号（跨所有任务），这类卡数据本身有问题，重启也无法成功"""
+        rows = self.db.fetchall(
+            "SELECT card_data_json FROM card_bindings WHERE status='failed' AND error LIKE '[Stripe字段错误]%' AND card_data_json IS NOT NULL"
+        )
+        numbers = set()
+        for r in rows:
+            try:
+                card = json.loads(r['card_data_json'])
+                if card.get('number'):
+                    numbers.add(card['number'])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return numbers
+
     def get_successfully_bound_card_numbers(self):
         """获取所有已成功绑定的卡号（跨所有任务）"""
         rows = self.db.fetchall(
