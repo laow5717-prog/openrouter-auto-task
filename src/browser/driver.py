@@ -1761,17 +1761,27 @@ def _is_dialog_turnstile_solved(driver):
 
 def _check_stripe_iframe_errors(driver):
     """
-    进入 Stripe iframe 检查表单字段错误
+    检查 Stripe iframe 内的表单字段错误
     Stripe 错误元素格式: <p id="Field-cvcError" class="p-FieldError Error" role="alert">...</p>
-    返回错误文本或 None
+
+    使用 CDP DOM 穿透（pierce: True）直接遍历跨域 iframe 内容，
+    比 Selenium switch_to.frame() 更可靠
     """
+    # 方法1: CDP DOM 穿透（推荐，对跨域 iframe 最可靠）
+    try:
+        doc = driver.execute_cdp_cmd('DOM.getDocument', {'depth': -1, 'pierce': True})
+        error_text = _find_stripe_field_errors_in_dom(doc['root'])
+        if error_text:
+            return error_text
+    except Exception:
+        pass
+
+    # 方法2: Selenium frame 切换（兜底）
     try:
         driver.switch_to.default_content()
-        # 优先在 credit-card-form 容器内查找（精准范围，避免遍历全部 iframe）
         target_iframes = driver.find_elements(By.CSS_SELECTOR,
             '[data-test-id="credit-card-form"] iframe')
         if not target_iframes:
-            # 回退: 在弹窗内按 name/src 匹配 Stripe iframe
             all_dialog_iframes = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"] iframe')
             for iframe in all_dialog_iframes:
                 try:
@@ -1779,9 +1789,10 @@ def _check_stripe_iframe_errors(driver):
                         continue
                     name = iframe.get_attribute('name') or ''
                     src = (iframe.get_attribute('src') or '').lower()
-                    if (name.startswith('__privateStripeFrame') or 'stripe.com' in src):
-                        if 'express' not in src:
-                            target_iframes.append(iframe)
+                    title = (iframe.get_attribute('title') or '').lower()
+                    if ('payment input' in title or
+                        (name.startswith('__privateStripeFrame') and 'express' not in src)):
+                        target_iframes.append(iframe)
                 except Exception:
                     continue
 
@@ -1791,7 +1802,6 @@ def _check_stripe_iframe_errors(driver):
             try:
                 driver.switch_to.default_content()
                 driver.switch_to.frame(sf)
-                # 查找 Stripe FieldError 元素
                 field_errors = driver.find_elements(By.CSS_SELECTOR,
                     '.p-FieldError, [role="alert"][id*="Error"], '
                     '[role="alert"].Error')
@@ -1810,7 +1820,87 @@ def _check_stripe_iframe_errors(driver):
             driver.switch_to.default_content()
         except Exception:
             pass
+
     return None
+
+
+def _find_stripe_field_errors_in_dom(node):
+    """
+    递归遍历 CDP DOM 树，查找 Stripe 的 FieldError 元素
+    匹配: class 包含 'p-FieldError' 或 id 包含 'Error' 且 role='alert' 的元素
+    """
+    node_name = node.get('nodeName', '').lower()
+
+    # 检查当前节点是否是错误元素（p, div, span 等）
+    if node_name in ('p', 'div', 'span'):
+        attrs = node.get('attributes', [])
+        attr_dict = dict(zip(attrs[::2], attrs[1::2])) if attrs else {}
+
+        cls = attr_dict.get('class', '')
+        node_id = attr_dict.get('id', '')
+        role = attr_dict.get('role', '')
+
+        # 匹配 Stripe FieldError: class 包含 "p-FieldError" 或 "FieldError"
+        is_field_error = ('FieldError' in cls or 'p-FieldError' in cls)
+        # 匹配 role="alert" 且 id 包含 "Error"
+        is_alert_error = (role == 'alert' and 'Error' in node_id)
+
+        if is_field_error or is_alert_error:
+            # 提取文本内容
+            text = _extract_text_from_dom_node(node)
+            if text:
+                return text
+
+    # 递归子节点
+    for child in node.get('children', []):
+        result = _find_stripe_field_errors_in_dom(child)
+        if result:
+            return result
+
+    # 递归 shadow roots（Stripe 不常用但以防万一）
+    for shadow in node.get('shadowRoots', []):
+        for child in shadow.get('children', []):
+            result = _find_stripe_field_errors_in_dom(child)
+            if result:
+                return result
+
+    # 递归 iframe 的 contentDocument
+    if node_name == 'iframe':
+        for child in node.get('children', []):
+            # iframe 的 children 中可能包含 contentDocument
+            if child.get('nodeName', '') == '#document':
+                result = _find_stripe_field_errors_in_dom(child)
+                if result:
+                    return result
+
+    # contentDocument 节点
+    content_doc = node.get('contentDocument')
+    if content_doc:
+        result = _find_stripe_field_errors_in_dom(content_doc)
+        if result:
+            return result
+
+    return None
+
+
+def _extract_text_from_dom_node(node):
+    """从 CDP DOM 节点提取文本内容"""
+    # 直接文本节点
+    if node.get('nodeType') == 3:  # TEXT_NODE
+        return (node.get('nodeValue', '') or '').strip()
+
+    text_parts = []
+    for child in node.get('children', []):
+        if child.get('nodeType') == 3:
+            val = (child.get('nodeValue', '') or '').strip()
+            if val:
+                text_parts.append(val)
+        else:
+            sub = _extract_text_from_dom_node(child)
+            if sub:
+                text_parts.append(sub)
+
+    return ' '.join(text_parts) if text_parts else None
 
 
 def _check_dialog_card_error(driver):
