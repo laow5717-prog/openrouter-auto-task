@@ -1466,7 +1466,8 @@ def add_credit_card(driver, card_info):
     2. 等待 "Add a payment method" 弹窗出现
     3. 在 Stripe iframe 中填写卡号/有效期/CVC
     4. 在弹窗主文档中填写账单地址
-    5. 点击 "Add payment method" 提交按钮
+    5. 处理弹窗内 Turnstile 人机验证（如果出现）
+    6. 点击 "Add payment method" 提交按钮
 
     参数:
         driver: 浏览器驱动
@@ -1526,6 +1527,12 @@ def add_credit_card(driver, card_info):
 
         time.sleep(2)
 
+        # 5.5 处理弹窗内的 Turnstile 验证（"Let us know you're human"）
+        print("🔒 检查弹窗内是否有 Turnstile 验证...")
+        _handle_dialog_turnstile(driver)
+
+        time.sleep(1)
+
         # 6. 点击 "Add payment method" 提交按钮
         print("🔘 查找提交按钮...")
         submitted = False
@@ -1569,6 +1576,184 @@ def add_credit_card(driver, card_info):
         except Exception:
             pass
         return False
+
+
+def _handle_dialog_turnstile(driver, max_wait=120):
+    """
+    处理 Add payment method 弹窗内的 Turnstile 验证
+    弹窗中可能出现 "Let us know you're human" + Turnstile checkbox
+    需要在点击提交按钮之前完成验证
+    """
+    driver.switch_to.default_content()
+
+    # 检查弹窗内是否存在 Turnstile
+    has_turnstile = False
+    try:
+        dialog = driver.find_element(By.CSS_SELECTOR, '[role="dialog"]')
+        if not dialog.is_displayed():
+            return True
+
+        dialog_text = dialog.text.lower()
+        if ("let us know you" in dialog_text or
+            "verify you are human" in dialog_text or
+            "captcha is required" in dialog_text or
+            '确认您是真人' in dialog_text or
+            '证明你是人类' in dialog_text):
+            has_turnstile = True
+
+        # 也检查弹窗内是否有 Turnstile iframe 或容器
+        if not has_turnstile:
+            turnstile_els = dialog.find_elements(By.CSS_SELECTOR,
+                'iframe[src*="challenges.cloudflare.com"], '
+                'iframe[src*="turnstile"], '
+                '[data-testid="challenge-widget-container"], '
+                'iframe[title*="challenge"], '
+                'iframe[title*="Turnstile"], '
+                '[id*="cf-chl-widget"]')
+            if any(el.is_displayed() for el in turnstile_els):
+                has_turnstile = True
+    except Exception:
+        return True
+
+    if not has_turnstile:
+        print("  ℹ️ 弹窗内无 Turnstile 验证，继续")
+        return True
+
+    print("  🔒 检测到弹窗内 Turnstile 验证，开始处理...")
+
+    # 尝试 CDP 点击 Turnstile checkbox
+    print("  🤖 尝试自动点击验证框...")
+    _try_click_turnstile(driver)
+
+    # 等待验证完成（轮询检查）
+    print("  ⏳ 等待 Turnstile 后台验证...")
+    for i in range(10):
+        time.sleep(3)
+        if _is_dialog_turnstile_solved(driver):
+            print("  ✅ 弹窗内 Turnstile 验证已通过！")
+            return True
+        if i == 3:
+            print("  ⏳ 仍在等待验证结果...")
+
+    # CDP 未通过，尝试 2Captcha
+    if captcha_solver.is_available():
+        print("  🤖 尝试使用 2Captcha 解决弹窗内 Turnstile...")
+        if captcha_solver.solve_turnstile(driver):
+            time.sleep(5)
+            if _is_dialog_turnstile_solved(driver):
+                print("  ✅ 2Captcha 解决成功！")
+                return True
+
+    # 提示用户手动操作
+    print("")
+    print("  " + "=" * 50)
+    print("  ⚠️  需要手动完成弹窗内人机验证！")
+    print("  👉 请在浏览器弹窗中勾选 Turnstile 验证框")
+    print(f"  ⏰ 等待时间: 最长 {max_wait} 秒")
+    print("  " + "=" * 50)
+    print("")
+
+    try:
+        driver.set_window_position(100, 100)
+        driver.execute_script("window.focus();")
+    except Exception:
+        pass
+
+    start = time.time()
+    while time.time() - start < max_wait:
+        if _is_dialog_turnstile_solved(driver):
+            elapsed = int(time.time() - start)
+            print(f"  ✅ 弹窗内 Turnstile 验证已通过！(耗时 {elapsed} 秒)")
+            return True
+        time.sleep(2)
+
+    print("  ⚠️ 弹窗内 Turnstile 验证超时，尝试继续提交...")
+    return False
+
+
+def _is_dialog_turnstile_solved(driver):
+    """检测弹窗内 Turnstile 验证是否已完成"""
+    try:
+        driver.switch_to.default_content()
+
+        # 方法1: 检查隐藏 input 是否有 token 值
+        hidden_inputs = driver.find_elements(
+            By.CSS_SELECTOR,
+            'input[name="cf_challenge_response"], '
+            'input[name="cf-turnstile-response"], '
+            'input[name*="turnstile"], '
+            'input[name*="challenge_response"]'
+        )
+        for inp in hidden_inputs:
+            value = inp.get_attribute('value') or ''
+            if len(value) > 10:
+                return True
+
+        # 方法2: 通过 JS 查找（包括弹窗内部）
+        try:
+            result = driver.execute_script("""
+                var dialog = document.querySelector('[role="dialog"]');
+                if (!dialog) return false;
+                // 弹窗内查找 token input
+                var inputs = dialog.querySelectorAll('input[type="hidden"]');
+                for (var i = 0; i < inputs.length; i++) {
+                    var name = inputs[i].name || '';
+                    if ((name.indexOf('turnstile') >= 0 || name.indexOf('challenge') >= 0)
+                        && inputs[i].value && inputs[i].value.length > 10) {
+                        return true;
+                    }
+                }
+                // 全局查找
+                var cf = document.querySelector('input[name="cf-turnstile-response"]');
+                if (cf && cf.value && cf.value.length > 10) return true;
+                var cf2 = document.querySelector('input[name="cf_challenge_response"]');
+                if (cf2 && cf2.value && cf2.value.length > 10) return true;
+                return false;
+            """)
+            if result:
+                return True
+        except Exception:
+            pass
+
+        # 方法3: 检查弹窗中的验证提示文字是否消失
+        try:
+            dialog = driver.find_element(By.CSS_SELECTOR, '[role="dialog"]')
+            if dialog.is_displayed():
+                dialog_text = dialog.text.lower()
+                # 如果 "captcha is required" 和 "verify you are human" 都不在了
+                if ('captcha is required' not in dialog_text and
+                    'let us know you' not in dialog_text and
+                    'verify you are human' not in dialog_text):
+                    return True
+        except Exception:
+            pass
+
+        # 方法4: 检查 Turnstile iframe 中的 checkbox 是否已勾选（通过 aria-checked）
+        try:
+            result = driver.execute_script("""
+                var iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+                for (var i = 0; i < iframes.length; i++) {
+                    if (!iframes[i].offsetParent) continue;
+                    var rect = iframes[i].getBoundingClientRect();
+                    // 已验证的 Turnstile iframe 通常会显示绿色勾选标记
+                    // 检查 data-* 属性变化
+                    var parent = iframes[i].parentElement;
+                    if (parent) {
+                        var response = parent.querySelector('input[type="hidden"]');
+                        if (response && response.value && response.value.length > 10) return true;
+                    }
+                }
+                return false;
+            """)
+            if result:
+                return True
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return False
 
 
 def _find_payment_submit_button(driver):
