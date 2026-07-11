@@ -1756,6 +1756,89 @@ def _is_dialog_turnstile_solved(driver):
     return False
 
 
+def _check_dialog_card_error(driver):
+    """
+    检查弹窗内是否出现信用卡/表单错误信息
+    返回错误描述字符串（如果有错误），否则返回 None
+    """
+    try:
+        dialog = None
+        dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+        for d in dialogs:
+            if d.is_displayed():
+                dialog = d
+                break
+        if not dialog:
+            return None
+
+        dialog_text = dialog.text
+
+        # 中文错误信息检测
+        cn_error_keywords = [
+            '安全码错误', '卡号错误', '卡号无效', '银行卡被拒',
+            '交易被拒绝', '卡片被拒绝', '信用卡被拒', '付款失败',
+            '无法处理', '请检查您的', '卡已过期',
+            '资金不足', '卡号不正确', '有效期错误', '信息不正确',
+        ]
+        for kw in cn_error_keywords:
+            if kw in dialog_text:
+                return kw
+
+        # 英文错误信息检测（精确匹配优先，避免误报）
+        dialog_text_lower = dialog_text.lower()
+        # 精确的卡片错误短语（不会误匹配正常 UI 文本）
+        card_error_phrases = [
+            "your card's security code is incorrect",
+            'security code is incorrect', 'card was declined',
+            'card number is invalid', 'card has expired',
+            'card number is incomplete', 'expiration date is incomplete',
+            "your card's expiration date is in the past",
+            "your card's expiration year is invalid",
+            'insufficient funds', 'transaction declined',
+            'payment failed', 'unable to process',
+            'incorrect cvc', 'incorrect security code',
+            'card has been declined', 'do not honor',
+            'lost or stolen', 'pickup card',
+            'processing error', 'try again later',
+        ]
+        for phrase in card_error_phrases:
+            if phrase in dialog_text_lower:
+                return phrase
+
+        # 检测弹窗内的错误提示元素（role="alert" 等）
+        # 排除 captcha 相关的提示（如 "Captcha is required."）
+        try:
+            error_els = dialog.find_elements(By.CSS_SELECTOR,
+                '[role="alert"], [data-error], '
+                '.field-error, .form-error, .validation-error')
+            for err_el in error_els:
+                if not err_el.is_displayed():
+                    continue
+                err_text = err_el.text.strip()
+                if not err_text:
+                    continue
+                # 排除 captcha 相关提示
+                err_lower = err_text.lower()
+                if 'captcha' in err_lower or 'human' in err_lower:
+                    continue
+                return err_text[:100]
+        except Exception:
+            pass
+
+        # Stripe 表单验证错误
+        try:
+            stripe_errors = driver.find_elements(By.CSS_SELECTOR, '.StripeElement--invalid')
+            if any(e.is_displayed() for e in stripe_errors):
+                return 'Stripe 表单验证错误'
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return None
+
+
 def _find_payment_submit_button(driver):
     """在弹窗中查找 'Add payment method' 提交按钮"""
     # 方法1: 精确匹配 data-kumo-component 按钮
@@ -1843,7 +1926,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     if not retry_clicked:
         print("  ⏳ 提交按钮已进入处理状态，等待结果...")
 
-    time.sleep(10)
+    time.sleep(5)
     print("  ⏳ 开始检测结果...")
 
     user_notified_captcha = False
@@ -1865,7 +1948,14 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         except Exception:
             pass
 
-        # 检查2: 是否出现人机验证
+        # 检查2: 弹窗内是否有表单/卡片错误（优先于 captcha 检测）
+        card_error = _check_dialog_card_error(driver)
+        if card_error:
+            print(f"  ❌ 添加失败: {card_error}")
+            _close_payment_dialog(driver)
+            return False
+
+        # 检查3: 是否出现人机验证
         captcha_type = None  # 'turnstile', 'hcaptcha', 'unknown'
         try:
             # Cloudflare Turnstile
@@ -2081,70 +2171,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
             time.sleep(3)
             continue
 
-        # 检查3: 弹窗仍在但有错误信息
-        try:
-            dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
-            for dialog in dialogs:
-                if not dialog.is_displayed():
-                    continue
-                dialog_text = dialog.text
-
-                # 中文错误信息检测（原文匹配，不转小写）
-                cn_error_keywords = [
-                    '安全码错误', '卡号错误', '卡号无效', '银行卡被拒',
-                    '交易被拒绝', '卡片被拒绝', '信用卡被拒', '付款失败',
-                    '验证失败', '无法处理', '请检查您的', '卡已过期',
-                    '资金不足', '卡号不正确', '有效期错误', '信息不正确',
-                ]
-                for kw in cn_error_keywords:
-                    if kw in dialog_text:
-                        print(f"  ❌ 添加失败: {kw}")
-                        _close_payment_dialog(driver)
-                        return False
-
-                # 英文错误信息检测
-                dialog_text_lower = dialog_text.lower()
-                en_error_keywords = [
-                    'security code is incorrect', 'card was declined',
-                    'card number is invalid', 'card has expired',
-                    'insufficient funds', 'transaction declined',
-                    'payment failed', 'unable to process',
-                    'incorrect cvc', 'incorrect security code',
-                    'error', 'declined', 'invalid', 'failed',
-                    'unable', 'unsuccessful',
-                ]
-                for kw in en_error_keywords:
-                    if kw in dialog_text_lower:
-                        print(f"  ❌ 添加失败: 检测到错误 '{kw}'")
-                        _close_payment_dialog(driver)
-                        return False
-
-                # 通用错误样式检测（弹窗内的 alert/error 元素）
-                try:
-                    error_els = dialog.find_elements(By.CSS_SELECTOR,
-                        '[role="alert"], .error, .Error, [data-error], '
-                        '.field-error, .form-error, .validation-error, '
-                        '[class*="error" i], [class*="Error"]')
-                    for err_el in error_els:
-                        if err_el.is_displayed() and err_el.text.strip():
-                            print(f"  ❌ 添加失败: 表单错误 - {err_el.text.strip()[:100]}")
-                            _close_payment_dialog(driver)
-                            return False
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 检查4: Stripe 表单验证错误（在 iframe 内）
-        try:
-            stripe_errors = driver.find_elements(By.CSS_SELECTOR, '.StripeElement--invalid')
-            visible_errors = [e for e in stripe_errors if e.is_displayed()]
-            if visible_errors:
-                print("  ❌ Stripe 表单验证错误")
-                _close_payment_dialog(driver)
-                return False
-        except Exception:
-            pass
+        # (卡片错误检测已在循环开头的 _check_dialog_card_error 中处理)
 
         # 继续等待 - 每30秒输出一次状态
         elapsed = int(time.time() - start)
