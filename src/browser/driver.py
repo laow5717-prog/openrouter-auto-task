@@ -1506,11 +1506,14 @@ def _fill_billing_address_in_dialog(driver, card_info):
             if country_input:
                 country_input.click()
                 time.sleep(0.3)
-                # 清除已有内容: 用 JS 清空 + select all delete 兜底
-                # 注意: Keys.COMMAND 在 Windows 上是 Win 键，会触发系统快捷键并泄漏字母
-                driver.execute_script("arguments[0].value = '';", country_input)
-                country_input.send_keys(Keys.CONTROL + 'a')
-                country_input.send_keys(Keys.DELETE)
+                # 清除已有内容: 用 ActionChains 确保修饰键正确按住
+                # send_keys(Keys.CONTROL + 'a') 在 Windows 上可能泄漏字母 'a'
+                actions = ActionChains(driver)
+                actions.click(country_input)
+                actions.key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL)
+                actions.pause(0.1)
+                actions.send_keys(Keys.BACKSPACE)
+                actions.perform()
                 time.sleep(0.3)
                 # 输入国家名称
                 type_slowly(country_input, country)
