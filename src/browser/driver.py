@@ -1506,10 +1506,10 @@ def _fill_billing_address_in_dialog(driver, card_info):
             if country_input:
                 country_input.click()
                 time.sleep(0.3)
-                # 三重清除: select all + delete
+                # 清除已有内容: 用 JS 清空 + select all delete 兜底
+                # 注意: Keys.COMMAND 在 Windows 上是 Win 键，会触发系统快捷键并泄漏字母
+                driver.execute_script("arguments[0].value = '';", country_input)
                 country_input.send_keys(Keys.CONTROL + 'a')
-                country_input.send_keys(Keys.DELETE)
-                country_input.send_keys(Keys.COMMAND + 'a')
                 country_input.send_keys(Keys.DELETE)
                 time.sleep(0.3)
                 # 输入国家名称
