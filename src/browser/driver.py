@@ -438,7 +438,7 @@ def _click_turnstile_via_cdp(driver):
 
         print(f"    → CDP: 找到 Turnstile iframe, 点击视口坐标 ({click_x:.0f}, {click_y:.0f})")
         _cdp_click_at(driver, click_x, click_y)
-        print("    ✅ CDP: 已模拟点击 Turnstile checkbox")
+        print("    → CDP: 已发送点击事件到 Turnstile checkbox (等待验证结果...)")
         return True
     except Exception as e:
         print(f"    ⚠️ CDP 点击失败: {e}")
@@ -671,10 +671,15 @@ def _handle_inline_turnstile(driver, max_wait=120):
     if captcha_solver.is_available():
         print("  🤖 尝试使用 2Captcha 解决内嵌 Turnstile...")
         if captcha_solver.solve_turnstile(driver):
-            time.sleep(5)
-            if _is_turnstile_solved(driver):
+            # 注入 token 后需要触发表单提交或等待页面自动响应
+            # 不能用 _is_turnstile_solved 验证，因为 token 是我们自己注入的
+            # 需要通过页面行为变化来判断：Turnstile widget 消失、验证容器变化、或页面跳转
+            time.sleep(8)
+            if _is_turnstile_truly_solved(driver):
                 print("  ✅ 2Captcha 解决成功！")
                 return True
+            else:
+                print("  ⚠️ 2Captcha token 已注入但验证未通过，可能 token 已过期")
 
     # 2Captcha 也失败，提示用户手动操作
     print("")
@@ -694,6 +699,61 @@ def _handle_inline_turnstile(driver, max_wait=120):
         time.sleep(2)
 
     print("  ❌ 人机验证超时")
+    return False
+
+
+def _is_turnstile_truly_solved(driver):
+    """
+    通过页面行为变化判断 Turnstile 是否真正通过（不依赖 input value）。
+    用于 2Captcha 注入 token 后的验证，避免被自己注入的值欺骗。
+    """
+    try:
+        # 检查1: Turnstile widget 是否显示已验证状态（绿色勾 / 成功样式）
+        result = driver.execute_script("""
+            // 检查 Turnstile 容器是否有 success 状态
+            var containers = document.querySelectorAll(
+                '[data-testid="challenge-widget-container"], .cf-turnstile, [id*="cf-chl-widget"]'
+            );
+            for (var i = 0; i < containers.length; i++) {
+                var c = containers[i];
+                // 检查容器的 data-status 属性
+                if (c.getAttribute('data-status') === 'solved' ||
+                    c.getAttribute('data-status') === 'success') return true;
+                // 检查是否有 success class
+                if (c.className && (c.className.indexOf('success') >= 0 ||
+                    c.className.indexOf('solved') >= 0)) return true;
+            }
+
+            // 检查2: 验证组件是否已消失（Turnstile 通过后通常会隐藏）
+            var visibleWidgets = document.querySelectorAll(
+                '[data-testid="challenge-widget-container"]:not([style*="display: none"]):not([hidden])'
+            );
+            // 如果之前有容器但现在都隐藏了，说明验证通过
+            var allWidgets = document.querySelectorAll('[data-testid="challenge-widget-container"]');
+            if (allWidgets.length > 0 && visibleWidgets.length === 0) return true;
+
+            // 检查3: 按钮是否变为可点击状态（验证通过后提交按钮通常会启用）
+            var submitBtn = document.querySelector('button[type="submit"]:not([disabled])');
+            if (submitBtn) {
+                // 同时确认验证容器存在（避免误判）
+                if (allWidgets.length > 0) return true;
+            }
+
+            return false;
+        """)
+        if result:
+            return True
+    except Exception:
+        pass
+
+    # 检查4: 页面 URL 是否已变化（提交成功后可能跳转）
+    try:
+        current_url = driver.current_url
+        if 'sign-up' not in current_url and 'challenge' not in current_url:
+            return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -1695,10 +1755,12 @@ def _handle_dialog_turnstile(driver, max_wait=120):
     if captcha_solver.is_available():
         print("  🤖 尝试使用 2Captcha 解决弹窗内 Turnstile...")
         if captcha_solver.solve_turnstile(driver):
-            time.sleep(5)
-            if _is_dialog_turnstile_solved(driver):
+            time.sleep(8)
+            if _is_turnstile_truly_solved(driver):
                 print("  ✅ 2Captcha 解决成功！")
                 return True
+            else:
+                print("  ⚠️ 2Captcha token 已注入但验证未通过，可能 token 已过期")
 
     # 提示用户手动操作
     print("")
@@ -2608,15 +2670,89 @@ def _fill_stripe_payment_element(driver, card_info):
         'input[data-elements-stable-field-name="cardCvc"]',
     ]
 
+    # Stripe Payment Element 内的账单地址字段选择器
+    billing_fields = [
+        ('billingName', [
+            'input[name="billingName"]',
+            'input[autocomplete="name"]',
+            'input[autocomplete="cc-name"]',
+            'input[data-elements-stable-field-name="billingName"]',
+            'input[placeholder*="Name on card"]',
+            'input[placeholder*="name on card"]',
+            'input[placeholder*="Full name"]',
+        ], lambda ci: f"{ci.get('first_name', '')} {ci.get('last_name', '')}".strip()),
+        ('billingAddress_line1', [
+            'input[name="addressLine1"]',
+            'input[name="billingAddress-line1"]',
+            'input[autocomplete="address-line1"]',
+            'input[data-elements-stable-field-name="addressLine1"]',
+            'input[placeholder*="Address"]',
+        ], lambda ci: ci.get('address', '')),
+        ('billingAddress_line2', [
+            'input[name="addressLine2"]',
+            'input[name="billingAddress-line2"]',
+            'input[autocomplete="address-line2"]',
+            'input[data-elements-stable-field-name="addressLine2"]',
+        ], lambda ci: ci.get('address2', '')),
+        ('billingAddress_city', [
+            'input[name="addressCity"]',
+            'input[name="billingAddress-city"]',
+            'input[autocomplete="address-level2"]',
+            'input[data-elements-stable-field-name="addressCity"]',
+            'input[placeholder*="City"]',
+        ], lambda ci: ci.get('city', '')),
+        ('billingAddress_state', [
+            'input[name="addressState"]',
+            'input[name="billingAddress-state"]',
+            'input[autocomplete="address-level1"]',
+            'input[data-elements-stable-field-name="addressState"]',
+            'select[name="addressState"]',
+            'input[placeholder*="State"]',
+        ], lambda ci: ci.get('state', '')),
+        ('billingAddress_zip', [
+            'input[name="addressZip"]',
+            'input[name="billingAddress-postalCode"]',
+            'input[autocomplete="postal-code"]',
+            'input[data-elements-stable-field-name="addressZip"]',
+            'input[placeholder*="ZIP"]',
+        ], lambda ci: ci.get('zip', '')),
+        ('billingAddress_country', [
+            'select[name="addressCountry"]',
+            'select[name="billingAddress-country"]',
+            'select[autocomplete="country"]',
+            'input[name="addressCountry"]',
+            'input[data-elements-stable-field-name="addressCountry"]',
+        ], lambda ci: ci.get('country', '')),
+    ]
+
     def try_fill_selectors(selectors, value, label):
         nonlocal filled_any
+        if not value:
+            return False
         for sel in selectors:
             try:
                 el = driver.find_element(By.CSS_SELECTOR, sel)
                 if el.is_displayed():
-                    el.click()
-                    time.sleep(0.3)
-                    type_slowly(el, value)
+                    tag = el.tag_name.lower()
+                    if tag == 'select':
+                        # 下拉选择框：用 JS 设置值
+                        from selenium.webdriver.support.ui import Select
+                        select = Select(el)
+                        try:
+                            select.select_by_visible_text(value)
+                        except Exception:
+                            try:
+                                select.select_by_value(value)
+                            except Exception:
+                                # 尝试模糊匹配
+                                for opt in select.options:
+                                    if value.lower() in opt.text.lower():
+                                        opt.click()
+                                        break
+                    else:
+                        el.click()
+                        time.sleep(0.3)
+                        type_slowly(el, value)
                     print(f"  ✅ 填写 {label}")
                     filled_any = True
                     return True
@@ -2631,15 +2767,30 @@ def _fill_stripe_payment_element(driver, card_info):
     expiry = f"{exp_month}{exp_year[-2:]}" if exp_year else exp_month
     cvc = card_info.get('cvc', '')
 
+    def try_fill_billing_fields():
+        """尝试填写 Stripe iframe 内的账单地址字段"""
+        for field_name, selectors, value_fn in billing_fields:
+            value = value_fn(card_info)
+            if value:
+                try_fill_selectors(selectors, value, field_name)
+                time.sleep(0.3)
+
     if try_fill_selectors(card_selectors, number, '卡号'):
         time.sleep(0.5)
         try_fill_selectors(expiry_selectors, expiry, '有效期')
         time.sleep(0.5)
         try_fill_selectors(cvc_selectors, cvc, 'CVC')
+        time.sleep(0.5)
+        # 同一 frame 内可能也有账单地址字段
+        try_fill_billing_fields()
         return filled_any
 
     # 当前 iframe 没有直接字段，可能有嵌套 iframe
-    # Stripe Payment Element 有时在内部再嵌套 iframe
+    # Stripe Payment Element 每个字段（卡号、有效期、CVC、账单地址）各自在独立的嵌套 iframe 中
+    card_filled_nested = False
+    expiry_filled_nested = False
+    cvc_filled_nested = False
+    billing_filled_in_nested = False
     try:
         inner_frames = driver.find_elements(By.TAG_NAME, 'iframe')
         for frame in inner_frames:
@@ -2648,15 +2799,22 @@ def _fill_stripe_payment_element(driver, card_info):
                     continue
                 driver.switch_to.frame(frame)
 
-                if try_fill_selectors(card_selectors, number, '卡号'):
-                    time.sleep(0.5)
-                    try_fill_selectors(expiry_selectors, expiry, '有效期')
-                    time.sleep(0.5)
-                    try_fill_selectors(cvc_selectors, cvc, 'CVC')
-                    driver.switch_to.parent_frame()
-                    return filled_any
+                if not card_filled_nested and try_fill_selectors(card_selectors, number, '卡号'):
+                    card_filled_nested = True
+                elif not expiry_filled_nested and try_fill_selectors(expiry_selectors, expiry, '有效期'):
+                    expiry_filled_nested = True
+                elif not cvc_filled_nested and try_fill_selectors(cvc_selectors, cvc, 'CVC'):
+                    cvc_filled_nested = True
+                else:
+                    # 尝试填写账单地址字段（可能分布在不同嵌套 iframe 中）
+                    for field_name, selectors, value_fn in billing_fields:
+                        value = value_fn(card_info)
+                        if value and try_fill_selectors(selectors, value, field_name):
+                            billing_filled_in_nested = True
+                            time.sleep(0.2)
 
                 driver.switch_to.parent_frame()
+                time.sleep(0.3)
             except Exception:
                 try:
                     driver.switch_to.parent_frame()
@@ -2665,12 +2823,35 @@ def _fill_stripe_payment_element(driver, card_info):
     except Exception:
         pass
 
+    if card_filled_nested or expiry_filled_nested or cvc_filled_nested:
+        # 卡信息填了部分，也尝试在父 frame 层填写账单地址
+        if not billing_filled_in_nested:
+            try_fill_billing_fields()
+        return filled_any
+
     # 最后尝试: 用 Tab 键在表单字段间切换输入
     print("  ⚠️ 未找到独立字段，尝试 Tab 键导航输入...")
     try:
         # 点击 iframe 区域获取焦点
-        body = driver.find_element(By.TAG_NAME, 'body')
-        body.click()
+        # Windows 上 Stripe iframe 内 body 可能尺寸为零，无法直接 click()
+        # 使用 JS focus + ActionChains 点击坐标作为回退
+        try:
+            body = driver.find_element(By.TAG_NAME, 'body')
+            body.click()
+        except Exception:
+            # body 尺寸为零时，用 JS 聚焦 + ActionChains 点击 iframe 中心
+            driver.execute_script("document.body.focus();")
+            try:
+                # 尝试找到任意可见元素并点击
+                first_el = driver.execute_script(
+                    "return document.querySelector('div, span, input, label, p');"
+                )
+                if first_el:
+                    ActionChains(driver).move_to_element(first_el).click().perform()
+                else:
+                    ActionChains(driver).send_keys("").perform()
+            except Exception:
+                pass
         time.sleep(0.5)
 
         # 输入卡号
