@@ -597,6 +597,114 @@ def _click_hcaptcha_via_cdp(driver):
         return False
 
 
+def _wait_for_turnstile_widget(driver, timeout=15):
+    """
+    等待 Turnstile 人机验证组件加载完成。
+    组件可能延迟渲染，需等待其 iframe 或容器实际出现在 DOM 中。
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            # 检查 Turnstile 容器
+            containers = driver.find_elements(
+                By.CSS_SELECTOR,
+                'div[data-testid="challenge-widget-container"], '
+                '[id*="cf-chl-widget"], .cf-turnstile, [data-sitekey]'
+            )
+            if containers:
+                # 容器存在，再检查内部 iframe 是否加载
+                has_iframe = driver.execute_script("""
+                    var widgets = document.querySelectorAll(
+                        '[id*="cf-chl-widget"], .cf-turnstile, [data-sitekey], '
+                        '[data-testid="challenge-widget-container"]'
+                    );
+                    for (var i = 0; i < widgets.length; i++) {
+                        // 检查 shadow DOM 中的 iframe
+                        if (widgets[i].shadowRoot) {
+                            var sf = widgets[i].shadowRoot.querySelector('iframe');
+                            if (sf) return true;
+                        }
+                        // 检查普通子元素中的 iframe
+                        var f = widgets[i].querySelector('iframe');
+                        if (f) return true;
+                    }
+                    // 检查隐藏 input 是否已存在
+                    var cf = document.querySelector('input[name="cf_challenge_response"]');
+                    if (cf) return true;
+                    return false;
+                """)
+                if has_iframe:
+                    print("  ✅ Turnstile 组件已加载")
+                    time.sleep(1)  # 额外等待渲染稳定
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("  ℹ️ Turnstile 组件等待超时，继续执行")
+
+
+def _wait_for_stripe_fields_ready(driver, timeout=15):
+    """
+    在已切入的 Stripe iframe 内，等待输入字段或嵌套 iframe 实际渲染完成。
+    弹窗和外层 iframe 可能先出现，但内部字段延迟加载。
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            # 检查1: 直接输入框
+            inputs = driver.find_elements(By.CSS_SELECTOR,
+                'input[name="cardnumber"], input[name="number"], '
+                'input[autocomplete="cc-number"], '
+                'input[data-elements-stable-field-name="cardNumber"]'
+            )
+            for inp in inputs:
+                if inp.is_displayed():
+                    print("  ✅ Stripe 输入字段已就绪")
+                    time.sleep(0.5)
+                    return True
+
+            # 检查2: 嵌套 iframe（Stripe 每个字段一个 iframe）
+            inner_frames = driver.find_elements(By.TAG_NAME, 'iframe')
+            visible_frames = [f for f in inner_frames if f.is_displayed()]
+            if len(visible_frames) >= 2:  # 至少有卡号和有效期两个 iframe
+                print(f"  ✅ Stripe 嵌套 iframe 已就绪 ({len(visible_frames)} 个)")
+                time.sleep(0.5)
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("  ⚠️ Stripe 字段加载等待超时，尝试继续")
+
+
+def _wait_for_billing_form_ready(driver, timeout=15):
+    """
+    等待账单地址表单字段渲染完成。
+    弹窗出现后，地址表单可能延迟加载。
+    """
+    driver.switch_to.default_content()
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            # 查找 first_name 或 country 字段（地址表单的标志性字段）
+            fields = driver.find_elements(By.CSS_SELECTOR,
+                '[role="dialog"] input[name="first_name"], '
+                '[role="dialog"] input[name="country"], '
+                '[data-testid="address-form"] input[name="first_name"]'
+            )
+            for f in fields:
+                if f.is_displayed():
+                    print("  ✅ 账单地址表单已加载")
+                    time.sleep(0.5)
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("  ⚠️ 账单地址表单加载等待超时，尝试继续")
+
+
 def _handle_inline_turnstile(driver, max_wait=120):
     """
     处理页面内嵌的 Turnstile 人机验证
@@ -882,6 +990,9 @@ def fill_signup_form(driver, email: str, password: str):
                 print("  ℹ️ 未找到条款复选框（可能不需要）")
 
         # 处理注册页面内嵌的 Turnstile 人机验证（"Let us know you are human"）
+        # Turnstile 组件可能延迟加载，需等待其 iframe 或容器实际出现
+        print("🔒 等待人机验证组件加载...")
+        _wait_for_turnstile_widget(driver, timeout=15)
         print("🔒 检查注册页面内嵌的人机验证...")
         _handle_inline_turnstile(driver)
         time.sleep(2)
@@ -1609,6 +1720,10 @@ def add_credit_card(driver, card_info):
         driver.switch_to.frame(stripe_iframe)
         time.sleep(1)
 
+        # 等待 Stripe iframe 内部组件（输入字段/嵌套 iframe）实际渲染完成
+        # 弹窗和外层 iframe 出现后，内部字段可能仍在加载中
+        _wait_for_stripe_fields_ready(driver)
+
         # Stripe Payment Element 使用统一的表单，字段可能在嵌套 iframe 中
         # 尝试在当前 iframe 内直接查找并填写
         card_filled = _fill_stripe_payment_element(driver, card_info)
@@ -1622,6 +1737,9 @@ def add_credit_card(driver, card_info):
         time.sleep(1)
 
         # 5. 填写账单地址（在弹窗主文档中）
+        # 等待地址表单字段渲染完成
+        print("🏠 等待账单地址表单加载...")
+        _wait_for_billing_form_ready(driver)
         print("🏠 正在填写账单地址...")
         _fill_billing_address_in_dialog(driver, card_info)
 
