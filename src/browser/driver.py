@@ -1503,8 +1503,9 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
 
 def handle_unpaid_invoices(driver):
     """
-    检查 Credits 页面的 Unpaid invoice，下载 PDF 并打开 Pay online 链接，
-    展开 Card 支付表单。信用卡数据填写由后续流程处理。
+    检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
+    打开 Stripe 支付页面并展开 Card 表单。
+    每处理完一个 invoice 后刷新 credits 页面重新查找。
 
     参数:
         driver: 浏览器驱动
@@ -1517,124 +1518,141 @@ def handle_unpaid_invoices(driver):
         print("未配置下载目录，跳过 Unpaid invoice 处理")
         return results
 
-    try:
-        # 等待 top-up history 表格加载
+    processed_ids = set()
+    round_num = 0
+
+    while True:
+        round_num += 1
+        # 等待表格加载
         time.sleep(3)
 
-        # 查找所有包含 Unpaid 的行，先收集信息避免 stale element
+        # 查找 Unpaid 行
         rows = driver.find_elements(By.XPATH, "//table//tr[.//span[text()='Unpaid']]")
         if not rows:
-            print("未发现 Unpaid invoice")
-            return results
+            if round_num == 1:
+                print("未发现 Unpaid invoice")
+            break
 
-        # 提取所有 invoice ID（后续可能会导航离开当前页面导致元素失效）
-        invoice_ids = []
+        # 找到第一个未处理过的 invoice
+        invoice_id = None
+        invoice_link = None
         for row in rows:
             try:
                 link = row.find_element(By.XPATH, ".//a[@role='button']")
-                invoice_ids.append(link.text.strip())
+                iid = link.text.strip()
+                if iid and iid not in processed_ids:
+                    invoice_id = iid
+                    invoice_link = link
+                    break
             except Exception:
-                pass
-
-        print(f"发现 {len(invoice_ids)} 条 Unpaid invoice，开始处理...")
-
-        for i, invoice_id in enumerate(invoice_ids):
-            try:
-                print(f"[{i+1}/{len(invoice_ids)}] 处理 invoice: {invoice_id}")
-
-                # 重新查找当前 invoice 的下载链接（页面可能已刷新）
-                # 用 contains(.,id) 匹配整个元素文本（含子元素），而非 text() 仅匹配直接文本节点
-                invoice_link = driver.find_element(
-                    By.XPATH, f"//table//tr[.//span[text()='Unpaid']]//a[@role='button'][contains(.,'{invoice_id}')]"
-                )
-
-                # 清空下载目录中的旧 PDF
-                for f in os.listdir(download_dir):
-                    if f.endswith('.pdf'):
-                        os.remove(os.path.join(download_dir, f))
-
-                # 点击下载
-                invoice_link.click()
-                print(f"  已点击下载 {invoice_id}...")
-
-                # 等待 PDF 下载完成
-                pdf_path = None
-                for _ in range(30):
-                    time.sleep(1)
-                    pdfs = [f for f in os.listdir(download_dir) if f.endswith('.pdf') and not f.endswith('.crdownload')]
-                    if pdfs:
-                        pdf_path = os.path.join(download_dir, pdfs[0])
-                        break
-
-                if not pdf_path:
-                    print(f"  {invoice_id} PDF 下载超时")
-                    results.append({"invoice": invoice_id, "status": "failed", "error": "PDF 下载超时"})
-                    continue
-
-                print(f"  PDF 已下载: {os.path.basename(pdf_path)}")
-
-                # 从 PDF 提取支付链接
-                pay_url = _extract_pdf_pay_url(pdf_path)
-                if not pay_url:
-                    print(f"  {invoice_id} 未找到 Pay online 链接")
-                    results.append({"invoice": invoice_id, "status": "failed", "error": "未找到支付链接"})
-                    continue
-
-                print(f"  找到支付链接: {pay_url}")
-
-                # 在浏览器中打开支付链接
-                driver.get(pay_url)
-                print(f"  正在等待 {invoice_id} 支付页面加载...")
-
-                # 等待 Stripe 支付页面加载完成（Pay 按钮出现）
-                try:
-                    pay_wait = WebDriverWait(driver, 120)
-                    pay_wait.until(EC.presence_of_element_located((
-                        By.CSS_SELECTOR, "button[data-testid='hosted-payment-submit-button']"
-                    )))
-                    print(f"  {invoice_id} 支付页面已加载完成")
-                except Exception:
-                    print(f"  {invoice_id} 支付页面加载超时")
-                    results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
-                    continue
-
-                # 切入 Stripe iframe 点击 Card 支付选项
-                try:
-                    stripe_iframe = pay_wait.until(EC.presence_of_element_located((
-                        By.CSS_SELECTOR, "div#payment-element iframe"
-                    )))
-                    driver.switch_to.frame(stripe_iframe)
-                    print(f"  {invoice_id} 已切入 Stripe iframe")
-
-                    iframe_wait = WebDriverWait(driver, 30)
-                    card_btn = iframe_wait.until(EC.element_to_be_clickable((
-                        By.CSS_SELECTOR, "div.p-AccordionButton[data-value='card']"
-                    )))
-                    card_btn.click()
-                    time.sleep(2)
-                    print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
-
-                    # 切回主页面
-                    driver.switch_to.default_content()
-                except Exception as e:
-                    print(f"  {invoice_id} 点击 Card 选项失败: {e}")
-                    try:
-                        driver.switch_to.default_content()
-                    except Exception:
-                        pass
-                    results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": f"点击 Card 选项失败: {e}"})
-                    continue
-
-                # Card 表单已展开，信用卡数据填写由后续流程处理
-                results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
-
-            except Exception as e:
-                print(f"  处理 {invoice_id} 异常: {e}")
-                results.append({"invoice": invoice_id, "status": "failed", "error": str(e)})
                 continue
 
-    except Exception as e:
-        print(f"处理 Unpaid invoices 异常: {e}")
+        if not invoice_id:
+            print("所有 Unpaid invoice 已处理完毕")
+            break
+
+        processed_ids.add(invoice_id)
+        total_unpaid = len(rows)
+        print(f"[{len(processed_ids)}/{total_unpaid}] 处理 invoice: {invoice_id}")
+
+        try:
+            # 清空下载目录中的旧 PDF
+            for f in os.listdir(download_dir):
+                if f.endswith('.pdf'):
+                    os.remove(os.path.join(download_dir, f))
+
+            # 点击下载
+            invoice_link.click()
+            print(f"  已点击下载 {invoice_id}...")
+
+            # 等待 PDF 下载完成
+            pdf_path = None
+            for _ in range(30):
+                time.sleep(1)
+                pdfs = [f for f in os.listdir(download_dir) if f.endswith('.pdf') and not f.endswith('.crdownload')]
+                if pdfs:
+                    pdf_path = os.path.join(download_dir, pdfs[0])
+                    break
+
+            if not pdf_path:
+                print(f"  {invoice_id} PDF 下载超时")
+                results.append({"invoice": invoice_id, "status": "failed", "error": "PDF 下载超时"})
+                continue
+
+            print(f"  PDF 已下载: {os.path.basename(pdf_path)}")
+
+            # 从 PDF 提取支付链接
+            pay_url = _extract_pdf_pay_url(pdf_path)
+            if not pay_url:
+                print(f"  {invoice_id} 未找到 Pay online 链接")
+                results.append({"invoice": invoice_id, "status": "failed", "error": "未找到支付链接"})
+                continue
+
+            print(f"  找到支付链接: {pay_url}")
+
+            # 在浏览器中打开支付链接
+            driver.get(pay_url)
+            print(f"  正在等待 {invoice_id} 支付页面加载...")
+
+            # 等待 Stripe 支付页面加载完成（Pay 按钮出现）
+            try:
+                pay_wait = WebDriverWait(driver, 120)
+                pay_wait.until(EC.presence_of_element_located((
+                    By.CSS_SELECTOR, "button[data-testid='hosted-payment-submit-button']"
+                )))
+                print(f"  {invoice_id} 支付页面已加载完成")
+            except Exception:
+                print(f"  {invoice_id} 支付页面加载超时")
+                results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
+                # 回到 credits 页面继续处理下一个
+                driver.back()
+                time.sleep(3)
+                continue
+
+            # 切入 Stripe iframe 点击 Card 支付选项
+            try:
+                stripe_iframe = pay_wait.until(EC.presence_of_element_located((
+                    By.CSS_SELECTOR, "div#payment-element iframe"
+                )))
+                driver.switch_to.frame(stripe_iframe)
+                print(f"  {invoice_id} 已切入 Stripe iframe")
+
+                iframe_wait = WebDriverWait(driver, 30)
+                card_btn = iframe_wait.until(EC.element_to_be_clickable((
+                    By.CSS_SELECTOR, "div.p-AccordionButton[data-value='card']"
+                )))
+                card_btn.click()
+                time.sleep(2)
+                print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
+
+                driver.switch_to.default_content()
+            except Exception as e:
+                print(f"  {invoice_id} 点击 Card 选项失败: {e}")
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": f"点击 Card 选项失败: {e}"})
+                # 回到 credits 页面继续
+                driver.back()
+                time.sleep(3)
+                continue
+
+            # Card 表单已展开，信用卡数据填写由后续流程处理
+            results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
+
+        except Exception as e:
+            print(f"  处理 {invoice_id} 异常: {e}")
+            results.append({"invoice": invoice_id, "status": "failed", "error": str(e)})
+
+        # 处理完一个 invoice 后，回到 credits 页面重新查找
+        print(f"  返回 Credits 页面查找剩余 Unpaid invoices...")
+        driver.back()
+        time.sleep(3)
+        # 可能需要多次 back（从 Stripe 页面回到 credits）
+        if 'credits' not in driver.current_url:
+            driver.back()
+            time.sleep(3)
 
     return results
 
