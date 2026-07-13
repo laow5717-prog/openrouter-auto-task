@@ -1423,12 +1423,21 @@ def handle_unpaid_invoices(driver):
 
                 # 在浏览器中打开支付链接
                 driver.get(pay_url)
-                time.sleep(5)
-                print(f"  已打开 {invoice_id} 的在线支付页面")
-                results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
+                print(f"  正在等待 {invoice_id} 支付页面加载...")
 
-                # 等待支付页面加载完成后再处理下一条
-                time.sleep(3)
+                # 等待 Stripe 支付页面加载完成（Pay 按钮出现）
+                try:
+                    pay_wait = WebDriverWait(driver, 120)
+                    pay_wait.until(EC.presence_of_element_located((
+                        By.CSS_SELECTOR, "button[data-testid='hosted-payment-submit-button']"
+                    )))
+                    print(f"  {invoice_id} 支付页面已加载完成")
+                except Exception:
+                    print(f"  {invoice_id} 支付页面加载超时")
+                    results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
+                    continue
+
+                results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
 
             except Exception as e:
                 print(f"  处理 {invoice_id} 异常: {e}")

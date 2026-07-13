@@ -547,17 +547,18 @@ def recharge_account():
 
 @api.route('/api/accounts/open-browser', methods=['POST'])
 def open_account_browser():
-    """打开浏览器查看账号的 Cloudflare 控制台，不执行任何自动操作"""
+    """打开浏览器查看账号的 Cloudflare 控制台，按账号独立，不阻塞全局任务"""
     state = get_app_state()
     models = get_models()
-
-    if state.is_running:
-        return jsonify({"error": "有任务正在运行，请等待完成后再操作"}), 400
 
     data = request.json or {}
     email = data.get('email', '')
     if not email:
         return jsonify({"error": "未指定账号"}), 400
+
+    # 该账号正在执行自动任务或已有浏览器打开
+    if email in state.open_browsers:
+        return jsonify({"error": f"{email} 已有浏览器打开"}), 400
 
     rows = models['account'].search(email)
     account = None
@@ -573,9 +574,8 @@ def open_account_browser():
     if not cf_password:
         return jsonify({"error": "该账号没有保存 CF 密码"}), 400
 
-    state.is_running = True
-    state.current_action = f"正在为 {email} 打开浏览器..."
-    state._patch_prints()
+    state.open_browsers.add(email)
+    state.add_log(f"{email} 正在打开浏览器...")
 
     import threading
 
@@ -586,10 +586,8 @@ def open_account_browser():
             driver = create_driver(headless=False, profile_id=email)
             account_id = login_cloudflare(driver, email, cf_password)
             if account_id:
-                state.current_action = f"{email} 浏览器已打开，手动关闭浏览器后自动结束"
                 state.add_log(f"{email} 浏览器已打开")
             else:
-                state.current_action = f"{email} 登录失败"
                 state.add_log(f"{email} 打开浏览器登录失败")
 
             # 等待用户手动关闭浏览器
@@ -601,19 +599,25 @@ def open_account_browser():
                 except Exception:
                     break
         except Exception as e:
-            state.current_action = f"打开浏览器异常: {e}"
-            state.add_log(f"打开浏览器异常: {e}")
+            state.add_log(f"{email} 打开浏览器异常: {e}")
         finally:
             if driver:
                 try:
                     close_driver(driver)
                 except Exception:
                     pass
-            state._stop_screenshot_loop()
-            state.is_running = False
+            state.open_browsers.discard(email)
+            state.add_log(f"{email} 浏览器已关闭")
 
     threading.Thread(target=_do_open, daemon=True).start()
     return jsonify({"status": "started", "email": email})
+
+
+@api.route('/api/accounts/open-browsers')
+def get_open_browsers():
+    """获取当前打开的浏览器会话列表"""
+    state = get_app_state()
+    return jsonify({"emails": list(state.open_browsers)})
 
 
 @api.route('/api/recharge-logs')

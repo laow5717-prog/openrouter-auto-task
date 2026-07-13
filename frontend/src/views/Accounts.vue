@@ -72,9 +72,9 @@
             <td style="display:flex;gap:6px;align-items:center">
               <button
                 class="row-browse-btn"
-                :disabled="store.isRunning"
+                :disabled="openBrowserEmails.has(acc.email)"
                 @click="handleOpenBrowser(acc.email)"
-              >查看</button>
+              >{{ openBrowserEmails.has(acc.email) ? '查看中' : '查看' }}</button>
               <button
                 v-if="acc.status && acc.status.includes('bound')"
                 class="row-recharge-btn"
@@ -154,10 +154,30 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, openAccountBrowser, getRechargeLogsByEmail } from '../api'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, openAccountBrowser, getOpenBrowsers, getRechargeLogsByEmail } from '../api'
 import { useAppStore } from '../stores/app'
 const store = useAppStore()
+
+// 已打开浏览器的账号集合
+const openBrowserEmails = ref(new Set())
+let browserPollTimer = null
+
+async function pollOpenBrowsers() {
+  try {
+    const data = await getOpenBrowsers()
+    openBrowserEmails.value = new Set(data.emails || [])
+  } catch { /* ignore */ }
+}
+
+function startBrowserPoll() {
+  pollOpenBrowsers()
+  browserPollTimer = setInterval(pollOpenBrowsers, 3000)
+}
+
+function stopBrowserPoll() {
+  if (browserPollTimer) { clearInterval(browserPollTimer); browserPollTimer = null }
+}
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 import Modal from '../components/Modal.vue'
@@ -359,7 +379,8 @@ async function showRechargeLogs(email) {
   }
 }
 
-onMounted(loadData)
+onMounted(() => { loadData(); startBrowserPoll() })
+onUnmounted(stopBrowserPoll)
 </script>
 
 <style scoped>

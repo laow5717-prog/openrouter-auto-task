@@ -49,6 +49,9 @@ class AppState:
         # 当前信用卡驱动任务 ID
         self.current_card_task_id = None
 
+        # 按账号独立跟踪的浏览器查看会话（不阻塞全局任务）
+        self.open_browsers = set()
+
     def add_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         with self.lock:
