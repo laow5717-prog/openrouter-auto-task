@@ -52,6 +52,7 @@ export const getAccountCards = (email) => get(`/api/accounts/${encodeURIComponen
 export const exportAccounts = (body) => postBlob('/api/accounts/export', body)
 export const deleteAccounts = (emails) => post('/api/accounts/delete', { emails })
 export const rechargeAccount = (email) => post('/api/accounts/recharge', { email })
+export const openAccountBrowser = (email) => post('/api/accounts/open-browser', { email })
 
 // Recharge logs
 export const getRechargeLogs = (params) => get('/api/recharge-logs', params)

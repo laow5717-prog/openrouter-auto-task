@@ -71,9 +71,14 @@
             <td>{{ acc.time }}</td>
             <td style="display:flex;gap:6px;align-items:center">
               <button
+                class="row-browse-btn"
+                :disabled="store.isRunning"
+                @click="handleOpenBrowser(acc.email)"
+              >查看</button>
+              <button
                 v-if="acc.status && acc.status.includes('bound')"
                 class="row-recharge-btn"
-                :disabled="rechargingEmail === acc.email"
+                :disabled="rechargingEmail === acc.email || store.isRunning"
                 @click="handleRecharge(acc.email)"
               >{{ rechargingEmail === acc.email ? '充值中...' : '充值' }}</button>
               <button class="row-log-btn" @click="showRechargeLogs(acc.email)">充值记录</button>
@@ -150,7 +155,9 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, getRechargeLogsByEmail } from '../api'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, openAccountBrowser, getRechargeLogsByEmail } from '../api'
+import { useAppStore } from '../stores/app'
+const store = useAppStore()
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 import Modal from '../components/Modal.vue'
@@ -279,6 +286,15 @@ async function handleRecharge(email) {
     alert('充值请求失败: ' + e.message)
   } finally {
     rechargingEmail.value = ''
+  }
+}
+
+async function handleOpenBrowser(email) {
+  try {
+    await openAccountBrowser(email)
+    alert(`已打开 ${email} 的浏览器，关闭浏览器窗口后自动结束`)
+  } catch (e) {
+    alert('打开浏览器失败: ' + e.message)
   }
 }
 
@@ -452,6 +468,19 @@ onMounted(loadData)
   border-radius: 6px;
   font-size: 12px;
 }
+
+.row-browse-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border: 1px solid #bfdbfe;
+  border-radius: 4px;
+  background: #fff;
+  color: #2563eb;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.row-browse-btn:hover:not(:disabled) { background: #eff6ff; }
+.row-browse-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .row-log-btn {
   padding: 3px 10px;

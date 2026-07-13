@@ -534,6 +534,77 @@ def recharge_account():
     return jsonify({"status": "started", "email": email})
 
 
+@api.route('/api/accounts/open-browser', methods=['POST'])
+def open_account_browser():
+    """打开浏览器查看账号的 Cloudflare 控制台，不执行任何自动操作"""
+    state = get_app_state()
+    models = get_models()
+
+    if state.is_running:
+        return jsonify({"error": "有任务正在运行，请等待完成后再操作"}), 400
+
+    data = request.json or {}
+    email = data.get('email', '')
+    if not email:
+        return jsonify({"error": "未指定账号"}), 400
+
+    rows = models['account'].search(email)
+    account = None
+    for r in rows:
+        if r['email'] == email:
+            account = r
+            break
+
+    if not account:
+        return jsonify({"error": "账号不存在"}), 404
+
+    cf_password = account.get('cf_password')
+    if not cf_password:
+        return jsonify({"error": "该账号没有保存 CF 密码"}), 400
+
+    state.is_running = True
+    state.current_action = f"正在为 {email} 打开浏览器..."
+    state._patch_prints()
+
+    import threading
+
+    def _do_open():
+        from src.browser.driver import create_driver, login_cloudflare, close_driver
+        driver = None
+        try:
+            driver = create_driver(headless=False, profile_id=email)
+            account_id = login_cloudflare(driver, email, cf_password)
+            if account_id:
+                state.current_action = f"{email} 浏览器已打开，手动关闭浏览器后自动结束"
+                state.add_log(f"{email} 浏览器已打开")
+            else:
+                state.current_action = f"{email} 登录失败"
+                state.add_log(f"{email} 打开浏览器登录失败")
+
+            # 等待用户手动关闭浏览器
+            import time
+            while True:
+                try:
+                    _ = driver.title
+                    time.sleep(2)
+                except Exception:
+                    break
+        except Exception as e:
+            state.current_action = f"打开浏览器异常: {e}"
+            state.add_log(f"打开浏览器异常: {e}")
+        finally:
+            if driver:
+                try:
+                    close_driver(driver)
+                except Exception:
+                    pass
+            state._stop_screenshot_loop()
+            state.is_running = False
+
+    threading.Thread(target=_do_open, daemon=True).start()
+    return jsonify({"status": "started", "email": email})
+
+
 @api.route('/api/recharge-logs')
 def get_recharge_logs():
     models = get_models()
