@@ -144,7 +144,7 @@
           </span>
         </div>
         <div class="recharge-log-meta">
-          <span v-if="log.card_display">卡片: •••• {{ log.card_display }}</span>
+          <span v-if="log.card_display">卡片: {{ log.card_display }}</span>
           <span>{{ log.created_at }}</span>
         </div>
         <div v-if="log.error" class="recharge-log-error">{{ log.error }}</div>

@@ -17,6 +17,12 @@ class RechargeLogModel:
         )
         return cursor.lastrowid
 
+    def update_card(self, log_id, card_display):
+        self.db.execute(
+            "UPDATE recharge_logs SET card_display=? WHERE id=?",
+            (card_display, log_id),
+        )
+
     def mark_success(self, log_id, api_response=None):
         self.db.execute(
             "UPDATE recharge_logs SET status='success', api_response=? WHERE id=?",

@@ -45,7 +45,7 @@
           </tr>
           <tr v-for="log in logs" :key="log.id">
             <td>{{ log.email }}</td>
-            <td style="font-family:monospace">{{ log.card_display ? '•••• ' + log.card_display : '-' }}</td>
+            <td style="font-family:monospace">{{ log.card_display || '-' }}</td>
             <td style="font-family:monospace">${{ log.amount }}</td>
             <td>
               <span class="status-tag" :class="statusClass(log.status)">{{ statusText(log.status) }}</span>

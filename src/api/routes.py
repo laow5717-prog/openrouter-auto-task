@@ -470,19 +470,30 @@ def recharge_account():
 
     import threading
 
-    # 获取该账号绑定的卡片信息用于记录
+    # 获取该账号绑定的卡片列表，后续根据页面实际使用的卡片后四位匹配完整卡号
     cards = models['card_binding'].get_by_email(email)
-    card_display = cards[0]['card_number'][-4:] if cards and cards[0].get('card_number') else ''
 
-    # 创建充值记录
-    log_id = models['recharge_log'].create(email, card_display=card_display, amount=10)
+    # 先创建充值记录，card_display 稍后根据实际使用的卡片更新
+    log_id = models['recharge_log'].create(email, card_display='', amount=10)
 
     def _do_recharge():
         try:
-            success, err, responses = registration.recharge_account(
+            success, err, responses, card_last4 = registration.recharge_account(
                 email, cf_password,
                 monitor_callback=state._monitor,
             )
+
+            # 用页面提取的后四位匹配完整卡号
+            matched_card = ''
+            if card_last4:
+                for c in cards:
+                    if c.get('card_number', '').endswith(card_last4):
+                        matched_card = c['card_number']
+                        break
+                if not matched_card:
+                    matched_card = f'•••• {card_last4}'
+            if matched_card:
+                models['recharge_log'].update_card(log_id, matched_card)
             # 从 API 响应中提取结果
             topup_resp = None
             for resp in responses:
