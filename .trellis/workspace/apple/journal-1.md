@@ -340,3 +340,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: AI Credits 自动充值功能（登录+导航）
+
+**Date**: 2026-07-13
+**Task**: AI Credits 自动充值功能（登录+导航）
+**Branch**: `main`
+
+### Summary
+
+为已绑卡账号添加 AI Credits 充值功能：login_cloudflare 登录函数、navigate_to_ai_credits 导航函数、/api/accounts/recharge 接口、前端充值按钮。当前实现到登录并跳转充值页面，充值操作待确认页面结构后补充。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e273ba8` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

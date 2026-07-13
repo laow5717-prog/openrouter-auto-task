@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 10
-- **Last Active**: 2026-07-11
+- **Total Sessions**: 11
+- **Last Active**: 2026-07-13
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~342 | Active |
+| `journal-1.md` | ~375 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 11 | 2026-07-13 | AI Credits 自动充值功能（登录+导航） | `e273ba8` | `main` |
 | 10 | 2026-07-11 | 数据目录迁移至用户家目录 | `f641868` | `main` |
 | 9 | 2026-07-11 | 浏览器后台运行与绑卡过滤优化 | `ac95695`, `f0d64ec` | `main` |
 | 8 | 2026-07-11 | 清理绑卡历史脏数据并添加自动/手动清理机制 | `6cb0dfa` | `main` |
