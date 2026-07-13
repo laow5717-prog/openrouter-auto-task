@@ -62,13 +62,14 @@ _LANGUAGES = [
 ]
 
 
-def create_driver(headless=False):
+def create_driver(headless=False, profile_id=None):
     """
     创建带有反检测的 Chrome 浏览器驱动（使用 undetected-chromedriver）
-    每次启动使用全新的浏览器环境（独立 profile + 随机指纹）
 
     参数:
         headless: 是否使用无头模式
+        profile_id: 持久化 profile 标识（如 email），传入后复用同一浏览器环境；
+                    为 None 时使用全新临时 profile
     返回:
         浏览器驱动实例
     """
@@ -83,9 +84,19 @@ def create_driver(headless=False):
         print("  👻 使用伪无头模式 (Off-screen)...")
         options.add_argument("--window-position=-10000,-10000")
 
-    # 每次使用全新的临时 profile，避免指纹关联
-    user_data_dir = tempfile.mkdtemp(prefix="cf_chrome_")
-    print(f"  🔄 使用全新浏览器 profile: ...{os.path.basename(user_data_dir)}")
+    # 持久化 profile：按 profile_id 复用同一目录；否则用临时目录
+    is_persistent = profile_id is not None
+    if is_persistent:
+        base_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data', 'profiles')
+        os.makedirs(base_dir, exist_ok=True)
+        # 用 profile_id 的安全文件名作为目录名
+        safe_name = re.sub(r'[^\w@.\-]', '_', profile_id)
+        user_data_dir = os.path.join(base_dir, safe_name)
+        os.makedirs(user_data_dir, exist_ok=True)
+        print(f"  🔒 使用持久化 profile: {safe_name}")
+    else:
+        user_data_dir = tempfile.mkdtemp(prefix="cf_chrome_")
+        print(f"  🔄 使用全新浏览器 profile: ...{os.path.basename(user_data_dir)}")
 
     # 随机语言
     lang = random.choice(_LANGUAGES)
@@ -112,8 +123,8 @@ def create_driver(headless=False):
         if not headless:
             driver.minimize_window()
 
-        # 记录临时目录，关闭时清理
-        driver._cf_temp_profile = user_data_dir
+        # 记录 profile 目录，临时 profile 关闭时清理，持久化 profile 保留
+        driver._cf_temp_profile = None if is_persistent else user_data_dir
 
         # 注入控制台拦截器（在所有页面 JS 执行之前生效）
         # 用于捕获 Cloudflare/Stripe 的错误日志
@@ -187,6 +198,137 @@ def type_slowly(element, text, delay=0.05):
     for char in text:
         element.send_keys(char)
         time.sleep(delay)
+
+
+def inject_network_interceptor(driver, patterns):
+    """
+    注入网络响应拦截器，捕获匹配指定 URL 模式的请求响应
+
+    参数:
+        driver: 浏览器驱动
+        patterns: URL 关键词列表，每个元素是一个列表，URL 需同时包含所有关键词才匹配
+                  例如: [['api.stripe.com', 'confirm'], ['ai-gateway', 'topup']]
+    """
+    import json as _json
+    patterns_js = _json.dumps(patterns)
+    driver.execute_script('''
+        window.__netInterceptResponses = [];
+        var patterns = ''' + patterns_js + ''';
+        function matchUrl(url) {
+            for (var i = 0; i < patterns.length; i++) {
+                var keywords = patterns[i];
+                var matched = true;
+                for (var j = 0; j < keywords.length; j++) {
+                    if (url.indexOf(keywords[j]) === -1) { matched = false; break; }
+                }
+                if (matched) return true;
+            }
+            return false;
+        }
+        // 拦截 fetch
+        (function() {
+            var origFetch = window.fetch;
+            window.fetch = function() {
+                var url = typeof arguments[0] === 'string' ? arguments[0] : (arguments[0].url || '');
+                if (matchUrl(url)) {
+                    return origFetch.apply(this, arguments).then(function(response) {
+                        var clone = response.clone();
+                        clone.text().then(function(text) {
+                            try { var data = JSON.parse(text); } catch(e) { var data = text; }
+                            window.__netInterceptResponses.push({
+                                url: url, status: response.status, data: data, ts: Date.now()
+                            });
+                        }).catch(function() {});
+                        return response;
+                    });
+                }
+                return origFetch.apply(this, arguments);
+            };
+        })();
+        // 拦截 XMLHttpRequest
+        (function() {
+            var origOpen = XMLHttpRequest.prototype.open;
+            var origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this._cfInterceptUrl = url;
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                var xhr = this;
+                if (xhr._cfInterceptUrl && matchUrl(xhr._cfInterceptUrl)) {
+                    xhr.addEventListener('load', function() {
+                        try { var data = JSON.parse(xhr.responseText); } catch(e) { var data = xhr.responseText; }
+                        window.__netInterceptResponses.push({
+                            url: xhr._cfInterceptUrl, status: xhr.status, data: data, ts: Date.now()
+                        });
+                    });
+                }
+                return origSend.apply(this, arguments);
+            };
+        })();
+    ''')
+    print(f"已注入网络拦截器，监听 {len(patterns)} 个 URL 模式")
+
+
+def collect_intercepted_responses(driver, timeout=60):
+    """
+    等待并收集所有被拦截的网络响应
+
+    参数:
+        driver: 浏览器驱动
+        timeout: 最大等待时间（秒），收到第一个响应后额外等 3 秒收集后续响应
+    返回:
+        list: 响应列表 [{url, status, data, ts}, ...]
+    """
+    import json as _json
+    first_found_time = None
+
+    for _ in range(timeout):
+        time.sleep(1)
+        responses = driver.execute_script('return window.__netInterceptResponses || [];')
+        if responses:
+            if first_found_time is None:
+                first_found_time = time.time()
+                print(f"捕获到 {len(responses)} 个响应，等待后续响应...")
+            # 收到第一个响应后再等几秒，收集可能的后续请求
+            if time.time() - first_found_time >= 3:
+                break
+
+    responses = driver.execute_script('return window.__netInterceptResponses || [];')
+    for resp in responses:
+        print(f"[网络响应] URL: {resp.get('url', '')}")
+        print(f"[网络响应] HTTP Status: {resp.get('status', '')}")
+        data = resp.get('data', {})
+        if isinstance(data, dict):
+            print(f"[网络响应] Body: {_json.dumps(data, indent=2, ensure_ascii=False)}")
+        else:
+            print(f"[网络响应] Body: {data}")
+        print("---")
+
+    if not responses:
+        print("未捕获到匹配的网络响应")
+
+    return responses
+
+
+def dismiss_overdue_dialog(driver):
+    """
+    检测并关闭 Cloudflare 欠费提示弹窗（点击 'I understand'）
+    可在任何页面操作前调用，无弹窗时直接返回
+    """
+    try:
+        dialog = driver.find_elements(By.CSS_SELECTOR, "div[role='alertdialog']")
+        if not dialog:
+            return False
+        btn = dialog[0].find_elements(By.XPATH, ".//button[.//span[text()='I understand']]")
+        if btn:
+            btn[0].click()
+            print("  已关闭欠费提示弹窗 (I understand)")
+            time.sleep(1)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def check_and_handle_cf_challenge(driver, max_wait=120):
@@ -934,13 +1076,35 @@ def login_cloudflare(driver, email: str, password: str):
 
         check_and_handle_cf_challenge(driver)
         time.sleep(2)
+        dismiss_overdue_dialog(driver)
 
-        # 等待邮箱输入框
-        print("等待登录表单...")
-        email_input = wait.until(EC.visibility_of_element_located((
-            By.CSS_SELECTOR,
-            'input[type="email"], input[name="email"], input[id="email"], input[autocomplete="email"]'
-        )))
+        # 检测页面状态：登录表单 或 已登录控制台，先到者胜出
+        print("检测页面状态...")
+        login_selector = 'input[type="email"], input[name="email"], input[id="email"], input[autocomplete="email"]'
+        timeout = 120
+        start = time.time()
+        email_input = None
+
+        while time.time() - start < timeout:
+            dismiss_overdue_dialog(driver)
+            # 检查是否已在控制台
+            account_id = _extract_account_id(driver)
+            if account_id:
+                print(f"已处于登录状态，Account ID: {account_id}")
+                return account_id
+            # 检查登录表单是否出现
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, login_selector)
+                if els and els[0].is_displayed():
+                    email_input = els[0]
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+
+        if email_input is None:
+            print(f"超时未检测到登录表单或控制台，当前 URL: {driver.current_url}")
+            return None
         email_input.clear()
         type_slowly(email_input, email)
         print(f"已输入邮箱: {email}")
@@ -1003,6 +1167,7 @@ def login_cloudflare(driver, email: str, password: str):
         time.sleep(3)
 
         # 检查是否登录成功：URL 应包含 account_id
+        dismiss_overdue_dialog(driver)
         account_id = _extract_account_id(driver)
         if account_id:
             print(f"登录成功！Account ID: {account_id}")
@@ -1013,6 +1178,7 @@ def login_cloudflare(driver, email: str, password: str):
         for _ in range(6):
             time.sleep(5)
             check_and_handle_cf_challenge(driver)
+            dismiss_overdue_dialog(driver)
             account_id = _extract_account_id(driver)
             if account_id:
                 print(f"登录成功！Account ID: {account_id}")
@@ -1038,29 +1204,106 @@ def _extract_account_id(driver):
 
 def navigate_to_ai_credits(driver, account_id):
     """
-    导航到 AI Gateway Credits 页面
+    导航到 AI Gateway Credits 页面并点击 Top-up credits 按钮
 
     参数:
         driver: 浏览器驱动
         account_id: Cloudflare 账号 ID
     返回:
-        bool: 是否成功导航
+        bool: 是否成功点击 Top-up credits 按钮
     """
-    try:
-        credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
-        print(f"正在导航到 AI Credits 页面: {credits_url}")
-        driver.get(credits_url)
-        time.sleep(5)
-        check_and_handle_cf_challenge(driver)
-        time.sleep(3)
+    credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+    max_retries = 3
 
-        print(f"当前 URL: {driver.current_url}")
-        print("已到达 AI Credits 页面，等待手动检查页面结构...")
-        return True
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"正在导航到 AI Credits 页面 (尝试 {attempt}/{max_retries}): {credits_url}")
+            driver.get(credits_url)
+            time.sleep(5)
+            check_and_handle_cf_challenge(driver)
+            time.sleep(3)
+            dismiss_overdue_dialog(driver)
+
+            print(f"当前 URL: {driver.current_url}")
+
+            # 等待 "Top-up credits" 按钮出现（页面可能加载很慢）
+            wait = WebDriverWait(driver, 120)
+            try:
+                topup_btn = wait.until(EC.element_to_be_clickable((
+                    By.XPATH, "//button[.//span[text()='Top-up credits']]"
+                )))
+            except Exception:
+                print(f"第 {attempt} 次未找到 Top-up credits 按钮，页面可能未加载完成")
+                if attempt < max_retries:
+                    print("刷新页面重试...")
+                    continue
+                return False
+
+            print("找到 Top-up credits 按钮，正在点击...")
+            topup_btn.click()
+            time.sleep(2)
+            print("已点击 Top-up credits 按钮")
+            return True
+
+        except Exception as e:
+            print(f"第 {attempt} 次导航到 AI Credits 页面失败: {e}")
+            if attempt < max_retries:
+                print("刷新页面重试...")
+                continue
+            return False
+
+    return False
+
+
+def fill_topup_and_confirm(driver, amount=10):
+    """
+    在 Top-up 弹窗中输入金额并点击确认支付
+
+    参数:
+        driver: 浏览器驱动
+        amount: 充值金额（美元），默认 10
+    返回:
+        (bool, dict|None): (是否成功点击, Stripe 响应数据)
+    """
+    wait = WebDriverWait(driver, 30)
+
+    try:
+        # 等待弹窗中的金额输入框出现
+        print(f"等待充值弹窗加载...")
+        price_input = wait.until(EC.visibility_of_element_located((
+            By.CSS_SELECTOR, "div[role='dialog'] input#price"
+        )))
+
+        # 清空并输入金额
+        price_input.click()
+        price_input.clear()
+        time.sleep(0.5)
+        price_input.send_keys(str(amount))
+        print(f"已输入充值金额: ${amount}")
+        time.sleep(1)
+
+        # 注入网络拦截器，捕获充值相关的接口响应
+        inject_network_interceptor(driver, [
+            ['api.stripe.com', 'payment_intents', 'confirm'],
+            ['ai-gateway', 'billing', 'topup'],
+        ])
+
+        # 等待 "Confirm and pay" 按钮变为可点击（输入金额后 disabled 属性会移除）
+        confirm_btn = wait.until(EC.element_to_be_clickable((
+            By.XPATH, "//div[@role='dialog']//button[.//span[text()='Confirm and pay']]"
+        )))
+
+        print("正在点击 Confirm and pay...")
+        confirm_btn.click()
+        print("已点击 Confirm and pay，等待响应...")
+
+        # 收集拦截到的响应
+        responses = collect_intercepted_responses(driver, timeout=60)
+        return True, responses
 
     except Exception as e:
-        print(f"导航到 AI Credits 页面失败: {e}")
-        return False
+        print(f"充值弹窗操作失败: {e}")
+        return False, None
 
 
 def fill_signup_form(driver, email: str, password: str):

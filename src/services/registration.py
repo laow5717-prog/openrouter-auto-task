@@ -18,6 +18,7 @@ from src.browser.driver import (
     get_bound_card_count,
     login_cloudflare,
     navigate_to_ai_credits,
+    fill_topup_and_confirm,
 )
 import src.services.captcha as captcha_solver
 
@@ -296,7 +297,7 @@ def recharge_account(email, cf_password, monitor_callback=None):
             monitor_callback(driver, step_name)
 
     try:
-        driver = create_driver(headless=False)
+        driver = create_driver(headless=False, profile_id=email)
         _report("init_browser")
 
         print(f"正在登录账号: {email}")
@@ -305,19 +306,25 @@ def recharge_account(email, cf_password, monitor_callback=None):
             return False, "登录失败，无法获取 account_id"
         _report("logged_in")
 
-        print("正在跳转到 AI Credits 页面...")
+        print("正在跳转到 AI Credits 页面并点击充值...")
         success = navigate_to_ai_credits(driver, account_id)
         _report("navigated_to_credits")
 
-        if success:
-            print(f"账号 {email} 已跳转到充值页面")
-            # 保持浏览器打开，等待一段时间供查看
-            import time
-            time.sleep(30)
-        else:
-            print(f"账号 {email} 跳转充值页面失败")
+        if not success:
+            return False, "导航到充值页面或点击 Top-up 按钮失败"
 
-        return success, "" if success else "导航失败"
+        print("正在填写充值金额并确认支付...")
+        pay_success, responses = fill_topup_and_confirm(driver, amount=10)
+        _report("topup_confirmed")
+
+        if pay_success:
+            print(f"账号 {email} 充值 $10 已提交，等待 60 秒观测结果...")
+            import time
+            time.sleep(60)
+        else:
+            print(f"账号 {email} 充值确认失败")
+
+        return pay_success, "" if pay_success else "填写金额或确认支付失败"
 
     except Exception as e:
         print(f"充值过程异常: {e}")
