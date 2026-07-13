@@ -17,6 +17,7 @@ from src.models.database import Database
 from src.models.account import AccountModel
 from src.models.task import TaskModel
 from src.models.card_binding import CardBindingModel
+from src.models.recharge_log import RechargeLogModel
 from src.services import registration, card as card_service
 from src.api.routes import api
 
@@ -379,6 +380,7 @@ def create_app(db_path=None):
         'account': AccountModel(db),
         'task': TaskModel(db),
         'card_binding': CardBindingModel(db),
+        'recharge_log': RechargeLogModel(db),
     }
 
     # 创建应用状态

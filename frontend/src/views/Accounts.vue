@@ -76,6 +76,7 @@
                 :disabled="rechargingEmail === acc.email"
                 @click="handleRecharge(acc.email)"
               >{{ rechargingEmail === acc.email ? '充值中...' : '充值' }}</button>
+              <button class="row-log-btn" @click="showRechargeLogs(acc.email)">充值记录</button>
               <button class="row-delete-btn" @click="handleDeleteOne(acc.email)">删除</button>
             </td>
           </tr>
@@ -122,11 +123,34 @@
       </div>
     </div>
   </Modal>
+
+  <!-- 充值记录弹窗 -->
+  <Modal :visible="rechargeModalVisible" :title="rechargeModalTitle" @close="rechargeModalVisible = false" wide>
+    <div v-if="rechargeLogsLoading" class="table-loading">加载中...</div>
+    <div v-else-if="rechargeLogs.length === 0" style="text-align:center;color:var(--text-sub);padding:24px">
+      该账号暂无充值记录
+    </div>
+    <div v-else>
+      <div v-for="log in rechargeLogs" :key="log.id" class="recharge-log-item">
+        <div class="recharge-log-header">
+          <span class="recharge-log-amount">${{ log.amount }}</span>
+          <span class="status-tag" :class="log.status === 'success' ? 'success' : log.status === 'failed' ? 'fail' : 'warn'">
+            {{ log.status === 'success' ? '成功' : log.status === 'failed' ? '失败' : '进行中' }}
+          </span>
+        </div>
+        <div class="recharge-log-meta">
+          <span v-if="log.card_display">卡片: •••• {{ log.card_display }}</span>
+          <span>{{ log.created_at }}</span>
+        </div>
+        <div v-if="log.error" class="recharge-log-error">{{ log.error }}</div>
+      </div>
+    </div>
+  </Modal>
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount } from '../api'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, getRechargeLogsByEmail } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 import Modal from '../components/Modal.vue'
@@ -142,11 +166,17 @@ const selected = reactive(new Set())
 // 充值状态
 const rechargingEmail = ref('')
 
-// 弹窗
+// 卡片弹窗
 const modalVisible = ref(false)
 const modalTitle = ref('')
 const cardList = ref([])
 const cardsLoading = ref(false)
+
+// 充值记录弹窗
+const rechargeModalVisible = ref(false)
+const rechargeModalTitle = ref('')
+const rechargeLogs = ref([])
+const rechargeLogsLoading = ref(false)
 
 const allChecked = computed(() => {
   if (accounts.value.length === 0) return false
@@ -298,6 +328,21 @@ async function showCards(email) {
   }
 }
 
+async function showRechargeLogs(email) {
+  rechargeModalTitle.value = `${email} - 充值记录`
+  rechargeModalVisible.value = true
+  rechargeLogsLoading.value = true
+  rechargeLogs.value = []
+
+  try {
+    rechargeLogs.value = await getRechargeLogsByEmail(email)
+  } catch (e) {
+    console.error(e)
+  } finally {
+    rechargeLogsLoading.value = false
+  }
+}
+
 onMounted(loadData)
 </script>
 
@@ -402,6 +447,47 @@ onMounted(loadData)
 .card-detail-error {
   margin-top: 10px;
   padding: 8px 12px;
+  background: #fef2f2;
+  color: #dc2626;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.row-log-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border: 1px solid #ddd6fe;
+  border-radius: 4px;
+  background: #fff;
+  color: #7c3aed;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.row-log-btn:hover { background: #f5f3ff; }
+
+.recharge-log-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 10px;
+}
+.recharge-log-item:last-child { margin-bottom: 0; }
+.recharge-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.recharge-log-amount { font-size: 18px; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+.recharge-log-meta {
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+.recharge-log-error {
+  margin-top: 8px;
+  padding: 6px 10px;
   background: #fef2f2;
   color: #dc2626;
   border-radius: 6px;

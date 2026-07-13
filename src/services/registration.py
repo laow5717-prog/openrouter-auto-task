@@ -288,7 +288,7 @@ def recharge_account(email, cf_password, monitor_callback=None):
         cf_password: CF 密码
         monitor_callback: 监控回调 (driver, step_name)
     返回:
-        (bool, str): (是否成功, 错误信息)
+        (bool, str, list): (是否成功, 错误信息, API 响应列表)
     """
     driver = None
 
@@ -303,7 +303,7 @@ def recharge_account(email, cf_password, monitor_callback=None):
         print(f"正在登录账号: {email}")
         account_id = login_cloudflare(driver, email, cf_password)
         if not account_id:
-            return False, "登录失败，无法获取 account_id"
+            return False, "登录失败，无法获取 account_id", []
         _report("logged_in")
 
         print("正在跳转到 AI Credits 页面并点击充值...")
@@ -311,7 +311,7 @@ def recharge_account(email, cf_password, monitor_callback=None):
         _report("navigated_to_credits")
 
         if not success:
-            return False, "导航到充值页面或点击 Top-up 按钮失败"
+            return False, "导航到充值页面或点击 Top-up 按钮失败", []
 
         print("正在填写充值金额并确认支付...")
         pay_success, responses = fill_topup_and_confirm(driver, amount=10)
@@ -324,11 +324,11 @@ def recharge_account(email, cf_password, monitor_callback=None):
         else:
             print(f"账号 {email} 充值确认失败")
 
-        return pay_success, "" if pay_success else "填写金额或确认支付失败"
+        return pay_success, "" if pay_success else "填写金额或确认支付失败", responses or []
 
     except Exception as e:
         print(f"充值过程异常: {e}")
-        return False, str(e)
+        return False, str(e), []
 
     finally:
         if driver:

@@ -43,8 +43,22 @@ CREATE TABLE IF NOT EXISTS card_bindings (
 );
 """
 
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS recharge_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    card_display TEXT,
+    amount REAL DEFAULT 10,
+    status TEXT DEFAULT 'pending',
+    error TEXT,
+    api_response TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
+    2: _SCHEMA_V2,
 }
 
 

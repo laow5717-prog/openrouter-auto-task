@@ -53,6 +53,10 @@ export const exportAccounts = (body) => postBlob('/api/accounts/export', body)
 export const deleteAccounts = (emails) => post('/api/accounts/delete', { emails })
 export const rechargeAccount = (email) => post('/api/accounts/recharge', { email })
 
+// Recharge logs
+export const getRechargeLogs = (params) => get('/api/recharge-logs', params)
+export const getRechargeLogsByEmail = (email) => get(`/api/recharge-logs/${encodeURIComponent(email)}`)
+
 // Card mode
 export const uploadCardExcel = (file) => {
   const fd = new FormData()

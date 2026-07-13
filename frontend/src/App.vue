@@ -18,6 +18,9 @@
       <router-link to="/card-history" class="nav-item" active-class="active">
         <span>&#128203;</span> 绑卡记录
       </router-link>
+      <router-link to="/recharge-logs" class="nav-item" active-class="active">
+        <span>&#128176;</span> 充值记录
+      </router-link>
     </nav>
 
   </aside>
@@ -42,7 +45,7 @@ import { useAppStore } from './stores/app'
 const store = useAppStore()
 const route = useRoute()
 
-const titleMap = { dashboard: '运行监控', cardmode: '导入绑卡', accounts: '账号管理', cardHistory: '绑卡记录' }
+const titleMap = { dashboard: '运行监控', cardmode: '导入绑卡', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录' }
 const pageTitle = computed(() => titleMap[route.name] || '系统概览')
 
 onMounted(() => store.startPolling())

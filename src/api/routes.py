@@ -470,19 +470,60 @@ def recharge_account():
 
     import threading
 
+    # 获取该账号绑定的卡片信息用于记录
+    cards = models['card_binding'].get_by_email(email)
+    card_display = cards[0]['card_number'][-4:] if cards and cards[0].get('card_number') else ''
+
+    # 创建充值记录
+    log_id = models['recharge_log'].create(email, card_display=card_display, amount=10)
+
     def _do_recharge():
         try:
-            success, err = registration.recharge_account(
+            success, err, responses = registration.recharge_account(
                 email, cf_password,
                 monitor_callback=state._monitor,
             )
-            if success:
-                state.current_action = f"{email} 充值成功"
-                state.add_log(f"{email} AI Credits 充值 $10 成功")
+            # 从 API 响应中提取结果
+            topup_resp = None
+            for resp in responses:
+                url = resp.get('url', '')
+                if 'topup' in url or 'payment_intents' in url:
+                    topup_resp = resp
+                    break
+
+            if success and topup_resp:
+                resp_data = topup_resp.get('data', {})
+                http_status = topup_resp.get('status', 0)
+                # CF topup API: success=true 表示成功
+                if isinstance(resp_data, dict) and resp_data.get('success') is True:
+                    models['recharge_log'].mark_success(log_id, api_response=topup_resp)
+                    state.current_action = f"{email} 充值成功"
+                    state.add_log(f"{email} AI Credits 充值 $10 成功")
+                else:
+                    # API 返回了错误（如 409 重复充值）
+                    error_msg = ''
+                    if isinstance(resp_data, dict):
+                        errors = resp_data.get('errors', [])
+                        if errors:
+                            error_msg = errors[0].get('message', str(resp_data))
+                        else:
+                            error_msg = str(resp_data)
+                    else:
+                        error_msg = str(resp_data)
+                    models['recharge_log'].mark_failed(log_id, error=f"[HTTP {http_status}] {error_msg}", api_response=topup_resp)
+                    state.current_action = f"{email} 充值失败: {error_msg}"
+                    state.add_log(f"{email} 充值失败: {error_msg}")
+            elif success:
+                # 点击成功但未捕获到 API 响应
+                models['recharge_log'].mark_success(log_id)
+                state.current_action = f"{email} 充值已提交（未捕获响应）"
+                state.add_log(f"{email} AI Credits 充值 $10 已提交")
             else:
+                models['recharge_log'].mark_failed(log_id, error=err)
                 state.current_action = f"{email} 充值失败: {err}"
                 state.add_log(f"{email} 充值失败: {err}")
         except Exception as e:
+            models['recharge_log'].mark_failed(log_id, error=str(e))
             state.current_action = f"充值异常: {e}"
             state.add_log(f"充值异常: {e}")
         finally:
@@ -491,6 +532,31 @@ def recharge_account():
 
     threading.Thread(target=_do_recharge, daemon=True).start()
     return jsonify({"status": "started", "email": email})
+
+
+@api.route('/api/recharge-logs')
+def get_recharge_logs():
+    models = get_models()
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 20))
+    email = request.args.get('email', '')
+    status = request.args.get('status', '')
+    date_from = request.args.get('date_from', '')
+    date_to = request.args.get('date_to', '')
+
+    logs, total = models['recharge_log'].get_paginated(
+        page=page, page_size=page_size,
+        email=email, status=status,
+        date_from=date_from, date_to=date_to,
+    )
+    return jsonify({"data": logs, "total": total, "page": page, "page_size": page_size})
+
+
+@api.route('/api/recharge-logs/<email>')
+def get_recharge_logs_by_email(email):
+    models = get_models()
+    logs = models['recharge_log'].get_by_email(email)
+    return jsonify(logs)
 
 
 @api.route('/api/accounts/export', methods=['POST'])
