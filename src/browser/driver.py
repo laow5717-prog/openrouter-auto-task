@@ -913,6 +913,156 @@ def _is_turnstile_solved(driver):
     return False
 
 
+def login_cloudflare(driver, email: str, password: str):
+    """
+    登录已有的 Cloudflare 账号
+
+    参数:
+        driver: 浏览器驱动
+        email: 邮箱地址
+        password: CF 密码
+    返回:
+        str | None: 成功时返回 account_id，失败返回 None
+    """
+    wait = WebDriverWait(driver, MAX_WAIT_TIME)
+
+    try:
+        url = "https://dash.cloudflare.com/login"
+        print(f"正在打开登录页面 {url}...")
+        driver.get(url)
+        time.sleep(3)
+
+        check_and_handle_cf_challenge(driver)
+        time.sleep(2)
+
+        # 等待邮箱输入框
+        print("等待登录表单...")
+        email_input = wait.until(EC.visibility_of_element_located((
+            By.CSS_SELECTOR,
+            'input[type="email"], input[name="email"], input[id="email"], input[autocomplete="email"]'
+        )))
+        email_input.clear()
+        type_slowly(email_input, email)
+        print(f"已输入邮箱: {email}")
+        time.sleep(1)
+
+        # 填写密码
+        password_input = driver.find_element(
+            By.CSS_SELECTOR,
+            'input[type="password"], input[name="password"], input[id="password"]'
+        )
+        password_input.clear()
+        type_slowly(password_input, password)
+        print("密码已输入")
+        time.sleep(1)
+
+        # 处理可能的 Turnstile 验证
+        _wait_for_turnstile_widget(driver, timeout=10)
+        _handle_inline_turnstile(driver)
+        time.sleep(1)
+
+        # 点击登录按钮
+        print("正在点击登录按钮...")
+        login_selectors = [
+            'button[type="submit"]',
+            'button[data-testid="login-submit"]',
+        ]
+        clicked = False
+        for selector in login_selectors:
+            try:
+                btn = driver.find_element(By.CSS_SELECTOR, selector)
+                if btn.is_displayed():
+                    try:
+                        btn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", btn)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            try:
+                btns = driver.find_elements(By.TAG_NAME, 'button')
+                for btn in btns:
+                    text = btn.text.lower()
+                    if 'log in' in text or 'sign in' in text or 'login' in text:
+                        driver.execute_script("arguments[0].click();", btn)
+                        clicked = True
+                        break
+            except Exception:
+                pass
+
+        if not clicked:
+            print("未找到登录按钮")
+            return None
+
+        print("登录表单已提交，等待跳转...")
+        time.sleep(5)
+        check_and_handle_cf_challenge(driver)
+        time.sleep(3)
+
+        # 检查是否登录成功：URL 应包含 account_id
+        account_id = _extract_account_id(driver)
+        if account_id:
+            print(f"登录成功！Account ID: {account_id}")
+            return account_id
+
+        # 等待更长时间再试（可能有额外验证步骤）
+        print("等待仪表盘加载...")
+        for _ in range(6):
+            time.sleep(5)
+            check_and_handle_cf_challenge(driver)
+            account_id = _extract_account_id(driver)
+            if account_id:
+                print(f"登录成功！Account ID: {account_id}")
+                return account_id
+
+        print(f"登录后未能获取 account_id，当前 URL: {driver.current_url}")
+        return None
+
+    except Exception as e:
+        print(f"登录失败: {e}")
+        return None
+
+
+def _extract_account_id(driver):
+    """从当前 URL 中提取 Cloudflare account_id"""
+    current_url = driver.current_url
+    if 'dash.cloudflare.com' in current_url:
+        parts = current_url.replace('https://dash.cloudflare.com/', '').split('/')
+        if parts and parts[0] and len(parts[0]) == 32:
+            return parts[0]
+    return None
+
+
+def navigate_to_ai_credits(driver, account_id):
+    """
+    导航到 AI Gateway Credits 页面
+
+    参数:
+        driver: 浏览器驱动
+        account_id: Cloudflare 账号 ID
+    返回:
+        bool: 是否成功导航
+    """
+    try:
+        credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+        print(f"正在导航到 AI Credits 页面: {credits_url}")
+        driver.get(credits_url)
+        time.sleep(5)
+        check_and_handle_cf_challenge(driver)
+        time.sleep(3)
+
+        print(f"当前 URL: {driver.current_url}")
+        print("已到达 AI Credits 页面，等待手动检查页面结构...")
+        return True
+
+    except Exception as e:
+        print(f"导航到 AI Credits 页面失败: {e}")
+        return False
+
+
 def fill_signup_form(driver, email: str, password: str):
     """
     填写 Cloudflare 注册表单

@@ -69,7 +69,13 @@
               <span v-else class="card-count-badge empty">无</span>
             </td>
             <td>{{ acc.time }}</td>
-            <td>
+            <td style="display:flex;gap:6px;align-items:center">
+              <button
+                v-if="acc.status && acc.status.includes('bound')"
+                class="row-recharge-btn"
+                :disabled="rechargingEmail === acc.email"
+                @click="handleRecharge(acc.email)"
+              >{{ rechargingEmail === acc.email ? '充值中...' : '充值' }}</button>
               <button class="row-delete-btn" @click="handleDeleteOne(acc.email)">删除</button>
             </td>
           </tr>
@@ -120,7 +126,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts, deleteAccounts } from '../api'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 import Modal from '../components/Modal.vue'
@@ -132,6 +138,9 @@ const pageSize = ref(20)
 const loading = ref(false)
 const filters = reactive({ keyword: '', status: '', date_from: '', date_to: '' })
 const selected = reactive(new Set())
+
+// 充值状态
+const rechargingEmail = ref('')
 
 // 弹窗
 const modalVisible = ref(false)
@@ -227,6 +236,19 @@ async function handleDeleteOne(email) {
     await loadData()
   } catch (e) {
     alert('删除失败: ' + e.message)
+  }
+}
+
+async function handleRecharge(email) {
+  if (!confirm(`确定要为账号 ${email} 充值 $10 AI Credits 吗？`)) return
+  rechargingEmail.value = email
+  try {
+    await rechargeAccount(email)
+    alert(`已启动充值任务，请在 Dashboard 查看进度`)
+  } catch (e) {
+    alert('充值请求失败: ' + e.message)
+  } finally {
+    rechargingEmail.value = ''
   }
 }
 
@@ -351,6 +373,19 @@ onMounted(loadData)
 .action-btn.danger { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
 .action-btn.danger:hover:not(:disabled) { background: #fee2e2; }
 .action-btn.danger:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.row-recharge-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border: 1px solid #bbf7d0;
+  border-radius: 4px;
+  background: #fff;
+  color: #16a34a;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.row-recharge-btn:hover:not(:disabled) { background: #f0fdf4; }
+.row-recharge-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .row-delete-btn {
   padding: 3px 10px;

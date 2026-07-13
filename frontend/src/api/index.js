@@ -51,6 +51,7 @@ export const getAccounts = (params) => get('/api/accounts', params)
 export const getAccountCards = (email) => get(`/api/accounts/${encodeURIComponent(email)}/cards`)
 export const exportAccounts = (body) => postBlob('/api/accounts/export', body)
 export const deleteAccounts = (emails) => post('/api/accounts/delete', { emails })
+export const rechargeAccount = (email) => post('/api/accounts/recharge', { email })
 
 // Card mode
 export const uploadCardExcel = (file) => {

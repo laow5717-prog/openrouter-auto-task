@@ -16,6 +16,8 @@ from src.browser.driver import (
     navigate_to_billing,
     add_credit_card,
     get_bound_card_count,
+    login_cloudflare,
+    navigate_to_ai_credits,
 )
 import src.services.captcha as captcha_solver
 
@@ -274,3 +276,54 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
             close_driver(driver)
 
     return email, password, bound_count
+
+
+def recharge_account(email, cf_password, monitor_callback=None):
+    """
+    登录已有 Cloudflare 账号并充值 AI Credits $10
+
+    参数:
+        email: 账号邮箱
+        cf_password: CF 密码
+        monitor_callback: 监控回调 (driver, step_name)
+    返回:
+        (bool, str): (是否成功, 错误信息)
+    """
+    driver = None
+
+    def _report(step_name):
+        if monitor_callback and driver:
+            monitor_callback(driver, step_name)
+
+    try:
+        driver = create_driver(headless=False)
+        _report("init_browser")
+
+        print(f"正在登录账号: {email}")
+        account_id = login_cloudflare(driver, email, cf_password)
+        if not account_id:
+            return False, "登录失败，无法获取 account_id"
+        _report("logged_in")
+
+        print("正在跳转到 AI Credits 页面...")
+        success = navigate_to_ai_credits(driver, account_id)
+        _report("navigated_to_credits")
+
+        if success:
+            print(f"账号 {email} 已跳转到充值页面")
+            # 保持浏览器打开，等待一段时间供查看
+            import time
+            time.sleep(30)
+        else:
+            print(f"账号 {email} 跳转充值页面失败")
+
+        return success, "" if success else "导航失败"
+
+    except Exception as e:
+        print(f"充值过程异常: {e}")
+        return False, str(e)
+
+    finally:
+        if driver:
+            print("正在关闭浏览器...")
+            close_driver(driver)

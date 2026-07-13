@@ -10,6 +10,7 @@ from flask import Blueprint, jsonify, request, send_from_directory, send_file
 
 from src.config import cfg, get_data_dir
 from src.services import card as card_service
+from src.services import registration
 
 api = Blueprint('api', __name__)
 
@@ -428,6 +429,68 @@ def get_account_cards(email):
     models = get_models()
     cards = models['card_binding'].get_by_email(email)
     return jsonify(cards)
+
+
+@api.route('/api/accounts/recharge', methods=['POST'])
+def recharge_account():
+    state = get_app_state()
+    models = get_models()
+
+    if state.is_running:
+        return jsonify({"error": "有任务正在运行，请等待完成后再操作"}), 400
+
+    data = request.json or {}
+    email = data.get('email', '')
+    if not email:
+        return jsonify({"error": "未指定账号"}), 400
+
+    # 查找账号
+    rows = models['account'].search(email)
+    account = None
+    for r in rows:
+        if r['email'] == email:
+            account = r
+            break
+
+    if not account:
+        return jsonify({"error": "账号不存在"}), 404
+
+    cf_password = account.get('cf_password')
+    if not cf_password:
+        return jsonify({"error": "该账号没有保存 CF 密码"}), 400
+
+    status = account.get('status', '')
+    if 'bound' not in status:
+        return jsonify({"error": "该账号未绑定信用卡，无法充值"}), 400
+
+    # 标记为运行中，在后台线程执行充值
+    state.is_running = True
+    state.current_action = f"正在为 {email} 充值..."
+    state._patch_prints()
+
+    import threading
+
+    def _do_recharge():
+        try:
+            success, err = registration.recharge_account(
+                email, cf_password,
+                monitor_callback=state._monitor,
+            )
+            if success:
+                state.current_action = f"{email} 充值成功"
+                state.add_log(f"{email} AI Credits 充值 $10 成功")
+            else:
+                state.current_action = f"{email} 充值失败: {err}"
+                state.add_log(f"{email} 充值失败: {err}")
+        except Exception as e:
+            state.current_action = f"充值异常: {e}"
+            state.add_log(f"充值异常: {e}")
+        finally:
+            state._stop_screenshot_loop()
+            state.is_running = False
+
+    threading.Thread(target=_do_recharge, daemon=True).start()
+    return jsonify({"status": "started", "email": email})
 
 
 @api.route('/api/accounts/export', methods=['POST'])
