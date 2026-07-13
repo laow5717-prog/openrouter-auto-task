@@ -18,6 +18,9 @@ from src.models.account import AccountModel
 from src.models.task import TaskModel
 from src.models.card_binding import CardBindingModel
 from src.models.recharge_log import RechargeLogModel
+from src.models.card_group import CardGroupModel
+from src.models.card_pool import CardPoolModel
+from src.models.valid_card import ValidCardModel
 from src.services import registration, card as card_service
 from src.api.routes import api
 
@@ -48,6 +51,10 @@ class AppState:
 
         # 当前信用卡驱动任务 ID
         self.current_card_task_id = None
+
+        # 当前活跃的自动化 driver（用于停止时强制关闭）
+        self._active_driver = None
+        self._active_driver_lock = threading.Lock()
 
         # 按账号独立跟踪的浏览器查看会话（不阻塞全局任务）
         self.open_browsers = set()
@@ -97,6 +104,30 @@ class AppState:
         self._screenshot_stop.set()
         self._screenshot_driver = None
 
+    def set_active_driver(self, driver):
+        with self._active_driver_lock:
+            self._active_driver = driver
+
+    def clear_active_driver(self):
+        with self._active_driver_lock:
+            self._active_driver = None
+
+    def force_stop(self):
+        """强制停止：设置标志、关闭浏览器、重置状态"""
+        self.stop_requested = True
+        self._stop_screenshot_loop()
+
+        # 强制关闭活跃的 driver
+        with self._active_driver_lock:
+            if self._active_driver:
+                try:
+                    self._active_driver.quit()
+                except Exception:
+                    pass
+                self._active_driver = None
+
+        self.add_log("已强制停止任务并关闭浏览器")
+
     def _hooked_print(self, *args, **kwargs):
         sep = kwargs.get('sep', ' ')
         msg = sep.join(map(str, args))
@@ -109,6 +140,8 @@ class AppState:
         if self.stop_requested:
             self._hooked_print("收到停止请求，正在中断...")
             raise InterruptedError("User requested stop")
+        # 跟踪活跃 driver
+        self.set_active_driver(driver)
         # 首次调用时启动持续截图线程
         if self._screenshot_driver is not driver:
             self._start_screenshot_loop(driver)
@@ -172,6 +205,7 @@ class AppState:
         except Exception as e:
             self._hooked_print(f"严重错误: {e}")
         finally:
+            self.clear_active_driver()
             self._stop_screenshot_loop()
             self.is_running = False
             self.current_action = "任务已完成"
@@ -179,7 +213,7 @@ class AppState:
             self.models['task'].finish(task_id, 'completed' if not self.stop_requested else 'stopped')
             self._hooked_print("任务完成")
 
-    def run_card_driven_task(self, cards, cf_password, max_bindable_cards, captcha_api_key):
+    def run_card_driven_task(self, cards, cf_password, max_bindable_cards, captcha_api_key, source_group_id=None):
         self.is_running = True
         self.stop_requested = False
         self.success_count = 0
@@ -307,6 +341,7 @@ class AppState:
         except Exception as e:
             self._hooked_print(f"严重错误: {e}")
         finally:
+            self.clear_active_driver()
             self._stop_screenshot_loop()
             self.is_running = False
             final_summary = card_binding_model.get_summary(task_id)
@@ -314,6 +349,26 @@ class AppState:
             self.models['task'].update_counts(task_id, final_summary['success'], final_summary['failed'])
             self.models['task'].finish(task_id, 'completed' if not self.stop_requested else 'stopped')
             self._hooked_print(f"任务完成 - 总计: {final_summary['total']}，成功: {final_summary['success']}，失败: {final_summary['failed']}")
+
+            # 记录有效卡（绑定成功的卡）
+            try:
+                success_records = self.db.fetchall(
+                    "SELECT card_data_json, bound_to_email FROM card_bindings WHERE task_id=? AND status='success' AND card_data_json IS NOT NULL",
+                    (task_id,),
+                )
+                valid_count = 0
+                for sr in success_records:
+                    card_data = json.loads(sr['card_data_json'])
+                    self.models['valid_card'].record(
+                        card_data, source_type='bind',
+                        source_email=sr['bound_to_email'] or '',
+                        source_group_id=source_group_id,
+                    )
+                    valid_count += 1
+                if valid_count > 0:
+                    self._hooked_print(f"已记录 {valid_count} 张有效卡")
+            except Exception as e:
+                self._hooked_print(f"记录有效卡失败: {e}")
 
             # 导出报告
             try:
@@ -384,6 +439,9 @@ def create_app(db_path=None):
         'task': TaskModel(db),
         'card_binding': CardBindingModel(db),
         'recharge_log': RechargeLogModel(db),
+        'card_group': CardGroupModel(db),
+        'card_pool': CardPoolModel(db),
+        'valid_card': ValidCardModel(db),
     }
 
     # 创建应用状态

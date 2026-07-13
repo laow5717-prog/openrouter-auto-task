@@ -77,7 +77,7 @@ def stop_task():
     if not state.is_running:
         return jsonify({"error": "No running task"}), 400
 
-    state.stop_requested = True
+    state.force_stop()
     return jsonify({"status": "stopping"})
 
 
@@ -441,6 +441,7 @@ def recharge_account():
 
     data = request.json or {}
     email = data.get('email', '')
+    payment_group_id = data.get('payment_group_id')
     if not email:
         return jsonify({"error": "未指定账号"}), 400
 
@@ -470,6 +471,15 @@ def recharge_account():
 
     import threading
 
+    # 是否有支付卡分组 → 决定是否处理 Unpaid invoices
+    skip_invoice = not payment_group_id
+    payment_cards = []
+    if payment_group_id:
+        payment_cards = models['card_pool'].get_cards_as_list(payment_group_id)
+        if not payment_cards:
+            state.add_log(f"支付卡分组无卡片数据，将仅执行 Top-up Credits")
+            skip_invoice = True
+
     # 获取该账号绑定的卡片列表，后续根据页面实际使用的卡片后四位匹配完整卡号
     cards = models['card_binding'].get_by_email(email)
 
@@ -482,6 +492,8 @@ def recharge_account():
                 email, cf_password,
                 recharge_log_model=models['recharge_log'],
                 monitor_callback=state._monitor,
+                skip_invoice=skip_invoice,
+                payment_cards=payment_cards,
             )
 
             # 用页面提取的后四位匹配完整卡号
@@ -511,6 +523,14 @@ def recharge_account():
                     models['recharge_log'].mark_success(log_id, api_response=topup_resp)
                     state.current_action = f"{email} 充值成功"
                     state.add_log(f"{email} AI Credits 充值 $10 成功")
+                    # 记录有效卡（支付成功）
+                    if matched_card and card_last4:
+                        for c in cards:
+                            if c.get('card_number', '').endswith(card_last4):
+                                models['valid_card'].record(
+                                    c, source_type='payment', source_email=email,
+                                )
+                                break
                 else:
                     # API 返回了错误（如 409 重复充值）
                     error_msg = ''
@@ -539,6 +559,7 @@ def recharge_account():
             state.current_action = f"充值异常: {e}"
             state.add_log(f"充值异常: {e}")
         finally:
+            state.clear_active_driver()
             state._stop_screenshot_loop()
             state.is_running = False
 
@@ -742,3 +763,166 @@ def export_accounts():
         as_attachment=True,
         download_name='accounts_export.xlsx',
     )
+
+
+# ==================== 卡片分组 & 底料池 ====================
+
+@api.route('/api/card-groups')
+def get_card_groups():
+    models = get_models()
+    group_type = request.args.get('type', '')
+    if group_type:
+        groups = models['card_group'].get_by_type(group_type)
+    else:
+        groups = models['card_group'].get_all()
+    return jsonify(groups)
+
+
+@api.route('/api/card-groups', methods=['POST'])
+def create_card_group():
+    models = get_models()
+    data = request.json or {}
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({"error": "分组名称不能为空"}), 400
+    group_type = data.get('type', 'bind')
+    if group_type not in ('bind', 'payment'):
+        return jsonify({"error": "分组类型必须是 bind 或 payment"}), 400
+    description = data.get('description', '')
+    group_id = models['card_group'].create(name, group_type, description)
+    return jsonify({"id": group_id, "name": name, "type": group_type})
+
+
+@api.route('/api/card-groups/<int:group_id>', methods=['PUT'])
+def update_card_group(group_id):
+    models = get_models()
+    data = request.json or {}
+    name = data.get('name')
+    description = data.get('description')
+    models['card_group'].update(group_id, name=name, description=description)
+    return jsonify({"status": "ok"})
+
+
+@api.route('/api/card-groups/<int:group_id>', methods=['DELETE'])
+def delete_card_group(group_id):
+    models = get_models()
+    models['card_group'].delete(group_id)
+    return jsonify({"status": "ok"})
+
+
+@api.route('/api/card-pool/<int:group_id>')
+def get_card_pool(group_id):
+    models = get_models()
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 20))
+    cards, total = models['card_pool'].get_by_group(group_id, page=page, page_size=page_size)
+
+    # 标记有效卡
+    for card in cards:
+        card['is_valid'] = models['valid_card'].is_valid(card['card_number'])
+
+    return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size})
+
+
+@api.route('/api/card-pool/<int:group_id>/upload', methods=['POST'])
+def upload_card_pool(group_id):
+    models = get_models()
+
+    group = models['card_group'].get_by_id(group_id)
+    if not group:
+        return jsonify({"error": "分组不存在"}), 404
+
+    if 'file' not in request.files:
+        return jsonify({"error": "未上传文件"}), 400
+
+    file = request.files['file']
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        return jsonify({"error": "仅支持 .xlsx/.xls 文件"}), 400
+
+    upload_dir = str(get_data_dir() / "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    save_path = os.path.join(upload_dir, f"pool_upload_{group_id}.xlsx")
+    file.save(save_path)
+
+    cards, errors = card_service.parse_excel(save_path)
+    if not cards:
+        return jsonify({"error": "解析失败", "details": errors}), 400
+
+    added, skipped, conflicts = models['card_pool'].add_cards(group_id, cards)
+
+    return jsonify({
+        "added": added,
+        "skipped": skipped,
+        "conflicts": conflicts,
+        "total_parsed": len(cards),
+        "errors": errors,
+    })
+
+
+@api.route('/api/card-pool/card/<int:card_id>', methods=['DELETE'])
+def delete_pool_card(card_id):
+    models = get_models()
+    models['card_pool'].delete_card(card_id)
+    return jsonify({"status": "ok"})
+
+
+@api.route('/api/card-pool/<int:group_id>/clear', methods=['POST'])
+def clear_card_pool(group_id):
+    models = get_models()
+    deleted = models['card_pool'].delete_by_group(group_id)
+    return jsonify({"deleted": deleted})
+
+
+# ==================== 有效卡 ====================
+
+@api.route('/api/valid-cards')
+def get_valid_cards():
+    models = get_models()
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 20))
+    source_type = request.args.get('source_type', '')
+    keyword = request.args.get('keyword', '')
+    cards, total = models['valid_card'].get_all(
+        page=page, page_size=page_size,
+        source_type=source_type, keyword=keyword,
+    )
+    summary = models['valid_card'].get_summary()
+    return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size, "summary": summary})
+
+
+# ==================== 修改绑卡任务：支持从分组启动 ====================
+
+@api.route('/api/card/start-from-group', methods=['POST'])
+def start_card_task_from_group():
+    """从卡片分组启动绑卡任务"""
+    state = get_app_state()
+    if state.is_running:
+        return jsonify({"error": "有任务正在运行"}), 400
+
+    models = get_models()
+    data = request.json or {}
+    group_id = data.get('group_id')
+    if not group_id:
+        return jsonify({"error": "未指定卡片分组"}), 400
+
+    group = models['card_group'].get_by_id(group_id)
+    if not group:
+        return jsonify({"error": "分组不存在"}), 404
+
+    cards = models['card_pool'].get_cards_as_list(group_id)
+    if not cards:
+        return jsonify({"error": "该分组没有卡片数据"}), 400
+
+    cf_password = data.get('cf_password')
+    max_bindable_cards = data.get('max_bindable_cards', 2)
+    captcha_api_key = data.get('captcha_api_key')
+
+    import threading
+    threading.Thread(
+        target=state.run_card_driven_task,
+        args=(cards, cf_password, max_bindable_cards, captcha_api_key),
+        kwargs={'source_group_id': group_id},
+        daemon=True,
+    ).start()
+
+    return jsonify({"status": "started", "total_cards": len(cards), "group_name": group['name']})

@@ -51,9 +51,25 @@
         </div>
       </div>
 
+      <!-- 从分组启动 -->
+      <div v-if="bindGroups.length > 0" style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--border)">
+        <div style="font-size:12px;color:#666;margin-bottom:8px">
+          或从卡片分组启动（使用「卡片管理」中配置的绑定卡分组）：
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <select v-model="selectedGroupId" class="ctrl-input" style="width:200px">
+            <option value="">选择绑定卡分组...</option>
+            <option v-for="g in bindGroups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.card_count }}张)</option>
+          </select>
+          <button v-if="!appStore.isRunning" class="btn btn-primary" style="width:auto;padding:8px 20px" :disabled="!selectedGroupId" @click="handleStartFromGroup">
+            从分组启动
+          </button>
+        </div>
+      </div>
+
       <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
         <button v-if="!appStore.isRunning" class="btn btn-primary" style="width:auto;padding:8px 20px" @click="handleStartCardTask">
-          启动信用卡驱动任务
+          从上传文件启动
         </button>
         <button v-else class="btn btn-danger" style="width:auto;padding:8px 20px" @click="handleStop">
           停止
@@ -125,7 +141,7 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
-import { getCardStatus, uploadCardExcel, startCardTask, stopTask, checkUnfinishedCards } from '../api'
+import { getCardStatus, uploadCardExcel, startCardTask, stopTask, checkUnfinishedCards, getCardGroups, startCardTaskFromGroup } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
 
@@ -142,6 +158,8 @@ const filters = reactive({ keyword: '', status: '' })
 const uploadMsg = ref('')
 const fileInput = ref(null)
 const unfinishedInfo = reactive({ show: false, remaining: 0, total: 0, bound: 0 })
+const bindGroups = ref([])
+const selectedGroupId = ref('')
 
 let refreshTimer = null
 
@@ -224,9 +242,34 @@ async function checkUnfinished() {
   }
 }
 
+async function loadBindGroups() {
+  try {
+    bindGroups.value = await getCardGroups({ type: 'bind' })
+  } catch (e) { console.error(e) }
+}
+
+async function handleStartFromGroup() {
+  if (appStore.isRunning) { alert('任务已在运行中'); return }
+  if (!selectedGroupId.value) { alert('请选择卡片分组'); return }
+  appStore.clearLogs()
+  settings.save()
+
+  const body = { group_id: selectedGroupId.value, max_bindable_cards: 2 }
+  if (settings.cfPassword) body.cf_password = settings.cfPassword
+  if (settings.captchaApiKey) body.captcha_api_key = settings.captchaApiKey
+
+  try {
+    const result = await startCardTaskFromGroup(body)
+    alert(`已启动，分组共 ${result.total_cards} 张卡`)
+  } catch (e) {
+    alert('启动失败: ' + e.message)
+  }
+}
+
 onMounted(() => {
   loadData()
   checkUnfinished()
+  loadBindGroups()
   refreshTimer = setInterval(() => { if (appStore.isRunning) loadData() }, 2000)
 })
 

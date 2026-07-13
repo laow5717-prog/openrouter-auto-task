@@ -284,7 +284,8 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
     return email, password, bound_count
 
 
-def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None):
+def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
+                     skip_invoice=False, payment_cards=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -293,6 +294,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         cf_password: CF 密码
         recharge_log_model: RechargeLogModel 实例，用于查询今日充值记录
         monitor_callback: 监控回调 (driver, step_name)
+        skip_invoice: 是否跳过 Unpaid invoice 在线支付（未选择支付卡分组时为 True）
+        payment_cards: 支付卡数据列表（用于在线支付填写信用卡信息）
     返回:
         (bool, str, list, str): (是否成功, 错误信息, API 响应列表, 卡片后四位)
     """
@@ -333,19 +336,24 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             card_already_used_today = recharge_log_model.has_today_record(email, card_last4)
 
         if card_already_used_today:
-            print(f"卡片 ****{card_last4} 今日已有充值记录，跳过 Top-up，执行账单支付流程")
-            close_topup_dialog(driver)
-            time.sleep(2)
-
-            # 直接在当前 credits 页面处理 Unpaid invoices
-            invoice_results = handle_unpaid_invoices(driver)
-            if invoice_results:
-                print(f"Unpaid invoice 处理结果: {invoice_results}")
-                time.sleep(10)
+            if skip_invoice:
+                print(f"卡片 ****{card_last4} 今日已有充值记录，且未选择支付卡分组，跳过")
+                close_topup_dialog(driver)
+                return True, "今日已充值，跳过", [], card_last4
             else:
-                print("未发现 Unpaid invoice")
+                print(f"卡片 ****{card_last4} 今日已有充值记录，跳过 Top-up，执行账单支付流程")
+                close_topup_dialog(driver)
+                time.sleep(2)
 
-            return True, "跳过充值，已处理账单", [], card_last4
+                # 直接在当前 credits 页面处理 Unpaid invoices
+                invoice_results = handle_unpaid_invoices(driver)
+                if invoice_results:
+                    print(f"Unpaid invoice 处理结果: {invoice_results}")
+                    time.sleep(10)
+                else:
+                    print("未发现 Unpaid invoice")
+
+                return True, "跳过充值，已处理账单", [], card_last4
 
         # 今日未支付过，继续充值流程
         print("正在填写充值金额并确认支付...")
@@ -354,20 +362,24 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
 
         if pay_success:
             print(f"账号 {email} 充值 $10 已提交")
-            # 等待页面更新，然后回到 credits 页面检查 Unpaid invoices
-            time.sleep(5)
-            print("正在返回 Credits 页面检查 Unpaid invoices...")
-            credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
-            driver.get(credits_url)
-            time.sleep(5)
-            check_and_handle_cf_challenge(driver)
-            dismiss_overdue_dialog(driver)
-            time.sleep(3)
 
-            invoice_results = handle_unpaid_invoices(driver)
-            if invoice_results:
-                print(f"Unpaid invoice 处理结果: {invoice_results}")
-                time.sleep(10)
+            if not skip_invoice:
+                # 有支付卡分组，等待页面更新后检查 Unpaid invoices
+                time.sleep(5)
+                print("正在返回 Credits 页面检查 Unpaid invoices...")
+                credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+                driver.get(credits_url)
+                time.sleep(5)
+                check_and_handle_cf_challenge(driver)
+                dismiss_overdue_dialog(driver)
+                time.sleep(3)
+
+                invoice_results = handle_unpaid_invoices(driver)
+                if invoice_results:
+                    print(f"Unpaid invoice 处理结果: {invoice_results}")
+                    time.sleep(10)
+            else:
+                print("未选择支付卡分组，跳过 Unpaid invoice 处理")
         else:
             print(f"账号 {email} 充值确认失败")
 

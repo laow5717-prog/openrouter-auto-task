@@ -56,9 +56,62 @@ CREATE TABLE IF NOT EXISTS recharge_logs (
 );
 """
 
+_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS card_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'bind',
+    description TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS card_pool (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL REFERENCES card_groups(id) ON DELETE CASCADE,
+    card_number TEXT NOT NULL,
+    expiry_month TEXT NOT NULL,
+    expiry_year TEXT NOT NULL,
+    cvc TEXT NOT NULL,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    country TEXT DEFAULT '',
+    address TEXT DEFAULT '',
+    address2 TEXT DEFAULT '',
+    city TEXT DEFAULT '',
+    state TEXT DEFAULT '',
+    zip TEXT DEFAULT '',
+    company TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE(card_number, group_id)
+);
+
+CREATE TABLE IF NOT EXISTS valid_cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_number TEXT NOT NULL,
+    expiry_month TEXT NOT NULL,
+    expiry_year TEXT NOT NULL,
+    cvc TEXT NOT NULL,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    country TEXT DEFAULT '',
+    address TEXT DEFAULT '',
+    address2 TEXT DEFAULT '',
+    city TEXT DEFAULT '',
+    state TEXT DEFAULT '',
+    zip TEXT DEFAULT '',
+    company TEXT DEFAULT '',
+    source_type TEXT NOT NULL,
+    source_email TEXT DEFAULT '',
+    source_group_id INTEGER,
+    validated_at TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE(card_number, source_type)
+);
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
+    3: _SCHEMA_V3,
 }
 
 

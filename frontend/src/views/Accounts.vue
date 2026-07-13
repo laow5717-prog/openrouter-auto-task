@@ -129,6 +129,30 @@
     </div>
   </Modal>
 
+  <!-- 充值确认弹窗 -->
+  <Modal :visible="rechargeConfirmVisible" title="充值确认" @close="rechargeConfirmVisible = false">
+    <div style="margin-bottom:16px">
+      <div style="font-size:14px;margin-bottom:8px">账号: <strong>{{ rechargeTargetEmail }}</strong></div>
+      <div style="font-size:13px;color:var(--text-sub);margin-bottom:12px">充值 $10 AI Credits</div>
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px;color:#555">
+        在线支付卡分组（可选）
+      </label>
+      <select v-model="rechargeGroupId" class="ctrl-input" style="width:100%">
+        <option value="">不选择 - 仅执行 Top-up Credits</option>
+        <option v-for="g in paymentGroups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.card_count }}张)</option>
+      </select>
+      <div style="font-size:11px;color:#999;margin-top:4px">
+        选择支付卡分组后，充值完成会自动处理账单的在线支付；不选择则只执行 Top-up Credits 充值。
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" style="width:auto;padding:8px 20px" @click="rechargeConfirmVisible = false">取消</button>
+      <button class="btn btn-primary" style="width:auto;padding:8px 20px" @click="confirmRecharge">确认充值</button>
+    </div>
+  </Modal>
+
   <!-- 充值记录弹窗 -->
   <Modal :visible="rechargeModalVisible" :title="rechargeModalTitle" @close="rechargeModalVisible = false" wide>
     <div v-if="rechargeLogsLoading" class="table-loading">加载中...</div>
@@ -155,7 +179,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, openAccountBrowser, getOpenBrowsers, getRechargeLogsByEmail } from '../api'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, openAccountBrowser, getOpenBrowsers, getRechargeLogsByEmail, getCardGroups } from '../api'
 import { useAppStore } from '../stores/app'
 const store = useAppStore()
 
@@ -192,6 +216,10 @@ const selected = reactive(new Set())
 
 // 充值状态
 const rechargingEmail = ref('')
+const rechargeConfirmVisible = ref(false)
+const rechargeTargetEmail = ref('')
+const rechargeGroupId = ref('')
+const paymentGroups = ref([])
 
 // 卡片弹窗
 const modalVisible = ref(false)
@@ -297,10 +325,21 @@ async function handleDeleteOne(email) {
 }
 
 async function handleRecharge(email) {
-  if (!confirm(`确定要为账号 ${email} 充值 $10 AI Credits 吗？`)) return
+  rechargeTargetEmail.value = email
+  rechargeGroupId.value = ''
+  // 加载支付卡分组
+  try {
+    paymentGroups.value = await getCardGroups({ type: 'payment' })
+  } catch { paymentGroups.value = [] }
+  rechargeConfirmVisible.value = true
+}
+
+async function confirmRecharge() {
+  const email = rechargeTargetEmail.value
+  rechargeConfirmVisible.value = false
   rechargingEmail.value = email
   try {
-    await rechargeAccount(email)
+    await rechargeAccount(email, rechargeGroupId.value || null)
     alert(`已启动充值任务，请在 Dashboard 查看进度`)
   } catch (e) {
     alert('充值请求失败: ' + e.message)
