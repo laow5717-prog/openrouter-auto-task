@@ -373,3 +373,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 12: 充值流程完善：今日支付检查、Stripe 表单展开、多账号浏览器查看
+
+**Date**: 2026-07-13
+**Task**: 充值流程完善：今日支付检查、Stripe 表单展开、多账号浏览器查看
+**Branch**: `main`
+
+### Summary
+
+增加充值前今日已支付检查（跳过重复充值直接走账单流程）；Stripe 支付页面等待加载并展开 Card 表单（iframe 内字段已定位，数据填写待后续数据源）；多账号同时查看浏览器（per-account 跟踪）；修复 stale element 和卡片后四位提取逻辑拆分
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `58ff091` | (see git log) |
+| `3d9316f` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
