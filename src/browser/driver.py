@@ -1279,18 +1279,24 @@ def extract_topup_card_last4(driver):
     wait = WebDriverWait(driver, 30)
     try:
         # 等待弹窗加载
-        wait.until(EC.visibility_of_element_located((
-            By.CSS_SELECTOR, "div[role='dialog'] input#price"
+        wait.until(EC.presence_of_element_located((
+            By.CSS_SELECTOR, "input#price"
         )))
-        dialog = driver.find_element(By.CSS_SELECTOR, "div[role='dialog']")
-        card_text = dialog.text
-        match = re.search(r'(\d{4})\s*$', card_text.replace('\n', ' ').strip())
-        if not match:
-            match = re.search(r'[•·*\s]+(\d{4})', card_text)
-        if match:
-            card_last4 = match.group(1)
+        time.sleep(2)
+        # 通过 input#price 向上找到所属的 dialog（避免匹配到 Cookie 弹窗）
+        card_last4 = driver.execute_script(r"""
+            var priceInput = document.querySelector('input#price');
+            if (!priceInput) return '';
+            var dialog = priceInput.closest('div[role="dialog"]');
+            if (!dialog) return '';
+            var text = dialog.textContent || dialog.innerText || '';
+            var m = text.match(/[\u2022\u00b7*\s]+(\d{4})/);
+            return m ? m[1] : '';
+        """)
+        if card_last4:
             print(f"检测到支付卡片后四位: {card_last4}")
             return card_last4
+        print("未能从弹窗匹配到卡片后四位")
     except Exception as e:
         print(f"提取卡片后四位失败: {e}")
     return ''
@@ -1537,8 +1543,9 @@ def handle_unpaid_invoices(driver):
                 print(f"[{i+1}/{len(invoice_ids)}] 处理 invoice: {invoice_id}")
 
                 # 重新查找当前 invoice 的下载链接（页面可能已刷新）
+                # 用 contains(.,id) 匹配整个元素文本（含子元素），而非 text() 仅匹配直接文本节点
                 invoice_link = driver.find_element(
-                    By.XPATH, f"//table//tr[.//span[text()='Unpaid']]//a[@role='button'][contains(text(),'{invoice_id}')]"
+                    By.XPATH, f"//table//tr[.//span[text()='Unpaid']]//a[@role='button'][contains(.,'{invoice_id}')]"
                 )
 
                 # 清空下载目录中的旧 PDF
@@ -1591,16 +1598,30 @@ def handle_unpaid_invoices(driver):
                     results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
                     continue
 
-                # 点击 Card 支付选项展开信用卡输入表单
+                # 切入 Stripe iframe 点击 Card 支付选项
                 try:
-                    card_btn = pay_wait.until(EC.element_to_be_clickable((
+                    stripe_iframe = pay_wait.until(EC.presence_of_element_located((
+                        By.CSS_SELECTOR, "div#payment-element iframe"
+                    )))
+                    driver.switch_to.frame(stripe_iframe)
+                    print(f"  {invoice_id} 已切入 Stripe iframe")
+
+                    iframe_wait = WebDriverWait(driver, 30)
+                    card_btn = iframe_wait.until(EC.element_to_be_clickable((
                         By.CSS_SELECTOR, "div.p-AccordionButton[data-value='card']"
                     )))
                     card_btn.click()
                     time.sleep(2)
                     print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
+
+                    # 切回主页面
+                    driver.switch_to.default_content()
                 except Exception as e:
                     print(f"  {invoice_id} 点击 Card 选项失败: {e}")
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
                     results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": f"点击 Card 选项失败: {e}"})
                     continue
 
