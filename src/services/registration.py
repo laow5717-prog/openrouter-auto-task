@@ -17,7 +17,11 @@ from src.browser.driver import (
     add_credit_card,
     get_bound_card_count,
     login_cloudflare,
+    check_and_handle_cf_challenge,
+    dismiss_overdue_dialog,
     navigate_to_ai_credits,
+    extract_topup_card_last4,
+    close_topup_dialog,
     fill_topup_and_confirm,
     handle_unpaid_invoices,
 )
@@ -280,16 +284,17 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
     return email, password, bound_count
 
 
-def recharge_account(email, cf_password, monitor_callback=None):
+def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
     参数:
         email: 账号邮箱
         cf_password: CF 密码
+        recharge_log_model: RechargeLogModel 实例，用于查询今日充值记录
         monitor_callback: 监控回调 (driver, step_name)
     返回:
-        (bool, str, list): (是否成功, 错误信息, API 响应列表)
+        (bool, str, list, str): (是否成功, 错误信息, API 响应列表, 卡片后四位)
     """
     driver = None
 
@@ -304,7 +309,7 @@ def recharge_account(email, cf_password, monitor_callback=None):
         print(f"正在登录账号: {email}")
         account_id = login_cloudflare(driver, email, cf_password)
         if not account_id:
-            return False, "登录失败，无法获取 account_id", []
+            return False, "登录失败，无法获取 account_id", [], ''
         _report("logged_in")
 
         print("正在跳转到 AI Credits 页面并点击充值...")
@@ -312,24 +317,49 @@ def recharge_account(email, cf_password, monitor_callback=None):
         _report("navigated_to_credits")
 
         if not success:
-            return False, "导航到充值页面或点击 Top-up 按钮失败", []
+            return False, "导航到充值页面或点击 Top-up 按钮失败", [], ''
 
+        # 弹窗已打开，提取卡片后四位并检查今日是否已支付
+        card_last4 = extract_topup_card_last4(driver)
+        _report("extracted_card")
+
+        if not card_last4:
+            print("未能从弹窗提取到信用卡信息，无法继续充值")
+            close_topup_dialog(driver)
+            return False, "未获取到有效信用卡信息", [], ''
+
+        card_already_used_today = False
+        if recharge_log_model:
+            card_already_used_today = recharge_log_model.has_today_record(email, card_last4)
+
+        if card_already_used_today:
+            print(f"卡片 ****{card_last4} 今日已有充值记录，跳过 Top-up，执行账单支付流程")
+            close_topup_dialog(driver)
+            time.sleep(2)
+
+            # 直接在当前 credits 页面处理 Unpaid invoices
+            invoice_results = handle_unpaid_invoices(driver)
+            if invoice_results:
+                print(f"Unpaid invoice 处理结果: {invoice_results}")
+                time.sleep(10)
+            else:
+                print("未发现 Unpaid invoice")
+
+            return True, "跳过充值，已处理账单", [], card_last4
+
+        # 今日未支付过，继续充值流程
         print("正在填写充值金额并确认支付...")
         pay_success, responses, card_last4 = fill_topup_and_confirm(driver, amount=10)
         _report("topup_confirmed")
 
         if pay_success:
             print(f"账号 {email} 充值 $10 已提交")
-            import time
             # 等待页面更新，然后回到 credits 页面检查 Unpaid invoices
             time.sleep(5)
             print("正在返回 Credits 页面检查 Unpaid invoices...")
-            from src.browser.driver import navigate_to_ai_credits as _nav
-            # 不点 Top-up，只导航到 credits 页面
             credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
             driver.get(credits_url)
             time.sleep(5)
-            from src.browser.driver import check_and_handle_cf_challenge, dismiss_overdue_dialog
             check_and_handle_cf_challenge(driver)
             dismiss_overdue_dialog(driver)
             time.sleep(3)

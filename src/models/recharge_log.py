@@ -35,6 +35,19 @@ class RechargeLogModel:
             (error, json.dumps(api_response, ensure_ascii=False) if api_response else None, log_id),
         )
 
+    def has_today_record(self, email, card_last4=''):
+        """检查今日是否已有充值记录（不管成功失败）"""
+        conditions = ["email=?", "DATE(created_at)=DATE('now','localtime')"]
+        params = [email]
+        if card_last4:
+            conditions.append("card_display LIKE ?")
+            params.append(f"%{card_last4}")
+        row = self.db.fetchone(
+            f"SELECT COUNT(*) as cnt FROM recharge_logs WHERE {' AND '.join(conditions)}",
+            params,
+        )
+        return row['cnt'] > 0 if row else False
+
     def get_by_email(self, email):
         rows = self.db.fetchall(
             "SELECT * FROM recharge_logs WHERE email=? ORDER BY id DESC",

@@ -1267,9 +1267,60 @@ def navigate_to_ai_credits(driver, account_id):
     return False
 
 
+def extract_topup_card_last4(driver):
+    """
+    从 Top-up 弹窗中提取信用卡后四位
+
+    参数:
+        driver: 浏览器驱动
+    返回:
+        str: 卡片后四位，提取失败返回空字符串
+    """
+    wait = WebDriverWait(driver, 30)
+    try:
+        # 等待弹窗加载
+        wait.until(EC.visibility_of_element_located((
+            By.CSS_SELECTOR, "div[role='dialog'] input#price"
+        )))
+        dialog = driver.find_element(By.CSS_SELECTOR, "div[role='dialog']")
+        card_text = dialog.text
+        match = re.search(r'(\d{4})\s*$', card_text.replace('\n', ' ').strip())
+        if not match:
+            match = re.search(r'[•·*\s]+(\d{4})', card_text)
+        if match:
+            card_last4 = match.group(1)
+            print(f"检测到支付卡片后四位: {card_last4}")
+            return card_last4
+    except Exception as e:
+        print(f"提取卡片后四位失败: {e}")
+    return ''
+
+
+def close_topup_dialog(driver):
+    """关闭 Top-up 弹窗"""
+    try:
+        close_btn = driver.find_element(
+            By.CSS_SELECTOR, "div[role='dialog'] button[aria-label='Close']"
+        )
+        close_btn.click()
+        time.sleep(1)
+        print("已关闭 Top-up 弹窗")
+        return True
+    except Exception:
+        # 备用：按 Escape 键关闭
+        try:
+            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(1)
+            print("已通过 Escape 关闭 Top-up 弹窗")
+            return True
+        except Exception as e:
+            print(f"关闭弹窗失败: {e}")
+            return False
+
+
 def fill_topup_and_confirm(driver, amount=10):
     """
-    在 Top-up 弹窗中输入金额并点击确认支付
+    在 Top-up 弹窗中输入金额并点击确认支付（弹窗需已打开）
 
     参数:
         driver: 浏览器驱动
@@ -1278,28 +1329,10 @@ def fill_topup_and_confirm(driver, amount=10):
         (bool, list, str): (是否成功点击, API 响应列表, 使用的卡片后四位)
     """
     wait = WebDriverWait(driver, 30)
-    card_last4 = ''
+    card_last4 = extract_topup_card_last4(driver)
 
     try:
-        # 等待弹窗中的金额输入框出现
-        print(f"等待充值弹窗加载...")
-        price_input = wait.until(EC.visibility_of_element_located((
-            By.CSS_SELECTOR, "div[role='dialog'] input#price"
-        )))
-
-        # 提取弹窗中显示的支付卡片后四位
-        try:
-            dialog = driver.find_element(By.CSS_SELECTOR, "div[role='dialog']")
-            card_text = dialog.text
-            match = re.search(r'(\d{4})\s*$', card_text.replace('\n', ' ').strip())
-            if not match:
-                # 尝试匹配 •••• •••• •••• 1234 格式
-                match = re.search(r'[•·*\s]+(\d{4})', card_text)
-            if match:
-                card_last4 = match.group(1)
-                print(f"检测到支付卡片后四位: {card_last4}")
-        except Exception:
-            pass
+        price_input = driver.find_element(By.CSS_SELECTOR, "div[role='dialog'] input#price")
 
         # 清空并输入金额
         price_input.click()
@@ -1352,9 +1385,120 @@ def _extract_pdf_pay_url(pdf_path):
     return None
 
 
+def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
+    """
+    在 Stripe 支付页面的 iframe 内填写信用卡信息并点击 Pay
+
+    参数:
+        driver: 浏览器驱动
+        card_info: dict with number, expiry_month, expiry_year, cvc, country, zip
+        invoice_id: invoice 编号（用于日志）
+    返回:
+        dict: {status, error?}
+    """
+    try:
+        # 找到 Stripe Payment Element iframe 并切换进去
+        stripe_iframe = WebDriverWait(driver, 120).until(
+            EC.presence_of_element_located((
+                By.CSS_SELECTOR, "div#payment-element iframe"
+            ))
+        )
+        driver.switch_to.frame(stripe_iframe)
+        print(f"  {invoice_id} 已切换到 Stripe iframe")
+
+        iframe_wait = WebDriverWait(driver, 30)
+
+        # 等待卡号输入框出现并填写
+        number_input = iframe_wait.until(EC.visibility_of_element_located((
+            By.CSS_SELECTOR, "input#payment-numberInput"
+        )))
+        number_input.click()
+        time.sleep(0.3)
+        number_input.send_keys(card_info.get('number', ''))
+        print(f"  {invoice_id} 已输入卡号")
+        time.sleep(0.5)
+
+        # 填写有效期 (MM / YY)
+        expiry_input = driver.find_element(By.CSS_SELECTOR, "input#payment-expiryInput")
+        expiry_input.click()
+        time.sleep(0.3)
+        month = str(card_info.get('expiry_month', '')).zfill(2)
+        year = str(card_info.get('expiry_year', ''))
+        if len(year) == 4:
+            year = year[2:]  # 2026 -> 26
+        expiry_input.send_keys(f"{month}{year}")
+        print(f"  {invoice_id} 已输入有效期")
+        time.sleep(0.5)
+
+        # 填写 CVC
+        cvc_input = driver.find_element(By.CSS_SELECTOR, "input#payment-cvcInput")
+        cvc_input.click()
+        time.sleep(0.3)
+        cvc_input.send_keys(str(card_info.get('cvc', '')))
+        print(f"  {invoice_id} 已输入 CVC")
+        time.sleep(0.5)
+
+        # 选择国家
+        country_code = card_info.get('country', 'US')
+        if country_code:
+            from selenium.webdriver.support.ui import Select
+            country_select = driver.find_element(By.CSS_SELECTOR, "select#payment-countryInput")
+            Select(country_select).select_by_value(country_code)
+            print(f"  {invoice_id} 已选择国家: {country_code}")
+            time.sleep(0.5)
+
+        # 填写 ZIP code
+        zip_code = card_info.get('zip', '')
+        if zip_code:
+            zip_input = driver.find_element(By.CSS_SELECTOR, "input#payment-postalCodeInput")
+            zip_input.click()
+            time.sleep(0.3)
+            zip_input.send_keys(str(zip_code))
+            print(f"  {invoice_id} 已输入 ZIP: {zip_code}")
+            time.sleep(0.5)
+
+        # 切换回主页面
+        driver.switch_to.default_content()
+        print(f"  {invoice_id} 已切换回主页面")
+        time.sleep(1)
+
+        # 注入网络拦截器捕获支付结果
+        inject_network_interceptor(driver, [
+            ['api.stripe.com', 'confirm'],
+            ['stripe.com', 'pay'],
+        ])
+
+        # 点击 Pay 按钮
+        pay_btn = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((
+            By.CSS_SELECTOR, "button[data-testid='hosted-payment-submit-button']"
+        )))
+        print(f"  {invoice_id} 正在点击 Pay...")
+        pay_btn.click()
+        print(f"  {invoice_id} 已点击 Pay，等待支付结果...")
+
+        # 收集支付响应
+        responses = collect_intercepted_responses(driver, timeout=60)
+        if responses:
+            print(f"  {invoice_id} 收到 {len(responses)} 条支付响应")
+            for resp in responses:
+                print(f"    [{resp.get('status')}] {resp.get('url', '')[:80]}")
+
+        return {"status": "paid", "responses": responses}
+
+    except Exception as e:
+        print(f"  {invoice_id} Stripe 支付填写失败: {e}")
+        # 确保切换回主页面
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        return {"status": "failed", "error": f"Stripe 支付填写失败: {e}"}
+
+
 def handle_unpaid_invoices(driver):
     """
-    检查 Credits 页面的 Unpaid invoice，下载 PDF 并打开 Pay online 链接
+    检查 Credits 页面的 Unpaid invoice，下载 PDF 并打开 Pay online 链接，
+    展开 Card 支付表单。信用卡数据填写由后续流程处理。
 
     参数:
         driver: 浏览器驱动
@@ -1371,21 +1515,31 @@ def handle_unpaid_invoices(driver):
         # 等待 top-up history 表格加载
         time.sleep(3)
 
-        # 查找所有包含 Unpaid 的行
+        # 查找所有包含 Unpaid 的行，先收集信息避免 stale element
         rows = driver.find_elements(By.XPATH, "//table//tr[.//span[text()='Unpaid']]")
         if not rows:
             print("未发现 Unpaid invoice")
             return results
 
-        print(f"发现 {len(rows)} 条 Unpaid invoice，开始处理...")
-
-        for i, row in enumerate(rows):
-            invoice_id = ''
+        # 提取所有 invoice ID（后续可能会导航离开当前页面导致元素失效）
+        invoice_ids = []
+        for row in rows:
             try:
-                # 提取 invoice 编号
-                invoice_link = row.find_element(By.XPATH, ".//a[@role='button']")
-                invoice_id = invoice_link.text.strip()
-                print(f"[{i+1}/{len(rows)}] 处理 invoice: {invoice_id}")
+                link = row.find_element(By.XPATH, ".//a[@role='button']")
+                invoice_ids.append(link.text.strip())
+            except Exception:
+                pass
+
+        print(f"发现 {len(invoice_ids)} 条 Unpaid invoice，开始处理...")
+
+        for i, invoice_id in enumerate(invoice_ids):
+            try:
+                print(f"[{i+1}/{len(invoice_ids)}] 处理 invoice: {invoice_id}")
+
+                # 重新查找当前 invoice 的下载链接（页面可能已刷新）
+                invoice_link = driver.find_element(
+                    By.XPATH, f"//table//tr[.//span[text()='Unpaid']]//a[@role='button'][contains(text(),'{invoice_id}')]"
+                )
 
                 # 清空下载目录中的旧 PDF
                 for f in os.listdir(download_dir):
@@ -1437,6 +1591,20 @@ def handle_unpaid_invoices(driver):
                     results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
                     continue
 
+                # 点击 Card 支付选项展开信用卡输入表单
+                try:
+                    card_btn = pay_wait.until(EC.element_to_be_clickable((
+                        By.CSS_SELECTOR, "div.p-AccordionButton[data-value='card']"
+                    )))
+                    card_btn.click()
+                    time.sleep(2)
+                    print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
+                except Exception as e:
+                    print(f"  {invoice_id} 点击 Card 选项失败: {e}")
+                    results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": f"点击 Card 选项失败: {e}"})
+                    continue
+
+                # Card 表单已展开，信用卡数据填写由后续流程处理
                 results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
 
             except Exception as e:

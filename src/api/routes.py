@@ -480,6 +480,7 @@ def recharge_account():
         try:
             success, err, responses, card_last4 = registration.recharge_account(
                 email, cf_password,
+                recharge_log_model=models['recharge_log'],
                 monitor_callback=state._monitor,
             )
 
