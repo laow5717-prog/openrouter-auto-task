@@ -407,3 +407,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: 修复弹窗提取、Stripe iframe 交互及 invoice 逐个处理
+
+**Date**: 2026-07-13
+**Task**: 修复弹窗提取、Stripe iframe 交互及 invoice 逐个处理
+**Branch**: `main`
+
+### Summary
+
+修复 extract_topup_card_last4 匹配到 Cookie 弹窗的问题（用 JS 从 input#price 向上找正确 dialog）；修复 invoice 链接 XPath 用 contains(.,id) 替代 contains(text(),id)；Card 按钮操作改为先切入 Stripe iframe；handle_unpaid_invoices 改为逐个处理模式，每个完成后刷新 credits 页面重新查找
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1a88a97` | (see git log) |
+| `4455018` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
