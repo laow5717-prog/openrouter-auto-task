@@ -19,6 +19,7 @@ from src.browser.driver import (
     login_cloudflare,
     navigate_to_ai_credits,
     fill_topup_and_confirm,
+    handle_unpaid_invoices,
 )
 import src.services.captcha as captcha_solver
 
@@ -314,21 +315,37 @@ def recharge_account(email, cf_password, monitor_callback=None):
             return False, "导航到充值页面或点击 Top-up 按钮失败", []
 
         print("正在填写充值金额并确认支付...")
-        pay_success, responses = fill_topup_and_confirm(driver, amount=10)
+        pay_success, responses, card_last4 = fill_topup_and_confirm(driver, amount=10)
         _report("topup_confirmed")
 
         if pay_success:
-            print(f"账号 {email} 充值 $10 已提交，等待 60 秒观测结果...")
+            print(f"账号 {email} 充值 $10 已提交")
             import time
-            time.sleep(60)
+            # 等待页面更新，然后回到 credits 页面检查 Unpaid invoices
+            time.sleep(5)
+            print("正在返回 Credits 页面检查 Unpaid invoices...")
+            from src.browser.driver import navigate_to_ai_credits as _nav
+            # 不点 Top-up，只导航到 credits 页面
+            credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+            driver.get(credits_url)
+            time.sleep(5)
+            from src.browser.driver import check_and_handle_cf_challenge, dismiss_overdue_dialog
+            check_and_handle_cf_challenge(driver)
+            dismiss_overdue_dialog(driver)
+            time.sleep(3)
+
+            invoice_results = handle_unpaid_invoices(driver)
+            if invoice_results:
+                print(f"Unpaid invoice 处理结果: {invoice_results}")
+                time.sleep(10)
         else:
             print(f"账号 {email} 充值确认失败")
 
-        return pay_success, "" if pay_success else "填写金额或确认支付失败", responses or []
+        return pay_success, "" if pay_success else "填写金额或确认支付失败", responses or [], card_last4
 
     except Exception as e:
         print(f"充值过程异常: {e}")
-        return False, str(e), []
+        return False, str(e), [], ''
 
     finally:
         if driver:

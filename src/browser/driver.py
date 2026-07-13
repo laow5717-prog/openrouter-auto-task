@@ -126,6 +126,18 @@ def create_driver(headless=False, profile_id=None):
         # 记录 profile 目录，临时 profile 关闭时清理，持久化 profile 保留
         driver._cf_temp_profile = None if is_persistent else user_data_dir
 
+        # 设置下载目录（用于 invoice PDF 下载等）
+        download_dir = os.path.join(user_data_dir, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
+        driver._cf_download_dir = download_dir
+        try:
+            driver.execute_cdp_cmd('Page.setDownloadBehavior', {
+                'behavior': 'allow',
+                'downloadPath': download_dir,
+            })
+        except Exception:
+            pass
+
         # 注入控制台拦截器（在所有页面 JS 执行之前生效）
         # 用于捕获 Cloudflare/Stripe 的错误日志
         try:
@@ -1263,9 +1275,10 @@ def fill_topup_and_confirm(driver, amount=10):
         driver: 浏览器驱动
         amount: 充值金额（美元），默认 10
     返回:
-        (bool, dict|None): (是否成功点击, Stripe 响应数据)
+        (bool, list, str): (是否成功点击, API 响应列表, 使用的卡片后四位)
     """
     wait = WebDriverWait(driver, 30)
+    card_last4 = ''
 
     try:
         # 等待弹窗中的金额输入框出现
@@ -1273,6 +1286,20 @@ def fill_topup_and_confirm(driver, amount=10):
         price_input = wait.until(EC.visibility_of_element_located((
             By.CSS_SELECTOR, "div[role='dialog'] input#price"
         )))
+
+        # 提取弹窗中显示的支付卡片后四位
+        try:
+            dialog = driver.find_element(By.CSS_SELECTOR, "div[role='dialog']")
+            card_text = dialog.text
+            match = re.search(r'(\d{4})\s*$', card_text.replace('\n', ' ').strip())
+            if not match:
+                # 尝试匹配 •••• •••• •••• 1234 格式
+                match = re.search(r'[•·*\s]+(\d{4})', card_text)
+            if match:
+                card_last4 = match.group(1)
+                print(f"检测到支付卡片后四位: {card_last4}")
+        except Exception:
+            pass
 
         # 清空并输入金额
         price_input.click()
@@ -1299,11 +1326,119 @@ def fill_topup_and_confirm(driver, amount=10):
 
         # 收集拦截到的响应
         responses = collect_intercepted_responses(driver, timeout=60)
-        return True, responses
+        return True, responses, card_last4
 
     except Exception as e:
         print(f"充值弹窗操作失败: {e}")
-        return False, None
+        return False, None, card_last4
+
+
+def _extract_pdf_pay_url(pdf_path):
+    """从 invoice PDF 中提取 Pay online 链接"""
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(pdf_path)
+        for page in reader.pages:
+            if '/Annots' in page:
+                annots = page['/Annots']
+                for annot in annots:
+                    obj = annot.get_object()
+                    if obj.get('/A') and obj['/A'].get('/URI'):
+                        uri = obj['/A']['/URI']
+                        if 'pay' in uri.lower() or 'invoice' in uri.lower() or 'stripe' in uri.lower():
+                            return uri
+    except Exception as e:
+        print(f"解析 PDF 失败: {e}")
+    return None
+
+
+def handle_unpaid_invoices(driver):
+    """
+    检查 Credits 页面的 Unpaid invoice，下载 PDF 并打开 Pay online 链接
+
+    参数:
+        driver: 浏览器驱动
+    返回:
+        list: 处理结果列表 [{invoice, status, pay_url, error}, ...]
+    """
+    results = []
+    download_dir = getattr(driver, '_cf_download_dir', None)
+    if not download_dir:
+        print("未配置下载目录，跳过 Unpaid invoice 处理")
+        return results
+
+    try:
+        # 等待 top-up history 表格加载
+        time.sleep(3)
+
+        # 查找所有包含 Unpaid 的行
+        rows = driver.find_elements(By.XPATH, "//table//tr[.//span[text()='Unpaid']]")
+        if not rows:
+            print("未发现 Unpaid invoice")
+            return results
+
+        print(f"发现 {len(rows)} 条 Unpaid invoice，开始处理...")
+
+        for i, row in enumerate(rows):
+            invoice_id = ''
+            try:
+                # 提取 invoice 编号
+                invoice_link = row.find_element(By.XPATH, ".//a[@role='button']")
+                invoice_id = invoice_link.text.strip()
+                print(f"[{i+1}/{len(rows)}] 处理 invoice: {invoice_id}")
+
+                # 清空下载目录中的旧 PDF
+                for f in os.listdir(download_dir):
+                    if f.endswith('.pdf'):
+                        os.remove(os.path.join(download_dir, f))
+
+                # 点击下载
+                invoice_link.click()
+                print(f"  已点击下载 {invoice_id}...")
+
+                # 等待 PDF 下载完成
+                pdf_path = None
+                for _ in range(30):
+                    time.sleep(1)
+                    pdfs = [f for f in os.listdir(download_dir) if f.endswith('.pdf') and not f.endswith('.crdownload')]
+                    if pdfs:
+                        pdf_path = os.path.join(download_dir, pdfs[0])
+                        break
+
+                if not pdf_path:
+                    print(f"  {invoice_id} PDF 下载超时")
+                    results.append({"invoice": invoice_id, "status": "failed", "error": "PDF 下载超时"})
+                    continue
+
+                print(f"  PDF 已下载: {os.path.basename(pdf_path)}")
+
+                # 从 PDF 提取支付链接
+                pay_url = _extract_pdf_pay_url(pdf_path)
+                if not pay_url:
+                    print(f"  {invoice_id} 未找到 Pay online 链接")
+                    results.append({"invoice": invoice_id, "status": "failed", "error": "未找到支付链接"})
+                    continue
+
+                print(f"  找到支付链接: {pay_url}")
+
+                # 在浏览器中打开支付链接
+                driver.get(pay_url)
+                time.sleep(5)
+                print(f"  已打开 {invoice_id} 的在线支付页面")
+                results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
+
+                # 等待支付页面加载完成后再处理下一条
+                time.sleep(3)
+
+            except Exception as e:
+                print(f"  处理 {invoice_id} 异常: {e}")
+                results.append({"invoice": invoice_id, "status": "failed", "error": str(e)})
+                continue
+
+    except Exception as e:
+        print(f"处理 Unpaid invoices 异常: {e}")
+
+    return results
 
 
 def fill_signup_form(driver, email: str, password: str):
