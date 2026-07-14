@@ -1837,7 +1837,15 @@ def _find_confirm_payment_button(driver):
     定位 Stripe 的"确认付款"二次确认按钮（提交卡后出现的 ContentCard 卡片）。
 
     该按钮与表单的 Pay 按钮共用 data-testid='hosted-payment-submit-button'，
-    区别在于它是 type='button'（表单里的是 type='submit'）。不点它页面会一直停住。
+    区别在于它是 type='button'（表单里的是 type='submit'），且 class 带
+    'SubmitButton--complete'（就绪待确认态；普通支付按钮是 '--incomplete'）。
+    不点它页面会一直停在"确认 US$xx 的付款 / 银行会要求验证身份"卡片上。
+
+    识别用两条互补路径，任一命中即认：
+      1) class 含 'submitbutton--complete' —— 权威的"就绪待确认"信号，
+         不依赖文案（按钮盖着 Shimmer 流光动画 + 含隐藏的"正在处理"span，
+         inner_text 在动画未稳时可能取空/抖动，单靠文案会漏点）。
+      2) inner_text 命中"确认付款/confirm"等关键词 —— 兜底覆盖 class 变体。
     返回可点击的 locator；不存在 / 正在处理中 / 已完成时返回 None。
     """
     try:
@@ -1852,9 +1860,11 @@ def _find_confirm_payment_button(driver):
                 cls = (btn.get_attribute('class', timeout=SHORT_TIMEOUT_MS) or '').lower()
                 if 'processing' in cls or 'disabled' in cls:
                     continue
+                if 'submitbutton--complete' in cls:
+                    return btn                     # 路径 1：就绪态 class 直接认
                 txt = (btn.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip().lower()
                 if any(k in txt for k in _CONFIRM_BTN_KEYWORDS):
-                    return btn
+                    return btn                     # 路径 2：文案兜底
             except Exception:
                 continue
     except Exception:
@@ -2036,9 +2046,11 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         deadline = time.time() + 90
         while time.time() < deadline:
             driver.page.wait_for_timeout(2000)     # 驱动 Playwright 事件循环 + 等待
-            # 0) "确认付款"二次确认卡片：银行要求验证身份前 Stripe 会先要一次确认，
-            #    不点则页面永远停在这里。点完重新给足观测窗口。
-            if confirm_clicks < 2 and _click_confirm_payment(driver, invoice_id):
+            # 0) "确认付款"二次确认卡片：提交卡后 Stripe 可能返回「确认 US$xx 的付款」
+            #    卡片（含"银行会要求您验证您的身份"），不点则页面永远停在这里。
+            #    点完可能直接成功、也可能转入 3DS（下一步捕获）。点完重新给足观测窗口。
+            #    幂等地点击已提交的确认按钮无副作用，故容错上限给到 3。
+            if confirm_clicks < 3 and _click_confirm_payment(driver, invoice_id):
                 confirm_clicks += 1
                 deadline = time.time() + 90
                 continue
