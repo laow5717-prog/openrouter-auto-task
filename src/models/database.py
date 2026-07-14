@@ -108,10 +108,15 @@ CREATE TABLE IF NOT EXISTS valid_cards (
 );
 """
 
+_SCHEMA_V4 = """
+ALTER TABLE card_pool ADD COLUMN status TEXT DEFAULT '';
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
     3: _SCHEMA_V3,
+    4: _SCHEMA_V4,
 }
 
 

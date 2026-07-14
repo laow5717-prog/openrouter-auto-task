@@ -285,17 +285,20 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
 
 
 def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
-                     skip_invoice=False, payment_cards=None):
+                     skip_invoice=False, payment_cards=None,
+                     valid_card_model=None, card_pool_model=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
     参数:
         email: 账号邮箱
         cf_password: CF 密码
-        recharge_log_model: RechargeLogModel 实例，用于查询今日充值记录
+        recharge_log_model: RechargeLogModel 实例，用于今日记录查询 + 已成功支付卡统计 + 记账
         monitor_callback: 监控回调 (driver, step_name)
         skip_invoice: 是否跳过 Unpaid invoice 在线支付（未选择支付卡分组时为 True）
         payment_cards: 支付卡数据列表（用于在线支付填写信用卡信息）
+        valid_card_model: ValidCardModel，支付成功后记录有效卡（source_type=payment）
+        card_pool_model: CardPoolModel，支付成功后把底料卡状态标为 'paid'
     返回:
         (bool, str, list, str): (是否成功, 错误信息, API 响应列表, 卡片后四位)
     """
@@ -314,6 +317,29 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         if not account_id:
             return False, "登录失败，无法获取 account_id", [], ''
         _report("logged_in")
+
+        # === 账单支付：一个账号最多 20 张成功支付的卡；排除已成功支付过的卡；每笔记账 ===
+        CARD_CAP = 20
+        used_numbers = recharge_log_model.get_success_card_numbers(email) if recharge_log_model else set()
+        invoice_remaining = CARD_CAP - len(used_numbers)
+        invoice_cards = [c for c in (payment_cards or []) if c.get('number') not in used_numbers]
+        if invoice_remaining <= 0:
+            print(f"账号 {email} 已有 {len(used_numbers)} 张成功支付的卡，达到上限 {CARD_CAP}，不再执行账单支付")
+
+        def _on_invoice_paid(invoice_id, card, responses, amt):
+            """每笔发票支付成功后记账：recharge_log + valid_cards + card_pool 状态"""
+            num = card.get('number', '')
+            if recharge_log_model:
+                lid = recharge_log_model.create(email, card_display=num, amount=amt or 0)
+                recharge_log_model.mark_success(lid, api_response={'invoice': invoice_id, 'responses': responses})
+            if valid_card_model:
+                valid_card_model.record(card, source_type='payment', source_email=email)
+            if card_pool_model:
+                try:
+                    card_pool_model.mark_status_by_number(num, 'paid')
+                except Exception:
+                    pass
+            print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}")
 
         print("正在跳转到 AI Credits 页面并点击充值...")
         success = navigate_to_ai_credits(driver, account_id)
@@ -346,7 +372,9 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 time.sleep(2)
 
                 # 直接在当前 credits 页面处理 Unpaid invoices
-                invoice_results = handle_unpaid_invoices(driver, payment_cards=payment_cards)
+                invoice_results = handle_unpaid_invoices(
+                    driver, payment_cards=invoice_cards,
+                    max_invoices=invoice_remaining, on_paid=_on_invoice_paid)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
@@ -374,7 +402,9 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 dismiss_overdue_dialog(driver)
                 time.sleep(3)
 
-                invoice_results = handle_unpaid_invoices(driver, payment_cards=payment_cards)
+                invoice_results = handle_unpaid_invoices(
+                    driver, payment_cards=invoice_cards,
+                    max_invoices=invoice_remaining, on_paid=_on_invoice_paid)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)

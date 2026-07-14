@@ -80,6 +80,7 @@ class CardPoolModel:
         cards = []
         for r in rows:
             cards.append({
+                'id': r['id'],
                 'number': r['card_number'],
                 'expiry_month': r['expiry_month'],
                 'expiry_year': r['expiry_year'],
@@ -93,8 +94,16 @@ class CardPoolModel:
                 'state': r.get('state', ''),
                 'zip': r.get('zip', ''),
                 'company': r.get('company', ''),
+                'status': (r['status'] if 'status' in r.keys() else '') or '',
             })
         return cards
+
+    def mark_status_by_number(self, card_number, status):
+        """按卡号标记底料卡状态（如支付成功后标为 'paid'）"""
+        self.db.execute(
+            "UPDATE card_pool SET status=? WHERE card_number=?",
+            (status, card_number),
+        )
 
     def delete_card(self, card_id):
         self.db.execute("DELETE FROM card_pool WHERE id=?", (card_id,))

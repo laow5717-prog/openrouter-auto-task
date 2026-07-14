@@ -494,6 +494,8 @@ def recharge_account():
                 monitor_callback=state._monitor,
                 skip_invoice=skip_invoice,
                 payment_cards=payment_cards,
+                valid_card_model=models['valid_card'],
+                card_pool_model=models['card_pool'],
             )
 
             # 用页面提取的后四位匹配完整卡号

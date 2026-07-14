@@ -523,10 +523,22 @@ def dismiss_overdue_dialog(driver):
         dialog = page.locator("div[role='alertdialog']")
         if dialog.count() == 0:
             return False
-        # 定位含 "I understand" 文本 span 的按钮（等价原 XPath 精确文本匹配）
-        btn = dialog.first.locator("button:has(span:text-is('I understand'))")
+        d0 = dialog.first
+        # "I understand" 按钮：文本匹配 → data-kumo-part=close 的 button → role 兜底
+        btn = d0.locator("button:has(span:text-is('I understand'))")
+        if btn.count() == 0:
+            btn = d0.locator("button[data-kumo-part='close']")
+        if btn.count() == 0:
+            btn = d0.get_by_role("button", name="I understand")
         if btn.count() > 0:
-            _safe_click(btn.first, session=driver, desc="欠费弹窗 I understand")
+            # 弹窗按钮偶有 actionability 问题，_safe_click 失败则 JS click 兜底
+            try:
+                _safe_click(btn.first, session=driver, desc="欠费弹窗 I understand", retries=1)
+            except Exception:
+                try:
+                    btn.first.evaluate("el => el.click()")
+                except Exception:
+                    pass
             print("  已关闭欠费提示弹窗 (I understand)")
             time.sleep(1)
             return True
@@ -1738,21 +1750,24 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         return {"status": "failed", "error": f"Stripe 支付填写失败: {e}"}
 
 
-def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None):
+def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None, on_paid=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
-    打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找。
+    打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
+    不关闭浏览器、持续支付下一个账单，直到无账单 / 卡用尽 / 达到上限。
 
     参数:
         driver: 浏览器驱动
         payment_cards: 支付卡列表（dict: number/expiry_month/expiry_year/cvc/country/zip...）。
-                       提供时对每个 invoice 用一张卡填写并提交支付（卡按顺序轮换）；
+                       每张发票用一张**新卡**（按顺序，不复用、不循环，卡用尽即停）；
                        为空时仅打开支付页并展开 Card 表单（不支付）。
-        max_invoices: 单次最多处理的 invoice 数（安全阀，防止一次性产生过多扣款）；
-                      None 表示不限制。
+                       调用方应在传入前剔除该账号已成功支付过的卡。
+        max_invoices: 本次最多**成功支付**的张数（= 剩余可用额度，安全阀）；None 不限制。
+        on_paid: 每笔支付成功后的回调 on_paid(invoice_id, card, responses, amount)，
+                 由调用方负责记账（recharge_log / valid_cards / card_pool 状态）。
     返回:
-        list: 处理结果列表 [{invoice, status, pay_url, card?, error?}, ...]
-              status: paid（已提交支付）/ opened（仅打开未支付）/ failed
+        list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, error?}, ...]
+              status: paid（已提交支付）/ opened（仅打开未支付）/ failed / skipped
     """
     results = []
     download_dir = getattr(driver, '_download_dir', None)
@@ -1779,16 +1794,19 @@ def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None):
 
     processed_ids = set()
     round_num = 0
+    paid_count = 0      # 成功支付计数（每张成功 = 一张新卡；用于上限判断）
+    card_idx = 0        # 下一张要用的卡索引（每次尝试前进，不复用、不循环）
 
     while True:
         round_num += 1
-        # 安全阀：达到本次处理上限则停止
-        if max_invoices is not None and len(processed_ids) >= max_invoices:
-            print(f"已达单次处理上限 {max_invoices} 个 invoice，停止")
+        # 安全阀：成功支付数达到上限则停止
+        if max_invoices is not None and paid_count >= max_invoices:
+            print(f"已达成功支付上限 {max_invoices} 张卡，停止")
             break
 
-        # 等待表格加载
+        # 等待表格加载 + 清理可能弹出的欠费提示弹窗（会遮挡发票表格导致点击失败）
         time.sleep(3)
+        dismiss_overdue_dialog(driver)
 
         # 查找 Unpaid 行
         rows = driver.page.locator(
@@ -1802,6 +1820,7 @@ def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None):
         # 找到第一个未处理过的 invoice
         invoice_id = None
         invoice_link = None
+        invoice_row = None
         for row in rows:
             try:
                 link = row.locator("xpath=.//a[@role='button']").first
@@ -1809,6 +1828,7 @@ def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None):
                 if iid and iid not in processed_ids:
                     invoice_id = iid
                     invoice_link = link
+                    invoice_row = row
                     break
             except Exception:
                 continue
@@ -1820,6 +1840,15 @@ def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None):
         processed_ids.add(invoice_id)
         total_unpaid = len(rows)
         print(f"[{len(processed_ids)}/{total_unpaid}] 处理 invoice: {invoice_id}")
+
+        # 提取账单金额（用于记账，取行内第一个美元金额）
+        amount = 0.0
+        try:
+            _m = re.search(r'\$([0-9]+(?:\.[0-9]+)?)', invoice_row.inner_text(timeout=SHORT_TIMEOUT_MS))
+            if _m:
+                amount = float(_m.group(1))
+        except Exception:
+            pass
 
         try:
             # 点击下载并通过 Playwright 下载事件保存 PDF 到下载目录
@@ -1894,14 +1923,27 @@ def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None):
 
             # 有支付卡则填卡并提交支付；否则仅打开表单（保留原行为）
             if payment_cards:
-                card = payment_cards[(len(processed_ids) - 1) % len(payment_cards)]
+                # 每张发票用一张新卡（不复用、不循环）；卡用尽则停止
+                if card_idx >= len(payment_cards):
+                    print("  可用支付卡已用尽，停止")
+                    results.append({"invoice": invoice_id, "status": "skipped", "error": "无可用支付卡"})
+                    break
+                card = payment_cards[card_idx]
+                card_idx += 1
                 card_last4 = str(card.get('number', ''))[-4:]
                 print(f"  {invoice_id} 使用卡 ****{card_last4} 填写并支付...")
                 pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id)
                 if pay_result.get('status') == 'paid':
+                    paid_count += 1
                     results.append({"invoice": invoice_id, "status": "paid", "pay_url": pay_url,
-                                    "card": card_last4, "responses": pay_result.get('responses')})
-                    print(f"  {invoice_id} 支付已提交（卡 ****{card_last4}）")
+                                    "card": card_last4, "amount": amount,
+                                    "responses": pay_result.get('responses')})
+                    print(f"  {invoice_id} 支付已提交（卡 ****{card_last4}，金额 ${amount}）")
+                    if on_paid:
+                        try:
+                            on_paid(invoice_id, card, pay_result.get('responses'), amount)
+                        except Exception as _e:
+                            print(f"  on_paid 回调异常: {_e}")
                 else:
                     results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url,
                                     "card": card_last4, "error": pay_result.get('error', '支付失败')})
