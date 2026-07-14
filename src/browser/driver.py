@@ -1636,6 +1636,93 @@ def _normalize_country_code(val):
     return _COUNTRY_NAME_TO_CODE.get(v.lower(), v.upper())
 
 
+_DECLINE_REASONS = {
+    'insufficient_funds': '余额不足',
+    'incorrect_number': '卡号错误',
+    'invalid_number': '卡号无效',
+    'incorrect_cvc': 'CVC 安全码错误',
+    'invalid_cvc': 'CVC 安全码无效',
+    'incorrect_zip': '邮编/账单地址不匹配',
+    'invalid_expiry_month': '有效期月份无效',
+    'invalid_expiry_year': '有效期年份无效',
+    'expired_card': '卡已过期',
+    'card_declined': '银行拒付',
+    'do_not_honor': '银行拒绝（do not honor）',
+    'generic_decline': '通用拒付',
+    'lost_card': '卡已挂失',
+    'stolen_card': '卡被盗',
+    'pickup_card': '卡被没收',
+    'card_not_supported': '卡不支持此交易',
+    'currency_not_supported': '货币不支持',
+    'fraudulent': '疑似欺诈被拒',
+    'processing_error': '处理错误',
+    'authentication_required': '需要 3DS 银行验证',
+    'try_again_later': '请稍后重试',
+}
+
+
+def _extract_payment_error(driver):
+    """从捕获的支付响应或页面错误文案提取失败原因（返回中文说明，无则 None）。"""
+    import json as _json
+    for r in list(getattr(driver, 'net_responses', []) or []):
+        data = r.get('data')
+        txt = _json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data or '')
+        m = re.search(r'"decline_code"\s*:\s*"([^"]+)"', txt)
+        if m:
+            return _DECLINE_REASONS.get(m.group(1), f'拒付（{m.group(1)}）')
+        m = re.search(r'"code"\s*:\s*"([a-z_]+)"', txt)
+        if m and m.group(1) in _DECLINE_REASONS:
+            return _DECLINE_REASONS[m.group(1)]
+        m = re.search(r'"message"\s*:\s*"([^"]+)"', txt)
+        if m and any(k in m.group(1).lower() for k in
+                     ['declin', 'insufficient', 'incorrect', 'invalid', 'expired', 'not support', 'fund']):
+            return m.group(1)[:120]
+    try:
+        for sel in ['[role="alert"]', '.p-Notice-content', '.p-Notice', '.Error']:
+            loc = driver.page.locator(sel)
+            cnt = loc.count()
+            for i in range(min(cnt, 3)):
+                t = (loc.nth(i).inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+                if t and any(k in t.lower() for k in
+                             ['declin', 'insufficient', 'incorrect', 'invalid', 'expired', 'not support', 'fund', 'wrong']):
+                    return t[:120]
+    except Exception:
+        pass
+    return None
+
+
+def _has_3ds_challenge(driver):
+    """检测是否出现 Stripe 3DS 银行验证挑战弹窗（无法自动完成）。"""
+    try:
+        if driver.page.locator('iframe[src*="three-ds"]').count() > 0:
+            return True
+        overlay = driver.page.locator('div[data-react-aria-top-layer]')
+        if overlay.count() > 0 and overlay.locator('iframe[src*="stripe"]').count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _cancel_3ds_challenge(driver):
+    """尝试取消 3DS 挑战（点 Cancel/取消/关闭）；失败则由上层导航离开放弃。"""
+    try:
+        fl = driver.page.frame_locator('iframe[src*="three-ds"]')
+        for name in ['Cancel', '取消', 'Close', 'close', '关闭', 'No']:
+            try:
+                btn = fl.get_by_role('button', name=name)
+                if btn.count() > 0:
+                    btn.first.click(timeout=SHORT_TIMEOUT_MS)
+                    print("    已点击 3DS 取消")
+                    return True
+            except Exception:
+                continue
+        driver.page.keyboard.press('Escape')
+    except Exception:
+        pass
+    return False
+
+
 def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
     """
     在 Stripe 支付页面的 iframe 内填写信用卡信息并点击 Pay
@@ -1748,54 +1835,54 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
             pass
         print(f"  {invoice_id} 已点击 Pay，等待支付结果...")
 
-        # 严格判定真实支付结果（不再"点击没报错就算成功"）：
-        #  成功：捕获到 confirm 响应含 succeeded/paid，或页面出现成功文案；
-        #  失败：响应指示失败，或页面出现 declined/failed 文案；
-        #  两者都没有 → uncertain（不计为成功、不记账）。
-        outcome = None
-        deadline = time.time() + 90
-        while time.time() < deadline and outcome is None:
+        # 等待支付处理：期间检测 3DS 银行验证弹窗（无法自动完成→取消并判失败），
+        # 并提取失败原因（decline_code / 页面错误文案）。是否真正成功由上层按
+        # "账单是否仍在 Unpaid 列表" 权威判定；本函数负责取消 3DS + 给出失败原因。
+        is_3ds = False
+        reason = None
+        deadline = time.time() + 60
+        while time.time() < deadline:
             driver.page.wait_for_timeout(2000)     # 驱动 Playwright 事件循环 + 等待
-            # 把所有响应拼成一个 blob：先全局找成功信号（避免某条响应里的 'declined'
-            # 字样抢在真正的 'succeeded' 响应之前误判失败），没有成功再判失败。
+            # 1) 3DS 挑战弹窗
+            if _has_3ds_challenge(driver):
+                is_3ds = True
+                break
+            # 2) 成功信号（快速返回）
             blob = " ".join(
                 (_json.dumps(r.get('data'), ensure_ascii=False)
                  if isinstance(r.get('data'), (dict, list)) else str(r.get('data') or ''))
                 for r in list(driver.net_responses)
             )
-            bl = blob.lower()
             if '"status": "succeeded"' in blob or '"status":"succeeded"' in blob \
                     or '"paid": true' in blob or '"paid":true' in blob:
-                outcome = 'paid'; break
-            # 失败：明确的拒付/失败指示（收紧，去掉过宽的裸 'declined'）
-            if 'card_declined' in bl or 'decline_code' in bl or 'payment_failed' in bl \
-                    or 'your card was declined' in bl or 'insufficient' in bl \
-                    or '"status": "failed"' in blob or '"status":"failed"' in blob:
-                outcome = 'failed'; break
-            # 页面文案兜底
+                print(f"  {invoice_id} 检测到支付成功信号")
+                return {"status": "paid", "responses": list(driver.net_responses)}
+            # 3) 失败原因（响应 decline_code / 页面错误）
+            reason = _extract_payment_error(driver)
+            if reason:
+                break
+            # 4) 页面成功文案
             try:
                 body = driver.page.inner_text('body', timeout=SHORT_TIMEOUT_MS).lower()
             except Exception:
                 body = ''
             if any(k in body for k in ['payment received', 'payment complete', 'thanks for your payment',
                                        'you paid', 'receipt from', 'paid on']):
-                outcome = 'paid'; break
-            if any(k in body for k in ['card was declined', 'your card was declined', 'payment failed',
-                                       'try a different card', 'insufficient funds']):
-                outcome = 'failed'; break
+                return {"status": "paid", "responses": list(driver.net_responses)}
 
         collected = list(driver.net_responses)
         if collected:
             print(f"  {invoice_id} 收到 {len(collected)} 条支付响应")
-        if outcome == 'paid':
-            print(f"  {invoice_id} 支付成功（检测到成功信号）")
-            return {"status": "paid", "responses": collected}
-        elif outcome == 'failed':
-            print(f"  {invoice_id} 支付失败（检测到失败/拒付信号）")
-            return {"status": "failed", "error": "支付被拒绝或失败", "responses": collected}
-        else:
-            print(f"  {invoice_id} 支付结果未确认（未捕获成功/失败信号），不计为成功")
-            return {"status": "uncertain", "error": "支付结果未确认", "responses": collected}
+        if is_3ds:
+            print(f"  {invoice_id} 出现 3DS 银行验证，取消并判为失败")
+            _cancel_3ds_challenge(driver)
+            return {"status": "failed", "error": "需要 3DS 银行验证（已取消）", "responses": collected}
+        if reason:
+            print(f"  {invoice_id} 支付失败，原因: {reason}")
+            return {"status": "failed", "error": reason, "responses": collected}
+        # 未见明确成功/失败信号 → 交由上层按账单状态权威判定
+        print(f"  {invoice_id} 未捕获明确成功/失败信号，交由账单状态判定")
+        return {"status": "uncertain", "error": "支付结果未确认", "responses": collected}
 
     except Exception as e:
         print(f"  {invoice_id} Stripe 支付填写失败: {e}")
@@ -1803,24 +1890,39 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
 
 
 def _invoice_still_unpaid(driver, invoice_id):
-    """在 credits 页面判断某 invoice 是否仍在 Unpaid 列表中。
-    支付后若该账单已从 Unpaid 消失，说明 Cloudflare 已确认支付成功（权威判据）。"""
+    """在 credits 页面判断某 invoice 是否仍未支付（权威判据）。
+    发票表格同时显示 Paid/Unpaid 行；支付成功后该行状态会变为 Paid。
+    返回 True=仍未支付；False=已支付（该行显示 Paid）。
+
+    重要：必须先等表格加载再判断——否则表格未加载时找不到行会被误判为"已消失=已支付"
+    （假阳性会导致把未成功的支付误记为成功）。找不到行 / 表格未加载时一律保守返回 True。
+    """
+    # 等发票表格加载：出现至少一行带 invoice 链接的行
     try:
-        rows = driver.page.locator("xpath=//table//tr[.//span[text()='Unpaid']]").all()
+        driver.page.locator(
+            "xpath=//table//tr[.//a[@role='button']]"
+        ).first.wait_for(state="visible", timeout=20_000)
+    except Exception:
+        return True   # 表格没加载出来，无法确认已支付 → 保守视为仍未支付
+    time.sleep(1)
+    try:
+        rows = driver.page.locator("xpath=//table//tr[.//a[@role='button']]").all()
         for row in rows:
             try:
-                link = row.locator("xpath=.//a[@role='button']").first
-                iid = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+                iid = (row.locator("xpath=.//a[@role='button']").first
+                       .inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
                 if iid == invoice_id:
-                    return True
+                    txt = (row.inner_text(timeout=SHORT_TIMEOUT_MS) or '')
+                    # 该行明确显示 Paid 且不含 Unpaid → 已支付；否则仍未支付
+                    return not ('Paid' in txt and 'Unpaid' not in txt)
             except Exception:
                 continue
     except Exception:
         pass
-    return False
+    return True   # 表格已加载但找不到该 invoice 行 → 保守视为未支付（避免误记成功）
 
 
-def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
+def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
     打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
@@ -1834,6 +1936,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
                   由调用方在 get_card 内实现。为 None 时仅打开支付页展开 Card 表单（不支付）。
         on_paid: 每笔支付成功后的回调 on_paid(invoice_id, card, responses, amount)，
                  由调用方负责记账（recharge_log / valid_cards / card_pool 状态）。
+        on_failed: 每笔支付失败后的回调 on_failed(invoice_id, card, reason)，
+                   由调用方标记该卡失败并记录原因（余额不足 / 卡号错 / 3DS 等）。
     返回:
         list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, error?}, ...]
               status: paid / opened / failed / skipped
@@ -1995,7 +2099,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
                 pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id)
                 pending = {"invoice": invoice_id, "card": card, "last4": card_last4,
                            "amount": amount, "pay_url": pay_url,
-                           "responses": pay_result.get('responses')}
+                           "responses": pay_result.get('responses'),
+                           "error": pay_result.get('error')}
             else:
                 results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
 
@@ -2013,9 +2118,15 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
             time.sleep(4)
             dismiss_overdue_dialog(driver)
             if _invoice_still_unpaid(driver, pending["invoice"]):
-                print(f"  {pending['invoice']} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}）")
+                fail_reason = pending.get("error") or "支付后账单仍为 Unpaid"
+                print(f"  {pending['invoice']} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}），原因: {fail_reason}")
                 results.append({"invoice": pending["invoice"], "status": "failed", "pay_url": pending["pay_url"],
-                                "card": pending["last4"], "error": "支付后账单仍为 Unpaid"})
+                                "card": pending["last4"], "error": fail_reason})
+                if on_failed:
+                    try:
+                        on_failed(pending["invoice"], pending["card"], fail_reason)
+                    except Exception as _e:
+                        print(f"  on_failed 回调异常: {_e}")
             else:
                 print(f"  {pending['invoice']} 支付成功（账单已从 Unpaid 消失，卡 ****{pending['last4']}，${pending['amount']}）")
                 results.append({"invoice": pending["invoice"], "status": "paid", "pay_url": pending["pay_url"],

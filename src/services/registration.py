@@ -364,6 +364,22 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}"
                   f"（该账号累计 {len(_paid_numbers)} 张成功卡）")
 
+        def _on_invoice_failed(invoice_id, card, reason):
+            """每笔发票支付失败后：标记该底料卡为失败 + 记录失败原因（便于排查）"""
+            num = card.get('number', '')
+            if card_pool_model:
+                try:
+                    card_pool_model.mark_status_by_number(num, 'failed')
+                except Exception:
+                    pass
+            if recharge_log_model:
+                try:
+                    lid = recharge_log_model.create(email, card_display=num, amount=0)
+                    recharge_log_model.mark_failed(lid, error=f"invoice {invoice_id}: {reason}"[:200])
+                except Exception:
+                    pass
+            print(f"  已记失败: invoice {invoice_id} 卡 ****{str(num)[-4:]} 原因: {reason}")
+
         print("正在跳转到 AI Credits 页面并点击充值...")
         success = navigate_to_ai_credits(driver, account_id)
         _report("navigated_to_credits")
@@ -396,7 +412,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
 
                 # 直接在当前 credits 页面处理 Unpaid invoices
                 invoice_results = handle_unpaid_invoices(
-                    driver, get_card=_get_card, on_paid=_on_invoice_paid)
+                    driver, get_card=_get_card, on_paid=_on_invoice_paid,
+                    on_failed=_on_invoice_failed)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
@@ -425,7 +442,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 time.sleep(3)
 
                 invoice_results = handle_unpaid_invoices(
-                    driver, get_card=_get_card, on_paid=_on_invoice_paid)
+                    driver, get_card=_get_card, on_paid=_on_invoice_paid,
+                    on_failed=_on_invoice_failed)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
