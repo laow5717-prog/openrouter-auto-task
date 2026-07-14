@@ -475,3 +475,38 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: Stripe 发票支付确认卡片处理 + Credits 余额记录与展示
+
+**Date**: 2026-07-15
+**Task**: Stripe 发票支付确认卡片处理 + Credits 余额记录与展示
+**Branch**: `main`
+
+### Summary
+
+1) Stripe 托管发票页在提交卡后会出现「确认付款」二次确认卡片（type=button 的 hosted-payment-submit-button，表单被 display:none 隐藏），不点则页面卡死：在支付等待循环中检测并点击（最多 2 次，点后重置 90s 观测窗口）；Pay 按钮改用 [type=submit] 精确定位避免误选；页面若直接停在已保存卡确认态，先点「选择一个新的支付方式」展开卡表单。2) 支付后返回 credits 页面改为整页导航重新加载（原 go_back 走 SPA 回退会拿到陈旧账单表格/余额），handle_unpaid_invoices 新增 account_id 参数。3) 新增 read_credits_balance() 从 Credits 卡片读余额，每笔发票支付成功后 + 充值收尾各记录一次，落库到 accounts.credits_balance/balance_updated_at（DB migration v5）与 recharge_logs.api_response；/api/accounts 返回余额字段，账号表新增「Credits 余额」列，Excel 导出追加两列。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `150b79f` | (see git log) |
+| `d3a2bca` | (see git log) |
+| `4278d9d` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

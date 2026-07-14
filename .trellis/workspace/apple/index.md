@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 14
-- **Last Active**: 2026-07-14
+- **Total Sessions**: 15
+- **Last Active**: 2026-07-15
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~477 | Active |
+| `journal-1.md` | ~512 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 15 | 2026-07-15 | Stripe 发票支付确认卡片处理 + Credits 余额记录与展示 | `150b79f`, `d3a2bca`, `4278d9d` | `main` |
 | 14 | 2026-07-14 | 浏览器引擎迁移到 Patchright + 封禁检测入库 | `02a4a2f`, `ffc13ca` | `main` |
 | 13 | 2026-07-13 | 修复弹窗提取、Stripe iframe 交互及 invoice 逐个处理 | `1a88a97`, `4455018` | `main` |
 | 12 | 2026-07-13 | 充值流程完善：今日支付检查、Stripe 表单展开、多账号浏览器查看 | `58ff091`, `3d9316f` | `main` |
