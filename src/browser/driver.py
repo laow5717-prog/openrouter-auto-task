@@ -303,6 +303,9 @@ def _wait_gone(locator, timeout=ELEMENT_TIMEOUT_MS):
 
 BROWSER_LANG = "en-US"
 BROWSER_ACCEPT_LANG = "en-US,en"
+# 带 q 值的 Accept-Language 请求头（真人浏览器的标准写法）。
+# Stripe 托管支付页、Cloudflare 页面均按此头选择显示语言。
+BROWSER_ACCEPT_LANG_HEADER = "en-US,en;q=0.9"
 
 
 def _write_profile_language(user_data_dir):
@@ -450,6 +453,17 @@ def create_driver(headless=False, profile_id=None):
         # 保守的全局默认超时（稳定性优先，容忍慢网络）
         context.set_default_timeout(DEFAULT_TIMEOUT_MS)
         context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+
+        # 强制英文页面：给所有请求加 Accept-Language: en-US 头。
+        # 这是决定 Stripe 支付页 / Cloudflare 页面显示语言的权威依据——
+        # 尤其对已存在的中文持久 profile，仅靠启动前写 Preferences 会被 Chrome
+        # 退出时回写覆盖，而请求头不受 profile 影响，能稳定生效。
+        # set_extra_http_headers 走 CDP Network 域（项目已用于响应监听），
+        # 不触发 Emulation.setLocaleOverride，不引入 Turnstile 检测风险。
+        try:
+            context.set_extra_http_headers({"Accept-Language": BROWSER_ACCEPT_LANG_HEADER})
+        except Exception as e:
+            print(f"  ⚠️ 设置 Accept-Language 头失败(忽略): {str(e)[:80]}")
 
         temp_profile = None if is_persistent else user_data_dir
         session = BrowserSession(playwright, context, page,
