@@ -318,17 +318,39 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             return False, "登录失败，无法获取 account_id", [], ''
         _report("logged_in")
 
-        # === 账单支付：一个账号最多 20 张成功支付的卡；排除已成功支付过的卡；每笔记账 ===
+        # === 账单支付选卡策略 ===
+        # 一个 CF 账号最多 20 张 distinct 成功支付的卡（含 Top-up）。
+        # 选卡：未满 20 且有新卡 → 优先用新卡凑数；已满 20 或无新卡可提供 → 复用该账号
+        # 已支付过、且在当前分组内的卡（轮换、避免连续同一张）。每笔支付成功后记账。
         CARD_CAP = 20
-        used_numbers = recharge_log_model.get_success_card_numbers(email) if recharge_log_model else set()
-        invoice_remaining = CARD_CAP - len(used_numbers)
-        invoice_cards = [c for c in (payment_cards or []) if c.get('number') not in used_numbers]
-        if invoice_remaining <= 0:
-            print(f"账号 {email} 已有 {len(used_numbers)} 张成功支付的卡，达到上限 {CARD_CAP}，不再执行账单支付")
+        _all_cards = payment_cards or []
+        _paid_numbers = set(recharge_log_model.get_success_card_numbers(email)) if recharge_log_model else set()
+        _new_cards = [c for c in _all_cards if c.get('number') not in _paid_numbers]
+        _sel = {'new_idx': 0, 'reuse_idx': 0, 'last': None}
+
+        def _get_card():
+            # 1) 未满 20 且有新卡 → 用新卡（成功后成为一张新的 distinct 卡）
+            if len(_paid_numbers) < CARD_CAP and _sel['new_idx'] < len(_new_cards):
+                c = _new_cards[_sel['new_idx']]
+                _sel['new_idx'] += 1
+                return c
+            # 2) 已满 20 或无新卡 → 复用该账号已支付过、且在当前分组内的卡（轮换、避开连续同卡）
+            reuse_pool = [c for c in _all_cards if c.get('number') in _paid_numbers]
+            if not reuse_pool:
+                return None
+            n = len(reuse_pool)
+            for _ in range(n):
+                c = reuse_pool[_sel['reuse_idx'] % n]
+                _sel['reuse_idx'] += 1
+                if n == 1 or c.get('number') != _sel['last']:
+                    return c
+            return reuse_pool[0]
 
         def _on_invoice_paid(invoice_id, card, responses, amt):
-            """每笔发票支付成功后记账：recharge_log + valid_cards + card_pool 状态"""
+            """每笔发票支付成功后：更新选卡状态 + 记账（recharge_log + valid_cards + card_pool）"""
             num = card.get('number', '')
+            _sel['last'] = num
+            _paid_numbers.add(num)
             if recharge_log_model:
                 lid = recharge_log_model.create(email, card_display=num, amount=amt or 0)
                 recharge_log_model.mark_success(lid, api_response={'invoice': invoice_id, 'responses': responses})
@@ -339,7 +361,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     card_pool_model.mark_status_by_number(num, 'paid')
                 except Exception:
                     pass
-            print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}")
+            print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}"
+                  f"（该账号累计 {len(_paid_numbers)} 张成功卡）")
 
         print("正在跳转到 AI Credits 页面并点击充值...")
         success = navigate_to_ai_credits(driver, account_id)
@@ -373,8 +396,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
 
                 # 直接在当前 credits 页面处理 Unpaid invoices
                 invoice_results = handle_unpaid_invoices(
-                    driver, payment_cards=invoice_cards,
-                    max_invoices=invoice_remaining, on_paid=_on_invoice_paid)
+                    driver, get_card=_get_card, on_paid=_on_invoice_paid)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
@@ -403,8 +425,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 time.sleep(3)
 
                 invoice_results = handle_unpaid_invoices(
-                    driver, payment_cards=invoice_cards,
-                    max_invoices=invoice_remaining, on_paid=_on_invoice_paid)
+                    driver, get_card=_get_card, on_paid=_on_invoice_paid)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)

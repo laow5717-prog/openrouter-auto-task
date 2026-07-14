@@ -1750,32 +1750,29 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         return {"status": "failed", "error": f"Stripe 支付填写失败: {e}"}
 
 
-def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None, on_paid=None):
+def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
     打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
-    不关闭浏览器、持续支付下一个账单，直到无账单 / 卡用尽 / 达到上限。
+    不关闭浏览器、持续支付下一个账单，直到无账单 / get_card 返回 None。
 
     参数:
         driver: 浏览器驱动
-        payment_cards: 支付卡列表（dict: number/expiry_month/expiry_year/cvc/country/zip...）。
-                       每张发票用一张**新卡**（按顺序，不复用、不循环，卡用尽即停）；
-                       为空时仅打开支付页并展开 Card 表单（不支付）。
-                       调用方应在传入前剔除该账号已成功支付过的卡。
-        max_invoices: 本次最多**成功支付**的张数（= 剩余可用额度，安全阀）；None 不限制。
+        get_card: 卡提供器 callable，每个待支付 invoice 调用一次，返回一张卡 dict
+                  （number/expiry_month/expiry_year/cvc/country/zip...）或 None（无卡→停止）。
+                  选卡策略（新卡优先凑满 20 张 / 满 20 或无新卡时复用已付卡 / 避免连续同卡）
+                  由调用方在 get_card 内实现。为 None 时仅打开支付页展开 Card 表单（不支付）。
         on_paid: 每笔支付成功后的回调 on_paid(invoice_id, card, responses, amount)，
                  由调用方负责记账（recharge_log / valid_cards / card_pool 状态）。
     返回:
         list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, error?}, ...]
-              status: paid（已提交支付）/ opened（仅打开未支付）/ failed / skipped
+              status: paid / opened / failed / skipped
     """
     results = []
     download_dir = getattr(driver, '_download_dir', None)
     if not download_dir:
         print("未配置下载目录，跳过 Unpaid invoice 处理")
         return results
-
-    payment_cards = payment_cards or []
 
     # 记录 credits 页面 URL：每轮用直接导航返回（比 go_back 稳定，避免后续 invoice
     # 因页面历史状态错乱导致下载按钮点击超时）
@@ -1794,15 +1791,9 @@ def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None, on_pai
 
     processed_ids = set()
     round_num = 0
-    paid_count = 0      # 成功支付计数（每张成功 = 一张新卡；用于上限判断）
-    card_idx = 0        # 下一张要用的卡索引（每次尝试前进，不复用、不循环）
 
     while True:
         round_num += 1
-        # 安全阀：成功支付数达到上限则停止
-        if max_invoices is not None and paid_count >= max_invoices:
-            print(f"已达成功支付上限 {max_invoices} 张卡，停止")
-            break
 
         # 等待表格加载 + 清理可能弹出的欠费提示弹窗（会遮挡发票表格导致点击失败）
         time.sleep(3)
@@ -1921,20 +1912,17 @@ def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None, on_pai
                 _return_to_credits()
                 continue
 
-            # 有支付卡则填卡并提交支付；否则仅打开表单（保留原行为）
-            if payment_cards:
-                # 每张发票用一张新卡（不复用、不循环）；卡用尽则停止
-                if card_idx >= len(payment_cards):
-                    print("  可用支付卡已用尽，停止")
+            # 有卡提供器则取一张卡填写并提交支付；否则仅打开表单（保留原行为）
+            if get_card is not None:
+                card = get_card()
+                if not card:
+                    print("  无可用支付卡（get_card 返回 None），停止")
                     results.append({"invoice": invoice_id, "status": "skipped", "error": "无可用支付卡"})
                     break
-                card = payment_cards[card_idx]
-                card_idx += 1
                 card_last4 = str(card.get('number', ''))[-4:]
                 print(f"  {invoice_id} 使用卡 ****{card_last4} 填写并支付...")
                 pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id)
                 if pay_result.get('status') == 'paid':
-                    paid_count += 1
                     results.append({"invoice": invoice_id, "status": "paid", "pay_url": pay_url,
                                     "card": card_last4, "amount": amount,
                                     "responses": pay_result.get('responses')})
