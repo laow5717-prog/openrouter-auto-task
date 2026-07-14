@@ -609,6 +609,9 @@ def open_account_browser():
             account_id = login_cloudflare(driver, email, cf_password)
             if account_id:
                 state.add_log(f"{email} 浏览器已打开")
+            elif getattr(driver, 'account_banned', False):
+                models['account'].update_status(email, 'banned')
+                state.add_log(f"{email} 账号已被 Cloudflare 封禁，已在数据库标记为 banned")
             else:
                 state.add_log(f"{email} 打开浏览器登录失败")
 

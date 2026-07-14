@@ -19,6 +19,7 @@
         <option value="billing_page">账单页面</option>
         <option value="interrupted">已中断</option>
         <option value="all_bindings_failed">绑卡全部失败</option>
+        <option value="banned">已封禁</option>
         <option value="failed">失败</option>
         <option value="error">错误</option>
       </select>
@@ -246,6 +247,7 @@ const statusMap = {
   interrupted: '已中断',
   billing_page: '账单页面',
   all_bindings_failed: '绑卡全部失败',
+  banned: '已封禁',
 }
 function accStatusLabel(s) {
   if (statusMap[s]) return statusMap[s]
@@ -254,6 +256,7 @@ function accStatusLabel(s) {
   return s
 }
 function accStatusClass(s) {
+  if (s === 'banned') return 'fail'
   if (s.includes('bound') || s === 'registered') return 'success'
   if (s.includes('failed') || s === 'error') return 'fail'
   if (s === 'interrupted' || s === 'billing_page') return 'warn'
