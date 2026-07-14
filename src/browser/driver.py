@@ -480,7 +480,13 @@ def collect_intercepted_responses(driver, timeout=60):
     first_found_time = None
 
     for _ in range(timeout):
-        time.sleep(1)
+        # 关键：用 Playwright 的 wait_for_timeout（而非 time.sleep）——sync Playwright 的
+        # page.on("response") 事件只在调用 Playwright API 时才派发；裸 time.sleep 不驱动
+        # 事件循环，会导致响应永远收不到。
+        try:
+            driver.page.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1)
         responses = list(driver.net_responses)
         if responses:
             if first_found_time is None:
