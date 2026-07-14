@@ -1723,6 +1723,85 @@ def _cancel_3ds_challenge(driver):
     return False
 
 
+_CONFIRM_BTN_KEYWORDS = ('确认付款', '确认支付', 'confirm payment', 'confirm')
+
+
+def _find_confirm_payment_button(driver):
+    """
+    定位 Stripe 的"确认付款"二次确认按钮（提交卡后出现的 ContentCard 卡片）。
+
+    该按钮与表单的 Pay 按钮共用 data-testid='hosted-payment-submit-button'，
+    区别在于它是 type='button'（表单里的是 type='submit'）。不点它页面会一直停住。
+    返回可点击的 locator；不存在 / 正在处理中 / 已完成时返回 None。
+    """
+    try:
+        btns = driver.page.locator(
+            "button[data-testid='hosted-payment-submit-button'][type='button']"
+        )
+        for i in range(min(btns.count(), 3)):
+            btn = btns.nth(i)
+            try:
+                if not btn.is_visible(timeout=SHORT_TIMEOUT_MS) or not btn.is_enabled(timeout=SHORT_TIMEOUT_MS):
+                    continue
+                cls = (btn.get_attribute('class', timeout=SHORT_TIMEOUT_MS) or '').lower()
+                if 'processing' in cls or 'disabled' in cls:
+                    continue
+                txt = (btn.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip().lower()
+                if any(k in txt for k in _CONFIRM_BTN_KEYWORDS):
+                    return btn
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _click_confirm_payment(driver, invoice_id=''):
+    """点击"确认付款"二次确认按钮；返回是否点击了。"""
+    btn = _find_confirm_payment_button(driver)
+    if btn is None:
+        return False
+    print(f"  {invoice_id} 检测到「确认付款」二次确认，点击继续...")
+    clicked = False
+    try:
+        _safe_click(btn, session=driver, desc='确认付款按钮', retries=1)
+        clicked = True
+    except Exception:
+        pass
+    if not clicked or _find_confirm_payment_button(driver) is not None:
+        # 普通点击失败 / 点后仍停在可确认态（未真正提交）→ JS click 兜底
+        try:
+            btn.evaluate("el => el.click()")
+            clicked = True
+        except Exception:
+            pass
+    driver.page.wait_for_timeout(2000)
+    return clicked
+
+
+def _reveal_payment_form_if_saved_card(driver, invoice_id=''):
+    """
+    支付页若直接停在"确认付款"（已保存支付方式）态、卡表单被隐藏，
+    点击"选择一个新的支付方式"把表单展开，好继续用我们自己的卡填写。
+    返回是否做了切换。
+    """
+    try:
+        wrapper = driver.page.locator("div.InvoicePaymentFormWrapper")
+        if wrapper.count() == 0 or wrapper.first.is_visible(timeout=SHORT_TIMEOUT_MS):
+            return False   # 表单本来就可见 → 正常填卡流程
+        for name in ['选择一个新的支付方式', '选择新的支付方式',
+                     'Choose a new payment method', 'Use a new payment method']:
+            link = driver.page.get_by_role('button', name=name)
+            if link.count() > 0:
+                link.first.click(timeout=CLICK_TIMEOUT_MS)
+                driver.page.wait_for_timeout(2000)
+                print(f"  {invoice_id} 页面停在已保存卡的确认态，已切换为新支付方式")
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
     """
     在 Stripe 支付页面的 iframe 内填写信用卡信息并点击 Pay
@@ -1820,9 +1899,13 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         # 点击 Pay 按钮（位于主文档，不在 iframe 内）。
         # 普通 click 可能"假成功"（actionability 通过但未真正提交），故追加 JS click 兜底，
         # 确保真正触发表单提交。
-        pay_btn = driver.page.locator(
-            "button[data-testid='hosted-payment-submit-button']"
-        ).first
+        # 优先取表单里的 type=submit 按钮：页面上若同时存在"确认付款"卡片，
+        # 它也带同样的 data-testid（type=button），.first 会误选到它。
+        submit_btns = driver.page.locator(
+            "button[data-testid='hosted-payment-submit-button'][type='submit']"
+        )
+        pay_btn = (submit_btns.first if submit_btns.count() > 0
+                   else driver.page.locator("button[data-testid='hosted-payment-submit-button']").first)
         _wait_visible(pay_btn, timeout=30_000)
         print(f"  {invoice_id} 正在点击 Pay...")
         try:
@@ -1842,9 +1925,16 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         # 明确结果（3DS / 成功 / 拒付原因）才收手，期间持续等待"处理中"状态。
         is_3ds = False
         reason = None
+        confirm_clicks = 0
         deadline = time.time() + 90
         while time.time() < deadline:
             driver.page.wait_for_timeout(2000)     # 驱动 Playwright 事件循环 + 等待
+            # 0) "确认付款"二次确认卡片：银行要求验证身份前 Stripe 会先要一次确认，
+            #    不点则页面永远停在这里。点完重新给足观测窗口。
+            if confirm_clicks < 2 and _click_confirm_payment(driver, invoice_id):
+                confirm_clicks += 1
+                deadline = time.time() + 90
+                continue
             # 1) 3DS 挑战弹窗
             if _has_3ds_challenge(driver):
                 is_3ds = True
@@ -2074,6 +2164,9 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
                 _return_to_credits()
                 continue
             print(f"  {invoice_id} 支付页面已加载完成")
+
+            # 页面可能直接停在"确认付款"（已保存支付方式）态、卡表单被隐藏 → 先切回新支付方式
+            _reveal_payment_form_if_saved_card(driver, invoice_id)
 
             # 切入 Stripe iframe 点击 Card 支付选项（frame_locator 无状态）
             try:
