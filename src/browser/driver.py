@@ -1898,19 +1898,27 @@ def _click_confirm_payment(driver, invoice_id=''):
 def _reveal_payment_form_if_saved_card(driver, invoice_id=''):
     """
     支付页若直接停在"确认付款"（已保存支付方式）态、卡表单被隐藏，
-    点击"选择一个新的支付方式"把表单展开，好继续用我们自己的卡填写。
+    点击"选择新的支付方式"把 InvoicePaymentFormWrapper 展开，好用我们自己的卡填写。
     返回是否做了切换。
+
+    该链接文案随语言/版本变化（实测英文是 "Select a new payment method"，
+    也出现过 "Choose/Use a new payment method"），故用公共子串匹配 accessible
+    name（get_by_role 的 name 默认子串、不区分大小写），一次覆盖各种说法，
+    避免文案微调就漏点导致表单展不开、后续点 Card 选项超时。
     """
     try:
         wrapper = driver.page.locator("div.InvoicePaymentFormWrapper")
         if wrapper.count() == 0 or wrapper.first.is_visible(timeout=SHORT_TIMEOUT_MS):
             return False   # 表单本来就可见 → 正常填卡流程
-        for name in ['选择一个新的支付方式', '选择新的支付方式',
-                     'Choose a new payment method', 'Use a new payment method']:
+        for name in ['new payment method', '新的支付方式']:
             link = driver.page.get_by_role('button', name=name)
             if link.count() > 0:
                 link.first.click(timeout=CLICK_TIMEOUT_MS)
-                driver.page.wait_for_timeout(2000)
+                # 等表单真正展开（wrapper 变可见）再返回，避免过早去点隐藏的 Card 选项
+                try:
+                    wrapper.first.wait_for(state="visible", timeout=CLICK_TIMEOUT_MS)
+                except Exception:
+                    driver.page.wait_for_timeout(2000)
                 print(f"  {invoice_id} 页面停在已保存卡的确认态，已切换为新支付方式")
                 return True
     except Exception:
