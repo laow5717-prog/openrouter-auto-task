@@ -24,6 +24,7 @@ from src.browser.driver import (
     close_topup_dialog,
     fill_topup_and_confirm,
     handle_unpaid_invoices,
+    read_credits_balance,
 )
 import src.services.captcha as captcha_solver
 
@@ -286,7 +287,7 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
 
 def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
                      skip_invoice=False, payment_cards=None,
-                     valid_card_model=None, card_pool_model=None):
+                     valid_card_model=None, card_pool_model=None, account_model=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -299,6 +300,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         payment_cards: 支付卡数据列表（用于在线支付填写信用卡信息）
         valid_card_model: ValidCardModel，支付成功后记录有效卡（source_type=payment）
         card_pool_model: CardPoolModel，支付成功后把底料卡状态标为 'paid'
+        account_model: AccountModel，每笔发票支付成功后记录该账号最新的 Credits 余额
     返回:
         (bool, str, list, str): (是否成功, 错误信息, API 响应列表, 卡片后四位)
     """
@@ -346,14 +348,21 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     return c
             return reuse_pool[0]
 
-        def _on_invoice_paid(invoice_id, card, responses, amt):
-            """每笔发票支付成功后：更新选卡状态 + 记账（recharge_log + valid_cards + card_pool）"""
+        def _on_invoice_paid(invoice_id, card, responses, amt, balance=None):
+            """每笔发票支付成功后：更新选卡状态 + 记账（recharge_log + valid_cards + card_pool）
+            balance: 支付后从 credits 页面读到的账户余额（美元，读取失败为 None）"""
             num = card.get('number', '')
             _sel['last'] = num
             _paid_numbers.add(num)
             if recharge_log_model:
                 lid = recharge_log_model.create(email, card_display=num, amount=amt or 0)
-                recharge_log_model.mark_success(lid, api_response={'invoice': invoice_id, 'responses': responses})
+                recharge_log_model.mark_success(lid, api_response={
+                    'invoice': invoice_id, 'responses': responses, 'balance': balance})
+            if account_model and balance is not None:
+                try:
+                    account_model.update_balance(email, balance)
+                except Exception as _e:
+                    print(f"  记录余额失败: {_e}")
             if valid_card_model:
                 valid_card_model.record(card, source_type='payment', source_email=email)
             if card_pool_model:
@@ -361,8 +370,9 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     card_pool_model.mark_status_by_number(num, 'paid')
                 except Exception:
                     pass
+            bal_txt = f"，余额 ${balance:.2f}" if balance is not None else ""
             print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}"
-                  f"（该账号累计 {len(_paid_numbers)} 张成功卡）")
+                  f"（该账号累计 {len(_paid_numbers)} 张成功卡）{bal_txt}")
 
         def _on_invoice_failed(invoice_id, card, reason):
             """每笔发票支付失败后：标记该底料卡为失败 + 记录失败原因（便于排查）"""
@@ -379,6 +389,22 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 except Exception:
                     pass
             print(f"  已记失败: invoice {invoice_id} 卡 ****{str(num)[-4:]} 原因: {reason}")
+
+        def _record_final_balance():
+            """流程收尾：重新加载 credits 页面，读一次最终余额并落库（读不到不影响主流程）"""
+            try:
+                driver.get(f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits")
+                time.sleep(5)
+                dismiss_overdue_dialog(driver)
+                balance = read_credits_balance(driver)
+                if balance is None:
+                    print("  未读到最终 Credits 余额")
+                    return
+                print(f"  账号 {email} 最终 Credits 余额: ${balance:.2f}")
+                if account_model:
+                    account_model.update_balance(email, balance)
+            except Exception as e:
+                print(f"  读取最终余额失败: {e}")
 
         print("正在跳转到 AI Credits 页面并点击充值...")
         success = navigate_to_ai_credits(driver, account_id)
@@ -413,13 +439,14 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 # 直接在当前 credits 页面处理 Unpaid invoices
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
-                    on_failed=_on_invoice_failed)
+                    on_failed=_on_invoice_failed, account_id=account_id)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
                 else:
                     print("未发现 Unpaid invoice")
 
+                _record_final_balance()
                 return True, "跳过充值，已处理账单", [], card_last4
 
         # 今日未支付过，继续充值流程
@@ -443,12 +470,13 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
 
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
-                    on_failed=_on_invoice_failed)
+                    on_failed=_on_invoice_failed, account_id=account_id)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
             else:
                 print("未选择支付卡分组，跳过 Unpaid invoice 处理")
+            _record_final_balance()
         else:
             print(f"账号 {email} 充值确认失败")
 

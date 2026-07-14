@@ -1444,6 +1444,36 @@ def _extract_account_id(driver):
     return None
 
 
+def read_credits_balance(driver, timeout_ms=30_000):
+    """
+    读取 AI Credits 页面 Credits 卡片里的余额（形如 "$0.00"）。
+
+    卡片结构：标题 <p><span>Credits</span></p> 与余额 <p class="... text-3xl">$0.00</p>
+    同在一个卡片 div 内。这里按"标题为 Credits 的卡片内第一个 $ 金额"定位，避免
+    误读页面上其它金额（如账单表格里的发票金额）。
+
+    返回:
+        float | None: 余额（美元），读取失败返回 None
+    """
+    try:
+        # .last 取文档序最后一个匹配（即嵌套最深的那层卡片 div），范围最小
+        card = driver.page.locator(
+            "xpath=//div[.//p[normalize-space(.)='Credits']]"
+            "[.//p[contains(@class,'text-3xl')]]"
+        ).last
+        amount = card.locator("xpath=.//p[contains(@class,'text-3xl')]").first
+        if not _wait_visible(amount, timeout=timeout_ms):
+            return None
+        txt = (amount.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+        m = re.search(r'\$\s*([\d,]+(?:\.\d+)?)', txt)
+        if not m:
+            return None
+        return float(m.group(1).replace(',', ''))
+    except Exception as e:
+        print(f"  读取 Credits 余额失败: {str(e)[:80]}")
+        return None
+
+
 def navigate_to_ai_credits(driver, account_id):
     """
     导航到 AI Gateway Credits 页面并点击 Top-up credits 按钮
@@ -2014,7 +2044,7 @@ def _invoice_still_unpaid(driver, invoice_id):
     return True   # 表格已加载但找不到该 invoice 行 → 保守视为未支付（避免误记成功）
 
 
-def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
+def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, account_id=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
     打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
@@ -2030,8 +2060,9 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
                  由调用方负责记账（recharge_log / valid_cards / card_pool 状态）。
         on_failed: 每笔支付失败后的回调 on_failed(invoice_id, card, reason)，
                    由调用方标记该卡失败并记录原因（余额不足 / 卡号错 / 3DS 等）。
+        account_id: Cloudflare 账号 ID，用于拼出 credits 页面 URL（返回时整页刷新）。
     返回:
-        list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, error?}, ...]
+        list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, balance?, error?}, ...]
               status: paid / opened / failed / skipped
     """
     results = []
@@ -2040,20 +2071,24 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
         print("未配置下载目录，跳过 Unpaid invoice 处理")
         return results
 
-    # 记录 credits 页面 URL：每轮用直接导航返回（比 go_back 稳定，避免后续 invoice
-    # 因页面历史状态错乱导致下载按钮点击超时）
-    credits_url = driver.current_url if 'credits' in (driver.current_url or '') else None
+    # credits 页面 URL：每轮支付完用整页导航返回并重新加载（不用 go_back——SPA 回退
+    # 会复用旧的前端状态，账单表格/余额都可能是支付前的陈旧数据）
+    credits_url = None
+    if account_id:
+        credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+    elif 'credits' in (driver.current_url or ''):
+        credits_url = driver.current_url
 
     def _return_to_credits():
-        if credits_url:
-            driver.get(credits_url)
-            time.sleep(3)
-        else:
-            driver.page.go_back(wait_until="domcontentloaded")
-            time.sleep(3)
-            if 'credits' not in driver.current_url:
-                driver.page.go_back(wait_until="domcontentloaded")
-                time.sleep(3)
+        """整页导航回 credits 并强制刷新，确保拿到支付后的最新账单状态与余额。"""
+        try:
+            if credits_url:
+                driver.get(credits_url)          # goto 同 URL 即整页重新加载
+            else:
+                driver.page.reload(wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"  返回 Credits 页面异常: {str(e)[:80]}")
+        time.sleep(3)
 
     processed_ids = set()
     round_num = 0
@@ -2229,13 +2264,18 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
                     _return_to_credits()
 
             if paid_confirmed:
-                print(f"  {inv} 支付成功（账单已变为 Paid，卡 ****{pending['last4']}，${pending['amount']}）")
+                # 页面已是刷新后的 credits 页 → 此刻的 Credits 卡片即支付后的最新余额
+                balance = read_credits_balance(driver)
+                bal_txt = f"${balance:.2f}" if balance is not None else "未读到"
+                print(f"  {inv} 支付成功（账单已变为 Paid，卡 ****{pending['last4']}，"
+                      f"${pending['amount']}），当前 Credits 余额: {bal_txt}")
                 results.append({"invoice": inv, "status": "paid", "pay_url": pending["pay_url"],
                                 "card": pending["last4"], "amount": pending["amount"],
+                                "balance": balance,
                                 "responses": pending["responses"]})
                 if on_paid:
                     try:
-                        on_paid(inv, pending["card"], pending["responses"], pending["amount"])
+                        on_paid(inv, pending["card"], pending["responses"], pending["amount"], balance)
                     except Exception as _e:
                         print(f"  on_paid 回调异常: {_e}")
             else:

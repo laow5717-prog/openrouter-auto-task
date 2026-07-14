@@ -112,11 +112,17 @@ _SCHEMA_V4 = """
 ALTER TABLE card_pool ADD COLUMN status TEXT DEFAULT '';
 """
 
+_SCHEMA_V5 = """
+ALTER TABLE accounts ADD COLUMN credits_balance REAL;
+ALTER TABLE accounts ADD COLUMN balance_updated_at TEXT;
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
     3: _SCHEMA_V3,
     4: _SCHEMA_V4,
+    5: _SCHEMA_V5,
 }
 
 

@@ -496,6 +496,7 @@ def recharge_account():
                 payment_cards=payment_cards,
                 valid_card_model=models['valid_card'],
                 card_pool_model=models['card_pool'],
+                account_model=models['account'],
             )
 
             # 用页面提取的后四位匹配完整卡号

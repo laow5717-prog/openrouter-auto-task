@@ -28,6 +28,16 @@ class AccountModel:
             (status, email),
         )
 
+    def update_balance(self, email, balance):
+        """记录该账号最近一次读到的 AI Credits 余额（美元）"""
+        if balance is None:
+            return
+        self.db.execute(
+            "UPDATE accounts SET credits_balance=?, balance_updated_at=datetime('now','localtime'), "
+            "updated_at=datetime('now','localtime') WHERE email=?",
+            (float(balance), email),
+        )
+
     def get_all(self, order_desc=True):
         order = "DESC" if order_desc else "ASC"
         rows = self.db.fetchall(f"SELECT * FROM accounts ORDER BY id {order}")
