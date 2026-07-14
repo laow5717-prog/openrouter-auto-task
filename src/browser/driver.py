@@ -1721,29 +1721,81 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         driver.capture_frame()
         time.sleep(1)
 
-        # 注入网络拦截器捕获支付结果
+        import json as _json
+
+        # 注入网络拦截器捕获支付结果（confirm 响应是判定真实成功的依据）
         inject_network_interceptor(driver, [
             ['api.stripe.com', 'confirm'],
-            ['stripe.com', 'pay'],
+            ['stripe.com', 'confirm'],
+            ['invoice.stripe.com', 'confirm'],
         ])
 
-        # 点击 Pay 按钮（位于主文档，不在 iframe 内）
+        # 点击 Pay 按钮（位于主文档，不在 iframe 内）。
+        # 普通 click 可能"假成功"（actionability 通过但未真正提交），故追加 JS click 兜底，
+        # 确保真正触发表单提交。
         pay_btn = driver.page.locator(
             "button[data-testid='hosted-payment-submit-button']"
         ).first
         _wait_visible(pay_btn, timeout=30_000)
         print(f"  {invoice_id} 正在点击 Pay...")
-        _safe_click(pay_btn, session=driver, desc='Pay 按钮')
+        try:
+            _safe_click(pay_btn, session=driver, desc='Pay 按钮', retries=1)
+        except Exception:
+            pass
+        try:
+            pay_btn.evaluate("el => el.click()")   # JS 兜底，确保真正提交
+        except Exception:
+            pass
         print(f"  {invoice_id} 已点击 Pay，等待支付结果...")
 
-        # 收集支付响应
-        responses = collect_intercepted_responses(driver, timeout=60)
-        if responses:
-            print(f"  {invoice_id} 收到 {len(responses)} 条支付响应")
-            for resp in responses:
-                print(f"    [{resp.get('status')}] {resp.get('url', '')[:80]}")
+        # 严格判定真实支付结果（不再"点击没报错就算成功"）：
+        #  成功：捕获到 confirm 响应含 succeeded/paid，或页面出现成功文案；
+        #  失败：响应指示失败，或页面出现 declined/failed 文案；
+        #  两者都没有 → uncertain（不计为成功、不记账）。
+        outcome = None
+        deadline = time.time() + 90
+        while time.time() < deadline and outcome is None:
+            driver.page.wait_for_timeout(2000)     # 驱动 Playwright 事件循环 + 等待
+            # 把所有响应拼成一个 blob：先全局找成功信号（避免某条响应里的 'declined'
+            # 字样抢在真正的 'succeeded' 响应之前误判失败），没有成功再判失败。
+            blob = " ".join(
+                (_json.dumps(r.get('data'), ensure_ascii=False)
+                 if isinstance(r.get('data'), (dict, list)) else str(r.get('data') or ''))
+                for r in list(driver.net_responses)
+            )
+            bl = blob.lower()
+            if '"status": "succeeded"' in blob or '"status":"succeeded"' in blob \
+                    or '"paid": true' in blob or '"paid":true' in blob:
+                outcome = 'paid'; break
+            # 失败：明确的拒付/失败指示（收紧，去掉过宽的裸 'declined'）
+            if 'card_declined' in bl or 'decline_code' in bl or 'payment_failed' in bl \
+                    or 'your card was declined' in bl or 'insufficient' in bl \
+                    or '"status": "failed"' in blob or '"status":"failed"' in blob:
+                outcome = 'failed'; break
+            # 页面文案兜底
+            try:
+                body = driver.page.inner_text('body', timeout=SHORT_TIMEOUT_MS).lower()
+            except Exception:
+                body = ''
+            if any(k in body for k in ['payment received', 'payment complete', 'thanks for your payment',
+                                       'you paid', 'receipt from', 'paid on']):
+                outcome = 'paid'; break
+            if any(k in body for k in ['card was declined', 'your card was declined', 'payment failed',
+                                       'try a different card', 'insufficient funds']):
+                outcome = 'failed'; break
 
-        return {"status": "paid", "responses": responses}
+        collected = list(driver.net_responses)
+        if collected:
+            print(f"  {invoice_id} 收到 {len(collected)} 条支付响应")
+        if outcome == 'paid':
+            print(f"  {invoice_id} 支付成功（检测到成功信号）")
+            return {"status": "paid", "responses": collected}
+        elif outcome == 'failed':
+            print(f"  {invoice_id} 支付失败（检测到失败/拒付信号）")
+            return {"status": "failed", "error": "支付被拒绝或失败", "responses": collected}
+        else:
+            print(f"  {invoice_id} 支付结果未确认（未捕获成功/失败信号），不计为成功")
+            return {"status": "uncertain", "error": "支付结果未确认", "responses": collected}
 
     except Exception as e:
         print(f"  {invoice_id} Stripe 支付填写失败: {e}")
