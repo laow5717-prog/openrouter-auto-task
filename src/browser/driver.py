@@ -1838,9 +1838,11 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         # 等待支付处理：期间检测 3DS 银行验证弹窗（无法自动完成→取消并判失败），
         # 并提取失败原因（decline_code / 页面错误文案）。是否真正成功由上层按
         # "账单是否仍在 Unpaid 列表" 权威判定；本函数负责取消 3DS + 给出失败原因。
+        # 支付是耗时操作（十几秒~几十秒，网络差更久）：观测窗口给足 90s，等到出现
+        # 明确结果（3DS / 成功 / 拒付原因）才收手，期间持续等待"处理中"状态。
         is_3ds = False
         reason = None
-        deadline = time.time() + 60
+        deadline = time.time() + 90
         while time.time() < deadline:
             driver.page.wait_for_timeout(2000)     # 驱动 Playwright 事件循环 + 等待
             # 1) 3DS 挑战弹窗
@@ -2100,7 +2102,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
                 pending = {"invoice": invoice_id, "card": card, "last4": card_last4,
                            "amount": amount, "pay_url": pay_url,
                            "responses": pay_result.get('responses'),
-                           "error": pay_result.get('error')}
+                           "error": pay_result.get('error'),
+                           "fill_status": pay_result.get('status')}
             else:
                 results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
 
@@ -2112,31 +2115,46 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None):
         print(f"  返回 Credits 页面查找剩余 Unpaid invoices...")
         _return_to_credits()
 
-        # 权威判定：刚尝试过支付的账单，若已从 Unpaid 列表消失 → 真实支付成功。
-        # 不依赖解析 Stripe 响应（confirmation_token 等不代表成功），以 Cloudflare 账单状态为准。
+        # 权威判定：以 Cloudflare 发票表状态为准（不解析 Stripe 响应）。
+        # 支付是耗时操作、且 Cloudflare 更新账单状态有延迟，故轮询等待：
+        #  - 明确失败（3DS 取消 / 拒付原因）→ 不空等，确认一次后直接判失败；
+        #  - 其它（成功/未确认）→ 轮询账单状态最多 ~60s，变 Paid 即成功，否则失败。
         if pending:
-            time.sleep(4)
-            dismiss_overdue_dialog(driver)
-            if _invoice_still_unpaid(driver, pending["invoice"]):
-                fail_reason = pending.get("error") or "支付后账单仍为 Unpaid"
-                print(f"  {pending['invoice']} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}），原因: {fail_reason}")
-                results.append({"invoice": pending["invoice"], "status": "failed", "pay_url": pending["pay_url"],
-                                "card": pending["last4"], "error": fail_reason})
-                if on_failed:
-                    try:
-                        on_failed(pending["invoice"], pending["card"], fail_reason)
-                    except Exception as _e:
-                        print(f"  on_failed 回调异常: {_e}")
+            inv = pending["invoice"]
+            definite_fail = pending.get("fill_status") == "failed"
+            paid_confirmed = False
+            if definite_fail:
+                dismiss_overdue_dialog(driver)
+                paid_confirmed = not _invoice_still_unpaid(driver, inv)
             else:
-                print(f"  {pending['invoice']} 支付成功（账单已从 Unpaid 消失，卡 ****{pending['last4']}，${pending['amount']}）")
-                results.append({"invoice": pending["invoice"], "status": "paid", "pay_url": pending["pay_url"],
+                for _rnd in range(10):        # 最多约 10 轮（含刷新与等待，覆盖网络不佳）
+                    dismiss_overdue_dialog(driver)
+                    if not _invoice_still_unpaid(driver, inv):
+                        paid_confirmed = True
+                        break
+                    time.sleep(6)
+                    _return_to_credits()
+
+            if paid_confirmed:
+                print(f"  {inv} 支付成功（账单已变为 Paid，卡 ****{pending['last4']}，${pending['amount']}）")
+                results.append({"invoice": inv, "status": "paid", "pay_url": pending["pay_url"],
                                 "card": pending["last4"], "amount": pending["amount"],
                                 "responses": pending["responses"]})
                 if on_paid:
                     try:
-                        on_paid(pending["invoice"], pending["card"], pending["responses"], pending["amount"])
+                        on_paid(inv, pending["card"], pending["responses"], pending["amount"])
                     except Exception as _e:
                         print(f"  on_paid 回调异常: {_e}")
+            else:
+                fail_reason = pending.get("error") or "支付未生效（账单仍为 Unpaid）"
+                print(f"  {inv} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}），原因: {fail_reason}")
+                results.append({"invoice": inv, "status": "failed", "pay_url": pending["pay_url"],
+                                "card": pending["last4"], "error": fail_reason})
+                if on_failed:
+                    try:
+                        on_failed(inv, pending["card"], fail_reason)
+                    except Exception as _e:
+                        print(f"  on_failed 回调异常: {_e}")
 
     return results
 
