@@ -1802,6 +1802,24 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         return {"status": "failed", "error": f"Stripe 支付填写失败: {e}"}
 
 
+def _invoice_still_unpaid(driver, invoice_id):
+    """在 credits 页面判断某 invoice 是否仍在 Unpaid 列表中。
+    支付后若该账单已从 Unpaid 消失，说明 Cloudflare 已确认支付成功（权威判据）。"""
+    try:
+        rows = driver.page.locator("xpath=//table//tr[.//span[text()='Unpaid']]").all()
+        for row in rows:
+            try:
+                link = row.locator("xpath=.//a[@role='button']").first
+                iid = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+                if iid == invoice_id:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
@@ -1846,6 +1864,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
 
     while True:
         round_num += 1
+        pending = None   # 本轮是否尝试了支付（用于返回 credits 后权威判定成功与否）
 
         # 等待表格加载 + 清理可能弹出的欠费提示弹窗（会遮挡发票表格导致点击失败）
         time.sleep(3)
@@ -1964,7 +1983,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
                 _return_to_credits()
                 continue
 
-            # 有卡提供器则取一张卡填写并提交支付；否则仅打开表单（保留原行为）
+            # 有卡提供器则填卡并提交（是否真成功在返回 credits 后按"账单是否仍 Unpaid"判定）
             if get_card is not None:
                 card = get_card()
                 if not card:
@@ -1972,21 +1991,11 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
                     results.append({"invoice": invoice_id, "status": "skipped", "error": "无可用支付卡"})
                     break
                 card_last4 = str(card.get('number', ''))[-4:]
-                print(f"  {invoice_id} 使用卡 ****{card_last4} 填写并支付...")
+                print(f"  {invoice_id} 使用卡 ****{card_last4} 填写并提交...")
                 pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id)
-                if pay_result.get('status') == 'paid':
-                    results.append({"invoice": invoice_id, "status": "paid", "pay_url": pay_url,
-                                    "card": card_last4, "amount": amount,
-                                    "responses": pay_result.get('responses')})
-                    print(f"  {invoice_id} 支付已提交（卡 ****{card_last4}，金额 ${amount}）")
-                    if on_paid:
-                        try:
-                            on_paid(invoice_id, card, pay_result.get('responses'), amount)
-                        except Exception as _e:
-                            print(f"  on_paid 回调异常: {_e}")
-                else:
-                    results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url,
-                                    "card": card_last4, "error": pay_result.get('error', '支付失败')})
+                pending = {"invoice": invoice_id, "card": card, "last4": card_last4,
+                           "amount": amount, "pay_url": pay_url,
+                           "responses": pay_result.get('responses')}
             else:
                 results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
 
@@ -1997,6 +2006,26 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None):
         # 处理完一个 invoice 后，回到 credits 页面重新查找
         print(f"  返回 Credits 页面查找剩余 Unpaid invoices...")
         _return_to_credits()
+
+        # 权威判定：刚尝试过支付的账单，若已从 Unpaid 列表消失 → 真实支付成功。
+        # 不依赖解析 Stripe 响应（confirmation_token 等不代表成功），以 Cloudflare 账单状态为准。
+        if pending:
+            time.sleep(4)
+            dismiss_overdue_dialog(driver)
+            if _invoice_still_unpaid(driver, pending["invoice"]):
+                print(f"  {pending['invoice']} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}）")
+                results.append({"invoice": pending["invoice"], "status": "failed", "pay_url": pending["pay_url"],
+                                "card": pending["last4"], "error": "支付后账单仍为 Unpaid"})
+            else:
+                print(f"  {pending['invoice']} 支付成功（账单已从 Unpaid 消失，卡 ****{pending['last4']}，${pending['amount']}）")
+                results.append({"invoice": pending["invoice"], "status": "paid", "pay_url": pending["pay_url"],
+                                "card": pending["last4"], "amount": pending["amount"],
+                                "responses": pending["responses"]})
+                if on_paid:
+                    try:
+                        on_paid(pending["invoice"], pending["card"], pending["responses"], pending["amount"])
+                    except Exception as _e:
+                        print(f"  on_paid 回调异常: {_e}")
 
     return results
 
