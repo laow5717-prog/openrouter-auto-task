@@ -401,6 +401,8 @@ def get_accounts():
             "time": acc.get('created_at') or '',
             "email_password": acc.get('email_password') or '',
             "card_count": card_counts.get(acc['email'], 0),
+            "credits_balance": acc.get('credits_balance'),
+            "balance_updated_at": acc.get('balance_updated_at') or '',
         })
 
     return jsonify({"data": data, "total": total, "page": page, "page_size": page_size})
@@ -710,7 +712,7 @@ def export_accounts():
     headers = ["邮箱", "CF密码", "邮箱密码", "状态", "注册时间",
                "卡号", "有效期", "CVC", "持卡人",
                "国家", "地址1", "地址2", "城市", "州/省", "邮编", "公司",
-               "绑卡状态", "绑卡时间"]
+               "绑卡状态", "绑卡时间", "Credits余额", "余额更新时间"]
     header_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
     header_font = Font(bold=True, size=11)
     for col_idx, h in enumerate(headers, 1):
@@ -729,6 +731,8 @@ def export_accounts():
             ws.cell(row=r, column=3, value=acc.get('email_password') or '')
             ws.cell(row=r, column=4, value=acc.get('status') or '')
             ws.cell(row=r, column=5, value=acc.get('created_at') or '')
+            ws.cell(row=r, column=19, value=acc.get('credits_balance'))
+            ws.cell(row=r, column=20, value=acc.get('balance_updated_at') or '')
 
         if cards:
             for card in cards:

@@ -44,16 +44,17 @@
             <th>邮箱密码 <a href="https://mail.tm" target="_blank" style="font-weight:normal;font-size:11px;color:var(--primary)">(mail.tm)</a></th>
             <th style="white-space:nowrap">状态</th>
             <th style="white-space:nowrap">绑定卡片</th>
+            <th style="white-space:nowrap">Credits 余额</th>
             <th style="white-space:nowrap">时间</th>
             <th style="white-space:nowrap">操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="8" class="table-loading">加载中...</td>
+            <td colspan="9" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="accounts.length === 0">
-            <td colspan="8" class="table-empty">暂无数据</td>
+            <td colspan="9" class="table-empty">暂无数据</td>
           </tr>
           <tr v-for="acc in accounts" :key="acc.email">
             <td><input type="checkbox" :checked="selected.has(acc.email)" @change="toggleSelect(acc.email, $event.target.checked)"></td>
@@ -68,6 +69,14 @@
                 {{ acc.card_count }} 张卡
               </span>
               <span v-else class="card-count-badge empty">无</span>
+            </td>
+            <td>
+              <span v-if="acc.credits_balance !== null && acc.credits_balance !== undefined"
+                    class="balance-badge" :class="{ zero: acc.credits_balance <= 0 }"
+                    :title="acc.balance_updated_at ? `更新于 ${acc.balance_updated_at}` : ''">
+                ${{ Number(acc.credits_balance).toFixed(2) }}
+              </span>
+              <span v-else style="color:var(--text-sub)">-</span>
             </td>
             <td>{{ acc.time }}</td>
             <td style="display:flex;gap:6px;align-items:center">
@@ -458,6 +467,19 @@ onUnmounted(stopBrowserPoll)
 }
 .card-count-badge:hover { background: #bfdbfe; }
 .card-count-badge.empty { background: #f3f4f6; color: #9ca3af; cursor: default; }
+
+.balance-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  font-weight: 600;
+  background: #dcfce7;
+  color: #15803d;
+  cursor: default;
+}
+.balance-badge.zero { background: #f3f4f6; color: #9ca3af; }
 
 .card-detail-card {
   border: 1px solid var(--border);
