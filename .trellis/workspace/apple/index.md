@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 13
-- **Last Active**: 2026-07-13
+- **Total Sessions**: 14
+- **Last Active**: 2026-07-14
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~443 | Active |
+| `journal-1.md` | ~477 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 14 | 2026-07-14 | 浏览器引擎迁移到 Patchright + 封禁检测入库 | `02a4a2f`, `ffc13ca` | `main` |
 | 13 | 2026-07-13 | 修复弹窗提取、Stripe iframe 交互及 invoice 逐个处理 | `1a88a97`, `4455018` | `main` |
 | 12 | 2026-07-13 | 充值流程完善：今日支付检查、Stripe 表单展开、多账号浏览器查看 | `58ff091`, `3d9316f` | `main` |
 | 11 | 2026-07-13 | AI Credits 自动充值功能（登录+导航） | `e273ba8` | `main` |

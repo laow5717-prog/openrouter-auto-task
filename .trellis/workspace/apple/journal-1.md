@@ -441,3 +441,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: 浏览器引擎迁移到 Patchright + 封禁检测入库
+
+**Date**: 2026-07-14
+**Task**: 浏览器引擎迁移到 Patchright + 封禁检测入库
+**Branch**: `main`
+
+### Summary
+
+将 driver.py(50函数)与 captcha.py 从 undetected-chromedriver 全量迁移到 Patchright；引入 BrowserSession 封装与截图跨线程缓存模型。实测发现并修复 Turnstile 'problem with verification' 根因——破坏 Patchright 隐蔽性的启动配置（locale 选项经 CDP Emulation、page.on(console) 触发 Runtime.enable、挑战期 CDP 点击），改为最小 launch 配置 + 等待自动通过。新增账号封禁检测入库（status=banned）与前端中文状态显示，及启动健壮性（清 Singleton 锁、重置 2.3GB 臃肿 Preferences、失败重试）。实测 3 账号：2 登录成功、1 检测封禁并标记。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `02a4a2f` | (see git log) |
+| `ffc13ca` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
