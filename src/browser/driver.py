@@ -2152,12 +2152,21 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
     打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
     不关闭浏览器、持续支付下一个账单，直到无账单 / get_card 返回 None。
 
+    失败重试语义（重要）：一张发票支付失败时，重试的是「同一张发票」而不是跳到下一张——
+    账单要逐张结清，跳过只会把欠费留在账号上。
+      - 卡被拒 / 卡号错 / 已过期 / 需要 3DS（card_fault=True）→ 换下一张卡重试同一发票，
+        直到付掉或卡池耗尽（get_card 返回 None → 整体停止，剩余发票同样无卡可付）；
+      - 页面超时 / PDF 下载失败 / 元素定位失败（card_fault=False）→ 卡是好的，复用同一张卡
+        重开支付页重试，最多 2 次；仍失败才放弃该发票并转下一张。
+
     参数:
         driver: 浏览器驱动
-        get_card: 卡提供器 callable，每个待支付 invoice 调用一次，返回一张卡 dict
+        get_card: 卡提供器 callable，每次需要一张卡时调用（同一发票换卡重试会多次调用），
+                  返回一张卡 dict
                   （number/expiry_month/expiry_year/cvc/country/zip...）或 None（无卡→停止）。
-                  选卡策略（新卡优先凑满 20 张 / 满 20 或无新卡时复用已付卡 / 避免连续同卡）
-                  由调用方在 get_card 内实现。为 None 时仅打开支付页展开 Card 表单（不支付）。
+                  选卡策略（新卡优先凑满 20 张 / 满 20 或无新卡时复用已付卡 / 避免连续同卡 /
+                  跳过 on_failed 标记过的无效卡）由调用方在 get_card 内实现。
+                  为 None 时仅打开支付页展开 Card 表单（不支付）。
         on_paid: 每笔支付成功后的回调 on_paid(invoice_id, card, responses, amount)，
                  由调用方负责记账（recharge_log / valid_cards / card_pool 状态）。
         on_failed: 每笔支付失败后的回调 on_failed(invoice_id, card, reason, card_fault)，
@@ -2194,10 +2203,42 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             print(f"  返回 Credits 页面异常: {str(e)[:80]}")
         time.sleep(3)
 
-    processed_ids = set()
+    # === 失败重试策略 ===
+    # 一张发票支付失败时，换下一张卡重试「同一张发票」，而不是跳到下一张发票——
+    # 账单必须逐张结清，跳过只会把欠费留在账号上。
+    #  - 卡自身问题（拒付 / 卡号错 / 已过期 / 需要 3DS）→ 换下一张卡重试同一发票。
+    #    坏卡由 on_failed 标记为无效，调用方的 get_card 下次自然跳过它；
+    #    直到支付成功或卡池耗尽（get_card 返回 None）为止。
+    #  - 脚本侧问题（PDF 下载失败 / 支付页超时 / 元素定位失败）→ 卡是好的，不该消耗卡池，
+    #    复用同一张卡重开支付页重试，最多 SCRIPT_RETRY_LIMIT 次，仍失败才放弃该发票、转下一张。
+    SCRIPT_RETRY_LIMIT = 2
+    MAX_ROUNDS = 500              # 死循环兜底（每轮至少消耗一张卡或一次脚本重试，正常远达不到）
+
+    done_ids = set()              # 已完结的发票：支付成功、或重试耗尽后永久放弃
+    card_tries = {}               # invoice_id -> 该发票已消耗的卡数（日志用）
+    script_tries = {}             # invoice_id -> 该发票的脚本侧重试次数
+    sticky_cards = {}             # invoice_id -> 脚本侧失败后待复用的同一张卡
     round_num = 0
 
-    while True:
+    def _give_up(iid, reason, **extra):
+        """放弃该发票：标记完结并记一条 failed，后续轮次不再选中它。"""
+        done_ids.add(iid)
+        sticky_cards.pop(iid, None)
+        rec = {"invoice": iid, "status": "failed", "error": reason}
+        rec.update(extra)
+        results.append(rec)
+
+    def _script_fail(iid, reason, **extra):
+        """脚本侧失败：未超上限则保留该发票待下轮用同一张卡重试，超限则放弃。"""
+        script_tries[iid] = script_tries.get(iid, 0) + 1
+        n = script_tries[iid]
+        if n > SCRIPT_RETRY_LIMIT:
+            print(f"  {iid} 脚本侧失败已达 {SCRIPT_RETRY_LIMIT} 次上限，放弃该发票: {reason}")
+            _give_up(iid, f"{reason}（脚本重试 {SCRIPT_RETRY_LIMIT} 次仍失败）", **extra)
+        else:
+            print(f"  {iid} 脚本侧失败（第 {n}/{SCRIPT_RETRY_LIMIT} 次），将用同一张卡重试该发票: {reason}")
+
+    while round_num < MAX_ROUNDS:
         round_num += 1
         pending = None   # 本轮是否尝试了支付（用于返回 credits 后权威判定成功与否）
 
@@ -2214,7 +2255,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 print("未发现 Unpaid invoice")
             break
 
-        # 找到第一个未处理过的 invoice
+        # 找到第一张尚未完结的 invoice。失败过的发票不会进 done_ids，因此仍会被再次选中
+        # ——这正是"换卡重试同一张发票"的落点。
         invoice_id = None
         invoice_link = None
         invoice_row = None
@@ -2222,7 +2264,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             try:
                 link = row.locator("xpath=.//a[@role='button']").first
                 iid = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
-                if iid and iid not in processed_ids:
+                if iid and iid not in done_ids:
                     invoice_id = iid
                     invoice_link = link
                     invoice_row = row
@@ -2234,9 +2276,12 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             print("所有 Unpaid invoice 已处理完毕")
             break
 
-        processed_ids.add(invoice_id)
         total_unpaid = len(rows)
-        print(f"[{len(processed_ids)}/{total_unpaid}] 处理 invoice: {invoice_id}")
+        retry_txt = ""
+        if card_tries.get(invoice_id) or script_tries.get(invoice_id):
+            retry_txt = (f"（重试：已试 {card_tries.get(invoice_id, 0)} 张卡"
+                         f"/脚本重试 {script_tries.get(invoice_id, 0)} 次）")
+        print(f"[剩余 Unpaid {total_unpaid} 张] 处理 invoice: {invoice_id}{retry_txt}")
 
         # 提取账单金额（用于记账，取行内第一个美元金额）
         amount = 0.0
@@ -2275,7 +2320,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 except Exception as e:
                     print(f"  {invoice_id} PDF 下载失败(方式={_method}): {str(e)[:90]}")
             if not downloaded:
-                results.append({"invoice": invoice_id, "status": "failed", "error": "PDF 下载超时"})
+                _script_fail(invoice_id, "PDF 下载超时")
                 _return_to_credits()
                 continue
 
@@ -2283,7 +2328,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             pay_url = _extract_pdf_pay_url(pdf_path)
             if not pay_url:
                 print(f"  {invoice_id} 未找到 Pay online 链接")
-                results.append({"invoice": invoice_id, "status": "failed", "error": "未找到支付链接"})
+                _script_fail(invoice_id, "未找到支付链接")
                 _return_to_credits()
                 continue
 
@@ -2299,7 +2344,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             ).first
             if not _wait_visible(pay_btn, timeout=120_000):
                 print(f"  {invoice_id} 支付页面加载超时")
-                results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
+                _script_fail(invoice_id, "支付页面加载超时", pay_url=pay_url)
                 _return_to_credits()
                 continue
             print(f"  {invoice_id} 支付页面已加载完成")
@@ -2317,19 +2362,28 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
             except Exception as e:
                 print(f"  {invoice_id} 点击 Card 选项失败: {e}")
-                results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": f"点击 Card 选项失败: {e}"})
+                _script_fail(invoice_id, f"点击 Card 选项失败: {e}", pay_url=pay_url)
                 _return_to_credits()
                 continue
 
             # 有卡提供器则填卡并提交（是否真成功在返回 credits 后按"账单是否仍 Unpaid"判定）
             if get_card is not None:
-                card = get_card()
+                # 上一轮若是脚本侧失败，卡本身没问题 → 复用同一张卡，不白白消耗卡池额度
+                # （一个 CF 账号最多 20 张 distinct 成功支付卡）。
+                reuse_card = sticky_cards.pop(invoice_id, None)
+                card = reuse_card or get_card()
                 if not card:
-                    print("  无可用支付卡（get_card 返回 None），停止")
-                    results.append({"invoice": invoice_id, "status": "skipped", "error": "无可用支付卡"})
+                    # 卡池耗尽：这张发票付不掉，后面的发票同样无卡可用 → 整体停止
+                    print("  无可用支付卡（卡池已耗尽），停止处理剩余账单")
+                    results.append({"invoice": invoice_id, "status": "skipped",
+                                    "error": f"无可用支付卡（已试 {card_tries.get(invoice_id, 0)} 张卡）"})
                     break
+                if not reuse_card:
+                    card_tries[invoice_id] = card_tries.get(invoice_id, 0) + 1
                 card_last4 = str(card.get('number', ''))[-4:]
-                print(f"  {invoice_id} 使用卡 ****{card_last4} 填写并提交...")
+                nth = card_tries.get(invoice_id, 1)
+                how = "复用同一张卡重试" if reuse_card else f"第 {nth} 张卡"
+                print(f"  {invoice_id} 使用卡 ****{card_last4}（{how}）填写并提交...")
                 pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id)
                 pending = {"invoice": invoice_id, "card": card, "last4": card_last4,
                            "amount": amount, "pay_url": pay_url,
@@ -2342,7 +2396,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
 
         except Exception as e:
             print(f"  处理 {invoice_id} 异常: {e}")
-            results.append({"invoice": invoice_id, "status": "failed", "error": str(e)})
+            _script_fail(invoice_id, str(e))
 
         # 处理完一个 invoice 后，回到 credits 页面重新查找
         print(f"  返回 Credits 页面查找剩余 Unpaid invoices...")
@@ -2370,6 +2424,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
 
             if paid_confirmed:
                 # 页面已是刷新后的 credits 页 → 此刻的 Credits 卡片即支付后的最新余额
+                done_ids.add(inv)
+                sticky_cards.pop(inv, None)
                 balance = read_credits_balance(driver)
                 bal_txt = f"${balance:.2f}" if balance is not None else "未读到"
                 print(f"  {inv} 支付成功（账单已变为 Paid，卡 ****{pending['last4']}，"
@@ -2390,14 +2446,30 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 card_fault = bool(pending.get("card_fault"))
                 print(f"  {inv} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}），"
                       f"原因: {fail_reason}（卡自身问题: {'是' if card_fault else '否'}）")
-                results.append({"invoice": inv, "status": "failed", "pay_url": pending["pay_url"],
-                                "card": pending["last4"], "error": fail_reason,
-                                "card_fault": card_fault})
+
+                # 先回调：card_fault=True 时调用方会把该卡标为无效，
+                # 下一轮 get_card 就自然跳过它、返回下一张卡。
                 if on_failed:
                     try:
                         on_failed(inv, pending["card"], fail_reason, card_fault)
                     except Exception as _e:
                         print(f"  on_failed 回调异常: {_e}")
+
+                if card_fault:
+                    # 卡的问题 → 换下一张卡重试同一张发票（不写 done_ids，下一轮会再次选中它）
+                    print(f"  {inv} 将改用下一张卡重试该发票"
+                          f"（已试 {card_tries.get(inv, 0)} 张卡）")
+                    results.append({"invoice": inv, "status": "failed", "pay_url": pending["pay_url"],
+                                    "card": pending["last4"], "error": fail_reason,
+                                    "card_fault": True, "retrying": True})
+                else:
+                    # 脚本侧失败 → 卡未判无效，下一轮复用同一张卡重开支付页；超上限才放弃该发票
+                    sticky_cards[inv] = pending["card"]
+                    _script_fail(inv, fail_reason, pay_url=pending["pay_url"],
+                                 card=pending["last4"], card_fault=False)
+
+    if round_num >= MAX_ROUNDS:
+        print(f"已达最大处理轮数 {MAX_ROUNDS}，停止（可能存在异常的重试循环）")
 
     return results
 
