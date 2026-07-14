@@ -301,6 +301,45 @@ def _wait_gone(locator, timeout=ELEMENT_TIMEOUT_MS):
         return False
 
 
+BROWSER_LANG = "en-US"
+BROWSER_ACCEPT_LANG = "en-US,en"
+
+
+def _write_profile_language(user_data_dir):
+    """把英文语言偏好写进 Chrome profile（Local State + Default/Preferences）。
+
+    macOS 上 --lang 不影响 UI 语言（Chrome 读系统 AppleLanguages），但页面语言由
+    profile 的 intl.accept_languages 决定，它同时驱动 Accept-Language 头与
+    navigator.languages —— 这正是 Cloudflare 页面选择语言的依据。
+    合并写入（保留已有键），任何异常都不阻断启动：语言只是锦上添花，不值得让浏览器起不来。
+    """
+    import json as _json
+
+    def _merge(path, patch):
+        data = {}
+        try:
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = _json.load(f) or {}
+        except Exception:
+            data = {}          # 读不动/坏了就当空的重建，别把启动搞挂
+        for section, values in patch.items():
+            node = data.setdefault(section, {})
+            if isinstance(node, dict):
+                node.update(values)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                _json.dump(data, f)
+        except Exception as e:
+            print(f"  ⚠️ 写入浏览器语言偏好失败(忽略): {str(e)[:80]}")
+
+    _merge(os.path.join(user_data_dir, 'Default', 'Preferences'),
+           {'intl': {'accept_languages': BROWSER_ACCEPT_LANG, 'selected_languages': BROWSER_ACCEPT_LANG}})
+    _merge(os.path.join(user_data_dir, 'Local State'),
+           {'intl': {'app_locale': BROWSER_LANG}})
+
+
 def create_driver(headless=False, profile_id=None):
     """
     创建带有反检测的 Chrome 浏览器会话（使用 Patchright）
@@ -332,16 +371,21 @@ def create_driver(headless=False, profile_id=None):
     download_dir = os.path.join(user_data_dir, 'downloads')
     os.makedirs(download_dir, exist_ok=True)
 
-    # 随机窗口尺寸（反检测）。
-    # 注意：不设 Playwright 的 locale 选项——它经 CDP Emulation.setLocaleOverride 生效，
+    # 浏览器语言强制英文（页面文案/选择器均按英文编写）。
+    # 走 Chrome 原生路径：--lang 开关 + profile 里的 intl.accept_languages，
+    # 二者都是真人浏览器的正常配置，navigator.languages 与 Accept-Language 天然一致。
+    # 绝不用 Playwright 的 locale 选项——它经 CDP Emulation.setLocaleOverride 生效，
     # 会被 Cloudflare 检测为受控浏览器，导致 Turnstile 报 "problem with verification"。
-    # 同理不加 --lang 等可能引入模拟指纹的参数。stealth 全交给 Patchright + channel=chrome。
+
+    # 随机窗口尺寸（反检测）
     w, h = random.choice(_WINDOW_SIZES)
 
     # 启动参数保持最小（与真人浏览器一致）
     launch_args = [
         "--no-first-run",
         "--no-default-browser-check",
+        f"--lang={BROWSER_LANG}",
+        f"--accept-lang={BROWSER_ACCEPT_LANG}",
         f"--window-size={w},{h}",
     ]
     if headless:
@@ -375,6 +419,7 @@ def create_driver(headless=False, profile_id=None):
     last_err = None
     for attempt in range(2):          # 启动失败重试一次（清理残留锁后再试），提升稳定性
         _clear_singleton_locks()
+        _write_profile_language(user_data_dir)   # 必须在 _clear 之后：它可能重置 Preferences
         try:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
@@ -1691,22 +1736,39 @@ _DECLINE_REASONS = {
 }
 
 
+# 这些 decline code 是临时/环境问题，不代表卡本身无效 → 不把卡标记为无效。
+# 注意 authentication_required（3DS）不在此列：本流程无法完成银行验证，
+# 需要 3DS 的卡在这里等同于不可用，按卡无效处理。
+_TRANSIENT_DECLINE_CODES = {
+    'processing_error',
+    'try_again_later',
+}
+
+
 def _extract_payment_error(driver):
-    """从捕获的支付响应或页面错误文案提取失败原因（返回中文说明，无则 None）。"""
+    """从捕获的支付响应或页面错误文案提取失败原因。
+
+    返回 (reason, card_fault)：reason 为中文说明（无则 None），
+    card_fault 表示失败是否归因于卡本身（拒付/卡号/CVC/过期等）——
+    只有 card_fault 才应把底料卡标记为无效；临时错误与脚本问题不标记。
+    """
     import json as _json
     for r in list(getattr(driver, 'net_responses', []) or []):
         data = r.get('data')
         txt = _json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data or '')
         m = re.search(r'"decline_code"\s*:\s*"([^"]+)"', txt)
         if m:
-            return _DECLINE_REASONS.get(m.group(1), f'拒付（{m.group(1)}）')
+            code = m.group(1)
+            return (_DECLINE_REASONS.get(code, f'拒付（{code}）'),
+                    code not in _TRANSIENT_DECLINE_CODES)
         m = re.search(r'"code"\s*:\s*"([a-z_]+)"', txt)
         if m and m.group(1) in _DECLINE_REASONS:
-            return _DECLINE_REASONS[m.group(1)]
+            code = m.group(1)
+            return _DECLINE_REASONS[code], code not in _TRANSIENT_DECLINE_CODES
         m = re.search(r'"message"\s*:\s*"([^"]+)"', txt)
         if m and any(k in m.group(1).lower() for k in
                      ['declin', 'insufficient', 'incorrect', 'invalid', 'expired', 'not support', 'fund']):
-            return m.group(1)[:120]
+            return m.group(1)[:120], True
     try:
         for sel in ['[role="alert"]', '.p-Notice-content', '.p-Notice', '.Error']:
             loc = driver.page.locator(sel)
@@ -1715,10 +1777,10 @@ def _extract_payment_error(driver):
                 t = (loc.nth(i).inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
                 if t and any(k in t.lower() for k in
                              ['declin', 'insufficient', 'incorrect', 'invalid', 'expired', 'not support', 'fund', 'wrong']):
-                    return t[:120]
+                    return t[:120], True
     except Exception:
         pass
-    return None
+    return None, False
 
 
 def _has_3ds_challenge(driver):
@@ -1955,6 +2017,7 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         # 明确结果（3DS / 成功 / 拒付原因）才收手，期间持续等待"处理中"状态。
         is_3ds = False
         reason = None
+        card_fault = False
         confirm_clicks = 0
         deadline = time.time() + 90
         while time.time() < deadline:
@@ -1980,7 +2043,7 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
                 print(f"  {invoice_id} 检测到支付成功信号")
                 return {"status": "paid", "responses": list(driver.net_responses)}
             # 3) 失败原因（响应 decline_code / 页面错误）
-            reason = _extract_payment_error(driver)
+            reason, card_fault = _extract_payment_error(driver)
             if reason:
                 break
             # 4) 页面成功文案
@@ -1996,19 +2059,24 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         if collected:
             print(f"  {invoice_id} 收到 {len(collected)} 条支付响应")
         if is_3ds:
-            print(f"  {invoice_id} 出现 3DS 银行验证，取消并判为失败")
+            # 3DS 银行验证无法自动完成，这张卡在本流程里就是不可用的 → 按卡无效处理
+            print(f"  {invoice_id} 出现 3DS 银行验证，取消并判为失败（卡标记无效）")
             _cancel_3ds_challenge(driver)
-            return {"status": "failed", "error": "需要 3DS 银行验证（已取消）", "responses": collected}
+            return {"status": "failed", "error": "需要 3DS 银行验证（已取消）",
+                    "card_fault": True, "responses": collected}
         if reason:
-            print(f"  {invoice_id} 支付失败，原因: {reason}")
-            return {"status": "failed", "error": reason, "responses": collected}
+            print(f"  {invoice_id} 支付失败，原因: {reason}（卡自身问题: {'是' if card_fault else '否'}）")
+            return {"status": "failed", "error": reason,
+                    "card_fault": card_fault, "responses": collected}
         # 未见明确成功/失败信号 → 交由上层按账单状态权威判定
         print(f"  {invoice_id} 未捕获明确成功/失败信号，交由账单状态判定")
-        return {"status": "uncertain", "error": "支付结果未确认", "responses": collected}
+        return {"status": "uncertain", "error": "支付结果未确认",
+                "card_fault": False, "responses": collected}
 
     except Exception as e:
+        # 填表/定位异常属于脚本侧失败，与卡是否有效无关 → 不标记卡
         print(f"  {invoice_id} Stripe 支付填写失败: {e}")
-        return {"status": "failed", "error": f"Stripe 支付填写失败: {e}"}
+        return {"status": "failed", "error": f"Stripe 支付填写失败: {e}", "card_fault": False}
 
 
 def _invoice_still_unpaid(driver, invoice_id):
@@ -2058,8 +2126,10 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                   由调用方在 get_card 内实现。为 None 时仅打开支付页展开 Card 表单（不支付）。
         on_paid: 每笔支付成功后的回调 on_paid(invoice_id, card, responses, amount)，
                  由调用方负责记账（recharge_log / valid_cards / card_pool 状态）。
-        on_failed: 每笔支付失败后的回调 on_failed(invoice_id, card, reason)，
-                   由调用方标记该卡失败并记录原因（余额不足 / 卡号错 / 3DS 等）。
+        on_failed: 每笔支付失败后的回调 on_failed(invoice_id, card, reason, card_fault)，
+                   由调用方记录失败原因。card_fault=True 表示失败归因于卡本身
+                   （拒付 / 卡号错 / 已过期 / 需要 3DS），调用方应把该卡标记为无效；
+                   False 表示脚本侧失败（页面超时、元素定位失败、结果未确认），不应动卡状态。
         account_id: Cloudflare 账号 ID，用于拼出 credits 页面 URL（返回时整页刷新）。
     返回:
         list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, balance?, error?}, ...]
@@ -2231,6 +2301,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                            "amount": amount, "pay_url": pay_url,
                            "responses": pay_result.get('responses'),
                            "error": pay_result.get('error'),
+                           "card_fault": pay_result.get('card_fault', False),
                            "fill_status": pay_result.get('status')}
             else:
                 results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
@@ -2280,12 +2351,17 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                         print(f"  on_paid 回调异常: {_e}")
             else:
                 fail_reason = pending.get("error") or "支付未生效（账单仍为 Unpaid）"
-                print(f"  {inv} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}），原因: {fail_reason}")
+                # card_fault：失败是否归因于卡本身（拒付/过期/3DS）。脚本侧失败
+                # （页面超时、元素定位失败、结果未确认）为 False，不应把卡判为无效。
+                card_fault = bool(pending.get("card_fault"))
+                print(f"  {inv} 支付未生效（账单仍为 Unpaid，卡 ****{pending['last4']}），"
+                      f"原因: {fail_reason}（卡自身问题: {'是' if card_fault else '否'}）")
                 results.append({"invoice": inv, "status": "failed", "pay_url": pending["pay_url"],
-                                "card": pending["last4"], "error": fail_reason})
+                                "card": pending["last4"], "error": fail_reason,
+                                "card_fault": card_fault})
                 if on_failed:
                     try:
-                        on_failed(inv, pending["card"], fail_reason)
+                        on_failed(inv, pending["card"], fail_reason, card_fault)
                     except Exception as _e:
                         print(f"  on_failed 回调异常: {_e}")
 

@@ -100,12 +100,16 @@
           <tr v-for="card in poolCards" :key="card.id">
             <td>{{ card.id }}</td>
             <td style="font-family:monospace">{{ card.card_number }}</td>
-            <td>{{ card.expiry_month }}/{{ card.expiry_year }}</td>
+            <td :class="{ 'expired-cell': card.status === 'expired' }">
+              {{ card.expiry_month }}/{{ card.expiry_year }}
+            </td>
             <td>{{ card.cvc }}</td>
             <td>{{ card.first_name }} {{ card.last_name }}</td>
             <td>{{ card.country }}</td>
             <td>
-              <span v-if="card.is_valid" class="status-tag success">有效</span>
+              <span v-if="card.status === 'expired'" class="status-tag fail">已过期</span>
+              <span v-else-if="card.status === 'invalid'" class="status-tag fail">无效</span>
+              <span v-else-if="card.is_valid" class="status-tag success">有效</span>
               <span v-else class="status-tag">待验证</span>
             </td>
             <td>
@@ -325,6 +329,7 @@ async function handleUpload() {
       const detail = Object.entries(grouped).map(([name, cnt]) => `「${name}」${cnt}张`).join('、')
       html += `<br><span style="color:#dc2626">${data.conflicts.length} 张卡已在其他分组中（${detail}），已跳过</span>`
     }
+    if (data.expired > 0) html += `<br><span style="color:#dc2626">${data.expired} 张卡有效期已过期，已标记为无效（不参与任务）</span>`
     if (data.errors?.length) html += `<br><span style="color:orange">${data.errors.length} 条数据有问题被跳过</span>`
     uploadMsg.value = html
     await loadGroups()
@@ -456,4 +461,5 @@ onMounted(() => {
 .stat-card.small { padding: 10px 14px; }
 .stat-card.small .stat-label { font-size: 11px; }
 .stat-card.small .stat-value { font-size: 18px; }
+.expired-cell { color: #991b1b; text-decoration: line-through; }
 </style>

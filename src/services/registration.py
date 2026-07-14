@@ -6,7 +6,7 @@ import time
 import random
 
 from src.config import cfg
-from src.utils import generate_random_password
+from src.utils import generate_random_password, filter_expired_cards
 from src.services.email import create_temp_email, wait_for_verification_email
 from src.browser.driver import (
     create_driver,
@@ -104,8 +104,12 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
             account_model.update_status(email, "billing_page")
             _report("billing_page")
 
-            # 添加信用卡
-            available_cards = [c for c in (card_info_list or []) if c.get('number')]
+            # 添加信用卡（过期/已判无效的卡不再尝试绑定，避免无谓的失败尝试）
+            available_cards, _skipped = filter_expired_cards(
+                [c for c in (card_info_list or []) if c.get('number')]
+            )
+            if _skipped:
+                print(f"已跳过 {len(_skipped)} 张无效/过期卡")
             if available_cards:
                 print("\n" + "-" * 30)
                 print("开始绑定信用卡")
@@ -325,19 +329,27 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         # 选卡：未满 20 且有新卡 → 优先用新卡凑数；已满 20 或无新卡可提供 → 复用该账号
         # 已支付过、且在当前分组内的卡（轮换、避免连续同一张）。每笔支付成功后记账。
         CARD_CAP = 20
-        _all_cards = payment_cards or []
+        # 先剔除过期卡（有效期已过），并把它们在底料池里标记为 expired。
+        # 上层通常已过滤过一遍，这里是最后一道闸：无论谁调用都不会拿过期卡去支付。
+        _all_cards, _expired_cards = filter_expired_cards(payment_cards or [], card_pool_model)
+        if _expired_cards:
+            print(f"  已跳过 {len(_expired_cards)} 张过期卡（已标记为无效）")
+        _invalid_numbers = set()      # 本次任务内被判定为无效的卡（拒付/3DS）
         _paid_numbers = set(recharge_log_model.get_success_card_numbers(email)) if recharge_log_model else set()
         _new_cards = [c for c in _all_cards if c.get('number') not in _paid_numbers]
         _sel = {'new_idx': 0, 'reuse_idx': 0, 'last': None}
 
         def _get_card():
             # 1) 未满 20 且有新卡 → 用新卡（成功后成为一张新的 distinct 卡）
-            if len(_paid_numbers) < CARD_CAP and _sel['new_idx'] < len(_new_cards):
+            while len(_paid_numbers) < CARD_CAP and _sel['new_idx'] < len(_new_cards):
                 c = _new_cards[_sel['new_idx']]
                 _sel['new_idx'] += 1
-                return c
+                if c.get('number') not in _invalid_numbers:
+                    return c
             # 2) 已满 20 或无新卡 → 复用该账号已支付过、且在当前分组内的卡（轮换、避开连续同卡）
-            reuse_pool = [c for c in _all_cards if c.get('number') in _paid_numbers]
+            reuse_pool = [c for c in _all_cards
+                          if c.get('number') in _paid_numbers
+                          and c.get('number') not in _invalid_numbers]
             if not reuse_pool:
                 return None
             n = len(reuse_pool)
@@ -374,12 +386,18 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}"
                   f"（该账号累计 {len(_paid_numbers)} 张成功卡）{bal_txt}")
 
-        def _on_invoice_failed(invoice_id, card, reason):
-            """每笔发票支付失败后：标记该底料卡为失败 + 记录失败原因（便于排查）"""
+        def _on_invoice_failed(invoice_id, card, reason, card_fault=False):
+            """每笔发票支付失败后：记录失败原因；仅当失败归因于卡本身时才把底料卡标为无效。
+
+            card_fault=True（拒付 / 卡过期 / 需要 3DS）→ 卡不可用，标记 invalid 并不再选用；
+            card_fault=False（页面超时、元素定位失败、结果未确认等脚本侧问题）→ 不动卡状态，
+            否则一次脚本抖动就会误杀一张好卡。
+            """
             num = card.get('number', '')
-            if card_pool_model:
+            if card_fault and card_pool_model:
                 try:
-                    card_pool_model.mark_status_by_number(num, 'failed')
+                    card_pool_model.mark_invalid_by_number(num)
+                    _invalid_numbers.add(num)     # 本次任务内后续选卡也立即跳过
                 except Exception:
                     pass
             if recharge_log_model:
@@ -388,7 +406,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     recharge_log_model.mark_failed(lid, error=f"invoice {invoice_id}: {reason}"[:200])
                 except Exception:
                     pass
-            print(f"  已记失败: invoice {invoice_id} 卡 ****{str(num)[-4:]} 原因: {reason}")
+            mark_txt = "，已标记为无效卡" if card_fault else "，卡状态不变（脚本侧失败）"
+            print(f"  已记失败: invoice {invoice_id} 卡 ****{str(num)[-4:]} 原因: {reason}{mark_txt}")
 
         def _record_final_balance():
             """流程收尾：重新加载 credits 页面，读一次最终余额并落库（读不到不影响主流程）"""

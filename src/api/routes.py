@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request, send_from_directory, send_file
 from src.config import cfg, get_data_dir
 from src.services import card as card_service
 from src.services import registration
+from src.utils import is_card_expired
 
 api = Blueprint('api', __name__)
 
@@ -477,9 +478,12 @@ def recharge_account():
     skip_invoice = not payment_group_id
     payment_cards = []
     if payment_group_id:
-        payment_cards = models['card_pool'].get_cards_as_list(payment_group_id)
+        # 只取可用卡：过期卡在此被标记为无效并剔除，不用于账单支付
+        payment_cards, unusable = models['card_pool'].get_usable_cards_as_list(payment_group_id)
+        if unusable:
+            state.add_log(f"支付卡分组已跳过 {len(unusable)} 张无效卡（过期/被拒）")
         if not payment_cards:
-            state.add_log(f"支付卡分组无卡片数据，将仅执行 Top-up Credits")
+            state.add_log(f"支付卡分组无可用卡片数据，将仅执行 Top-up Credits")
             skip_invoice = True
 
     # 获取该账号绑定的卡片列表，后续根据页面实际使用的卡片后四位匹配完整卡号
@@ -825,6 +829,9 @@ def get_card_pool(group_id):
     models = get_models()
     page = int(request.args.get('page', 1))
     page_size = int(request.args.get('page_size', 20))
+
+    # 先按当前日期刷新过期状态，列表里直接能看到哪些卡已过期
+    models['card_pool'].refresh_expired_status(group_id)
     cards, total = models['card_pool'].get_by_group(group_id, page=page, page_size=page_size)
 
     # 标记有效卡
@@ -860,10 +867,14 @@ def upload_card_pool(group_id):
 
     added, skipped, conflicts = models['card_pool'].add_cards(group_id, cards)
 
+    # 上传时即按有效期判定，过期卡会入库但标记为 expired（不参与任务），这里回传数量供前端提示
+    expired = sum(1 for c in cards if is_card_expired(c.get('expiry_month'), c.get('expiry_year')))
+
     return jsonify({
         "added": added,
         "skipped": skipped,
         "conflicts": conflicts,
+        "expired": expired,
         "total_parsed": len(cards),
         "errors": errors,
     })
@@ -919,9 +930,14 @@ def start_card_task_from_group():
     if not group:
         return jsonify({"error": "分组不存在"}), 404
 
-    cards = models['card_pool'].get_cards_as_list(group_id)
+    # 只取可用卡：过期卡在此被标记为无效并剔除，不进入任务
+    cards, unusable = models['card_pool'].get_usable_cards_as_list(group_id)
     if not cards:
+        if unusable:
+            return jsonify({"error": f"该分组 {len(unusable)} 张卡均已无效（过期/被拒），无可用卡"}), 400
         return jsonify({"error": "该分组没有卡片数据"}), 400
+    if unusable:
+        state.add_log(f"已跳过 {len(unusable)} 张无效卡（过期/被拒）")
 
     cf_password = data.get('cf_password')
     max_bindable_cards = data.get('max_bindable_cards', 2)
@@ -935,4 +951,5 @@ def start_card_task_from_group():
         daemon=True,
     ).start()
 
-    return jsonify({"status": "started", "total_cards": len(cards), "group_name": group['name']})
+    return jsonify({"status": "started", "total_cards": len(cards),
+                    "skipped_invalid": len(unusable), "group_name": group['name']})
