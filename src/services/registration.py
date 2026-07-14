@@ -346,7 +346,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 time.sleep(2)
 
                 # 直接在当前 credits 页面处理 Unpaid invoices
-                invoice_results = handle_unpaid_invoices(driver)
+                invoice_results = handle_unpaid_invoices(driver, payment_cards=payment_cards)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
@@ -374,7 +374,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 dismiss_overdue_dialog(driver)
                 time.sleep(3)
 
-                invoice_results = handle_unpaid_invoices(driver)
+                invoice_results = handle_unpaid_invoices(driver, payment_cards=payment_cards)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)

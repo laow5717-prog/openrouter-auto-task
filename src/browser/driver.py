@@ -1605,6 +1605,25 @@ def _extract_pdf_pay_url(pdf_path):
     return None
 
 
+_COUNTRY_NAME_TO_CODE = {
+    'united states': 'US', 'united states of america': 'US', 'usa': 'US', 'us': 'US',
+    'united kingdom': 'GB', 'uk': 'GB', 'great britain': 'GB',
+    'canada': 'CA', 'australia': 'AU', 'germany': 'DE', 'france': 'FR',
+    'singapore': 'SG', 'japan': 'JP', 'hong kong': 'HK', 'netherlands': 'NL',
+}
+
+
+def _normalize_country_code(val):
+    """把国家值规范化为 2 字母代码（Stripe 下拉 option value 用代码）。
+    卡库里可能存全称（如 "UNITED STATES"）。"""
+    v = (val or '').strip()
+    if not v:
+        return 'US'
+    if len(v) == 2:
+        return v.upper()
+    return _COUNTRY_NAME_TO_CODE.get(v.lower(), v.upper())
+
+
 def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
     """
     在 Stripe 支付页面的 iframe 内填写信用卡信息并点击 Pay
@@ -1620,12 +1639,21 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         # 定位 Stripe Payment Element iframe（frame_locator 无状态，无需手工切帧）
         stripe_frame = driver.page.frame_locator("div#payment-element iframe")
 
+        # 等待 Card 表单渲染完成（accordion 展开后字段需要一点时间挂载）；
+        # 用 wait_for_timeout 同时驱动 Playwright 事件循环
+        driver.page.wait_for_timeout(2000)
+
         # 等待卡号输入框出现并填写
         # 跨域 Stripe 字段：用 press_sequentially 模拟真实输入，触发 Stripe
         # 的格式化/校验事件（fill 直接赋值可能不触发，且卡号会被重新格式化）
         number_input = stripe_frame.locator("input#payment-numberInput")
-        if not _wait_visible(number_input, timeout=120_000):
-            raise RuntimeError("未找到 Stripe 卡号输入框")
+        # Stripe 输入框有时不满足 Playwright 严格 visible 判定，故 visible 失败后
+        # 回退到 attached（存在即尝试交互，后续 click 会自动等待可交互）
+        if not _wait_visible(number_input, timeout=60_000):
+            try:
+                number_input.wait_for(state="attached", timeout=10_000)
+            except Exception:
+                raise RuntimeError("未找到 Stripe 卡号输入框")
         print(f"  {invoice_id} 已定位 Stripe iframe")
         number_input.click()
         time.sleep(0.3)
@@ -1653,13 +1681,20 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         print(f"  {invoice_id} 已输入 CVC")
         time.sleep(0.5)
 
-        # 选择国家
-        country_code = card_info.get('country', 'US')
-        if country_code:
+        # 选择国家：卡库可能存全称（"UNITED STATES"），Stripe 下拉用代码（"US"）。
+        # 先按代码选，失败再按 label（全称），仍失败则跳过（不致命，避免整笔支付失败）。
+        country_raw = str(card_info.get('country', '') or 'US').strip()
+        country_code = _normalize_country_code(country_raw)
+        try:
             country_select = stripe_frame.locator("select#payment-countryInput")
-            country_select.select_option(value=country_code)
+            try:
+                country_select.select_option(value=country_code, timeout=SHORT_TIMEOUT_MS)
+            except Exception:
+                country_select.select_option(label=country_raw.title(), timeout=SHORT_TIMEOUT_MS)
             print(f"  {invoice_id} 已选择国家: {country_code}")
             time.sleep(0.5)
+        except Exception as e:
+            print(f"  {invoice_id} 国家选择失败(继续): {str(e)[:60]}")
 
         # 填写 ZIP code
         zip_code = card_info.get('zip', '')
@@ -1703,16 +1738,21 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         return {"status": "failed", "error": f"Stripe 支付填写失败: {e}"}
 
 
-def handle_unpaid_invoices(driver):
+def handle_unpaid_invoices(driver, payment_cards=None, max_invoices=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
-    打开 Stripe 支付页面并展开 Card 表单。
-    每处理完一个 invoice 后刷新 credits 页面重新查找。
+    打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找。
 
     参数:
         driver: 浏览器驱动
+        payment_cards: 支付卡列表（dict: number/expiry_month/expiry_year/cvc/country/zip...）。
+                       提供时对每个 invoice 用一张卡填写并提交支付（卡按顺序轮换）；
+                       为空时仅打开支付页并展开 Card 表单（不支付）。
+        max_invoices: 单次最多处理的 invoice 数（安全阀，防止一次性产生过多扣款）；
+                      None 表示不限制。
     返回:
-        list: 处理结果列表 [{invoice, status, pay_url, error}, ...]
+        list: 处理结果列表 [{invoice, status, pay_url, card?, error?}, ...]
+              status: paid（已提交支付）/ opened（仅打开未支付）/ failed
     """
     results = []
     download_dir = getattr(driver, '_download_dir', None)
@@ -1720,11 +1760,33 @@ def handle_unpaid_invoices(driver):
         print("未配置下载目录，跳过 Unpaid invoice 处理")
         return results
 
+    payment_cards = payment_cards or []
+
+    # 记录 credits 页面 URL：每轮用直接导航返回（比 go_back 稳定，避免后续 invoice
+    # 因页面历史状态错乱导致下载按钮点击超时）
+    credits_url = driver.current_url if 'credits' in (driver.current_url or '') else None
+
+    def _return_to_credits():
+        if credits_url:
+            driver.get(credits_url)
+            time.sleep(3)
+        else:
+            driver.page.go_back(wait_until="domcontentloaded")
+            time.sleep(3)
+            if 'credits' not in driver.current_url:
+                driver.page.go_back(wait_until="domcontentloaded")
+                time.sleep(3)
+
     processed_ids = set()
     round_num = 0
 
     while True:
         round_num += 1
+        # 安全阀：达到本次处理上限则停止
+        if max_invoices is not None and len(processed_ids) >= max_invoices:
+            print(f"已达单次处理上限 {max_invoices} 个 invoice，停止")
+            break
+
         # 等待表格加载
         time.sleep(3)
 
@@ -1763,14 +1825,32 @@ def handle_unpaid_invoices(driver):
             # 点击下载并通过 Playwright 下载事件保存 PDF 到下载目录
             safe_iid = re.sub(r'[^\w.\-]', '_', invoice_id)
             pdf_path = os.path.join(download_dir, f"invoice_{safe_iid}.pdf")
+            # 下载链接常在视口外/被遮挡导致 click actionability 超时：先滚动进视口并等可见，
+            # 再点击；普通点击失败则用 force 兜底（绕过 actionability 检查）。
             try:
-                with driver.page.expect_download(timeout=30_000) as download_info:
-                    invoice_link.click(timeout=CLICK_TIMEOUT_MS)
-                download_info.value.save_as(pdf_path)
-                print(f"  PDF 已下载: {os.path.basename(pdf_path)}")
-            except Exception as e:
-                print(f"  {invoice_id} PDF 下载超时: {e}")
+                invoice_link.scroll_into_view_if_needed(timeout=SHORT_TIMEOUT_MS)
+            except Exception:
+                pass
+            _wait_visible(invoice_link, timeout=SHORT_TIMEOUT_MS)
+            # 下载按钮是无 href 的 <a role=button>，由 React onClick 触发下载。
+            # 依次尝试：普通点击 → JS 直接 click（绕过坐标 actionability，直接触发 onClick）→ force。
+            downloaded = False
+            for _method in ('normal', 'js', 'force'):
+                try:
+                    with driver.page.expect_download(timeout=30_000) as download_info:
+                        if _method == 'js':
+                            invoice_link.evaluate("el => el.click()")
+                        else:
+                            invoice_link.click(timeout=CLICK_TIMEOUT_MS, force=(_method == 'force'))
+                    download_info.value.save_as(pdf_path)
+                    print(f"  PDF 已下载: {os.path.basename(pdf_path)} (方式={_method})")
+                    downloaded = True
+                    break
+                except Exception as e:
+                    print(f"  {invoice_id} PDF 下载失败(方式={_method}): {str(e)[:90]}")
+            if not downloaded:
                 results.append({"invoice": invoice_id, "status": "failed", "error": "PDF 下载超时"})
+                _return_to_credits()
                 continue
 
             # 从 PDF 提取支付链接
@@ -1778,6 +1858,7 @@ def handle_unpaid_invoices(driver):
             if not pay_url:
                 print(f"  {invoice_id} 未找到 Pay online 链接")
                 results.append({"invoice": invoice_id, "status": "failed", "error": "未找到支付链接"})
+                _return_to_credits()
                 continue
 
             print(f"  找到支付链接: {pay_url}")
@@ -1793,9 +1874,7 @@ def handle_unpaid_invoices(driver):
             if not _wait_visible(pay_btn, timeout=120_000):
                 print(f"  {invoice_id} 支付页面加载超时")
                 results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
-                # 回到 credits 页面继续处理下一个
-                driver.page.go_back(wait_until="domcontentloaded")
-                time.sleep(3)
+                _return_to_credits()
                 continue
             print(f"  {invoice_id} 支付页面已加载完成")
 
@@ -1810,13 +1889,24 @@ def handle_unpaid_invoices(driver):
             except Exception as e:
                 print(f"  {invoice_id} 点击 Card 选项失败: {e}")
                 results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": f"点击 Card 选项失败: {e}"})
-                # 回到 credits 页面继续
-                driver.page.go_back(wait_until="domcontentloaded")
-                time.sleep(3)
+                _return_to_credits()
                 continue
 
-            # Card 表单已展开，信用卡数据填写由后续流程处理
-            results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
+            # 有支付卡则填卡并提交支付；否则仅打开表单（保留原行为）
+            if payment_cards:
+                card = payment_cards[(len(processed_ids) - 1) % len(payment_cards)]
+                card_last4 = str(card.get('number', ''))[-4:]
+                print(f"  {invoice_id} 使用卡 ****{card_last4} 填写并支付...")
+                pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id)
+                if pay_result.get('status') == 'paid':
+                    results.append({"invoice": invoice_id, "status": "paid", "pay_url": pay_url,
+                                    "card": card_last4, "responses": pay_result.get('responses')})
+                    print(f"  {invoice_id} 支付已提交（卡 ****{card_last4}）")
+                else:
+                    results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url,
+                                    "card": card_last4, "error": pay_result.get('error', '支付失败')})
+            else:
+                results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
 
         except Exception as e:
             print(f"  处理 {invoice_id} 异常: {e}")
@@ -1824,12 +1914,7 @@ def handle_unpaid_invoices(driver):
 
         # 处理完一个 invoice 后，回到 credits 页面重新查找
         print(f"  返回 Credits 页面查找剩余 Unpaid invoices...")
-        driver.page.go_back(wait_until="domcontentloaded")
-        time.sleep(3)
-        # 可能需要多次 back（从 Stripe 页面回到 credits）
-        if 'credits' not in driver.current_url:
-            driver.page.go_back(wait_until="domcontentloaded")
-            time.sleep(3)
+        _return_to_credits()
 
     return results
 
