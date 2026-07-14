@@ -14,6 +14,11 @@ release/
 .wdm/
 .DS_Store
 data/cloudflare_auto.db
+data/cloudflare_auto.db-shm
+data/cloudflare_auto.db-wal
+data/profiles/
 data/uploads/
 registered_accounts.txt.migrated
 *.xlsx
+*.iml
+=*

@@ -1,6 +1,6 @@
 """
 浏览器自动化模块
-使用 Patchright（Playwright 反检测 fork）实现 Cloudflare 注册、
+使用 undetected-chromedriver 实现 Cloudflare 注册、
 账单页面导航及信用卡添加流程
 """
 
@@ -11,8 +11,15 @@ import random
 import logging
 import tempfile
 import shutil
-import threading
-from patchright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+
+# 抑制 urllib3 连接池警告（undetected-chromedriver 高频操作时触发）
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 
 from src.config import cfg
 import src.services.captcha as captcha_solver
@@ -55,255 +62,9 @@ _LANGUAGES = [
 ]
 
 
-# ======================================================================
-# Patchright 迁移基础设施（阶段 0）
-# ----------------------------------------------------------------------
-# 稳定性优先：超时偏保守（偏长），所有交互经 _safe_* 封装（超时+重试+
-# 诊断日志），Playwright 对象严格限定在创建它的工作线程内使用。
-# ======================================================================
-
-# 超时常量（毫秒）。Playwright 超时单位是 ms；现有 cfg 是秒。
-DEFAULT_TIMEOUT_MS = 30_000          # 全局默认（比 MAX_WAIT_TIME=20s 略长，容忍慢网络）
-NAV_TIMEOUT_MS = 60_000              # 页面导航（偏长，Cloudflare/Stripe 页面重）
-ELEMENT_TIMEOUT_MS = MAX_WAIT_TIME * 1000     # 元素可见/可交互等待 = 20s
-SHORT_TIMEOUT_MS = SHORT_WAIT_TIME * 1000     # 短等待 = 5s
-CLICK_TIMEOUT_MS = 15_000
-FILL_TIMEOUT_MS = 15_000
-
-# 支付/卡错误 console 日志匹配（复刻原 console 拦截器正则，L158-164）
-_CARD_ERROR_PATTERNS = [
-    re.compile(r'setup.intent.error', re.I),
-    re.compile(r'form.error.handler', re.I),
-    re.compile(r'payment.intent.failed', re.I),
-    re.compile(r'failed.to.save.payment', re.I),
-    re.compile(r'card.*(incorrect|invalid|declined|expired|failed)', re.I),
-    re.compile(r'security.code.*(incorrect|invalid)', re.I),
-    re.compile(r'cvc.*(incorrect|invalid|incomplete)', re.I),
-]
-
-
-class BrowserSession:
-    """
-    Patchright 浏览器会话封装。承载 (playwright, context, page)，
-    对内供 50 个 driver 函数通过 .page/.context 访问 Playwright 原生对象，
-    对外暴露调用层依赖的最小契约：get / get_screenshot_as_png / title / quit。
-
-    线程红线（稳定性基石）：所有 Playwright 对象（context/page/CDPSession）
-    只能在创建本会话的工作线程内调用。唯一的例外是 get_screenshot_as_png()，
-    它只读 _last_png 缓存、绝不触碰 self.page，因此可被独立截图线程安全调用。
-    """
-
-    def __init__(self, playwright, context, page, temp_profile=None, download_dir=None):
-        self.playwright = playwright        # sync_playwright().start() 句柄
-        self.context = context              # 持久化 BrowserContext
-        self.page = page                    # 主 Page
-        self._temp_profile = temp_profile   # 临时 profile 目录；持久化时为 None
-        self._download_dir = download_dir
-        self.console_errors = []            # page.on("console") 收集（替代 __cfAutoErrors）
-        self.net_responses = []             # page.on("response") 收集（替代 __netInterceptResponses）
-        self._net_patterns = []             # 网络拦截关键词模式（子列表内 AND，列表间 OR）
-        self._last_png = None               # 最近一帧截图缓存（业务线程写、截图线程读）
-        self._png_lock = threading.Lock()
-        self._cdp_session = None            # 惰性创建的 CDPSession（缓存）
-        self._closed = False
-        self.account_banned = False         # 登录时检测到账号被 Cloudflare 封禁则置 True
-
-    # ---- 事件监听（在 create_driver 中挂载，均在业务线程回调） ----
-    def _on_console(self, msg):
-        try:
-            text = msg.text or ''
-        except Exception:
-            return
-        for pat in _CARD_ERROR_PATTERNS:
-            if pat.search(text):
-                self.console_errors.append(text[:300])
-                break
-
-    def _on_response(self, response):
-        try:
-            url = response.url or ''
-        except Exception:
-            return
-        if not self._net_patterns or not _match_net_url(url, self._net_patterns):
-            return
-        # 读响应体（sync 回调内允许；失败不影响主流程）
-        try:
-            data = response.json()
-        except Exception:
-            try:
-                data = response.text()
-            except Exception:
-                data = None
-        try:
-            status = response.status
-        except Exception:
-            status = 0
-        self.net_responses.append({'url': url, 'status': status, 'data': data, 'ts': time.time()})
-
-    # ---- 业务线程内部工具（禁止跨线程） ----
-    def capture_frame(self):
-        """截取当前页面一帧并写入缓存。仅业务线程调用。"""
-        try:
-            png = self.page.screenshot()
-        except Exception:
-            return
-        with self._png_lock:
-            self._last_png = png
-
-    def _cdp(self):
-        """惰性创建并缓存 CDPSession（用于 closed shadow DOM 穿透等原生 API 无法覆盖处）。"""
-        if self._cdp_session is None:
-            self._cdp_session = self.context.new_cdp_session(self.page)
-        return self._cdp_session
-
-    @property
-    def current_url(self):
-        return self.page.url
-
-    # ---- 调用层外部契约 ----
-    def get(self, url):
-        """等价 Selenium driver.get：导航并刷新截图缓存。"""
-        _safe_goto(self, url)
-        self.capture_frame()
-
-    def get_screenshot_as_png(self):
-        """截图线程调用：只读缓存，绝不触碰 self.page（跨线程安全）。首帧未就绪返回 None。"""
-        with self._png_lock:
-            return self._last_png
-
-    @property
-    def title(self):
-        return self.page.title()
-
-    def quit(self):
-        """幂等关闭：关 context + 停 playwright + 清理临时 profile。"""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self.context.close()
-        except Exception:
-            pass
-        try:
-            self.playwright.stop()
-        except Exception:
-            pass
-        if self._temp_profile and os.path.exists(self._temp_profile):
-            try:
-                shutil.rmtree(self._temp_profile, ignore_errors=True)
-                print(f"  🧹 已清理临时 profile: ...{os.path.basename(self._temp_profile)}")
-            except Exception:
-                pass
-
-
-def _match_net_url(url, patterns):
-    """复刻原 matchUrl：patterns 为关键词子列表的列表，url 含某个子列表的全部关键词即匹配。"""
-    for keywords in patterns:
-        if all(kw in url for kw in keywords):
-            return True
-    return False
-
-
-# ======================================================================
-# 稳健操作封装（稳定性优先）：统一超时 + 有界重试 + 诊断日志 + 失败截图。
-# 所有 50 个 driver 函数的交互一律走这些封装，不裸调 locator。
-# ======================================================================
-
-def _diag(session, desc, extra=''):
-    """打印诊断上下文（经 _hooked_print 进 Web 日志）。"""
-    try:
-        url = session.current_url if session else '?'
-    except Exception:
-        url = '?'
-    print(f"    ⚠️ {desc} 失败 [{extra}] @ {url}")
-
-
-def _safe_goto(session, url, retries=2, timeout=NAV_TIMEOUT_MS):
-    """导航，失败重试。"""
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            session.page.goto(url, wait_until='domcontentloaded', timeout=timeout)
-            return True
-        except PWTimeoutError as e:
-            last_err = e
-            _diag(session, '导航', f'goto {url} 尝试{attempt + 1}/{retries + 1}')
-        except Exception as e:
-            last_err = e
-            _diag(session, '导航', f'{type(e).__name__} 尝试{attempt + 1}/{retries + 1}')
-        time.sleep(1)
-    if last_err:
-        raise last_err
-    return False
-
-
-def _safe_click(locator, session=None, timeout=CLICK_TIMEOUT_MS, retries=2, desc='元素'):
-    """等待可交互后点击，失败重试。locator 为 Playwright Locator。"""
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            locator.click(timeout=timeout)
-            return True
-        except PWTimeoutError as e:
-            last_err = e
-            _diag(session, f'点击[{desc}]', f'尝试{attempt + 1}/{retries + 1}')
-        except Exception as e:
-            last_err = e
-            _diag(session, f'点击[{desc}]', f'{type(e).__name__} 尝试{attempt + 1}/{retries + 1}')
-        if session:
-            session.capture_frame()
-        time.sleep(0.5)
-    if last_err:
-        raise last_err
-    return False
-
-
-def _safe_fill(locator, value, session=None, timeout=FILL_TIMEOUT_MS, retries=2,
-               verify=True, desc='字段'):
-    """填充输入框，可选回读校验（Stripe 字段尤其需要），不一致则重填。"""
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            locator.fill('', timeout=timeout)      # 先清空
-            locator.fill(str(value), timeout=timeout)
-            if verify:
-                actual = locator.input_value(timeout=SHORT_TIMEOUT_MS)
-                if actual != str(value):
-                    raise ValueError(f'回读不一致 expected={value!r} actual={actual!r}')
-            return True
-        except PWTimeoutError as e:
-            last_err = e
-            _diag(session, f'填充[{desc}]', f'尝试{attempt + 1}/{retries + 1}')
-        except Exception as e:
-            last_err = e
-            _diag(session, f'填充[{desc}]', f'{type(e).__name__} 尝试{attempt + 1}/{retries + 1}')
-        time.sleep(0.3)
-    if last_err:
-        raise last_err
-    return False
-
-
-def _wait_visible(locator, timeout=ELEMENT_TIMEOUT_MS):
-    """等待元素可见；返回 True/False（不抛）。"""
-    try:
-        locator.wait_for(state='visible', timeout=timeout)
-        return True
-    except Exception:
-        return False
-
-
-def _wait_gone(locator, timeout=ELEMENT_TIMEOUT_MS):
-    """等待元素消失/隐藏；返回 True/False（不抛）。"""
-    try:
-        locator.wait_for(state='hidden', timeout=timeout)
-        return True
-    except Exception:
-        return False
-
-
 def create_driver(headless=False, profile_id=None):
     """
-    创建带有反检测的 Chrome 浏览器会话（使用 Patchright）
+    创建带有反检测的 Chrome 浏览器驱动（使用 undetected-chromedriver）
 
     参数:
         headless: 是否使用无头模式
@@ -313,6 +74,15 @@ def create_driver(headless=False, profile_id=None):
         浏览器驱动实例
     """
     print(f"🌐 正在初始化浏览器 (Headless: {headless})...")
+
+    options = uc.ChromeOptions()
+
+    # 最小化启动，不抢占用户焦点；需要干预时点 Dock 图标即可还原
+    options.add_argument("--start-minimized")
+
+    if headless:
+        print("  👻 使用伪无头模式 (Off-screen)...")
+        options.add_argument("--window-position=-10000,-10000")
 
     # 持久化 profile：按 profile_id 复用同一目录；否则用临时目录
     is_persistent = profile_id is not None
@@ -328,125 +98,118 @@ def create_driver(headless=False, profile_id=None):
         user_data_dir = tempfile.mkdtemp(prefix="cf_chrome_")
         print(f"  🔄 使用全新浏览器 profile: ...{os.path.basename(user_data_dir)}")
 
-    # 下载目录（用于 invoice PDF 下载等）
-    download_dir = os.path.join(user_data_dir, 'downloads')
-    os.makedirs(download_dir, exist_ok=True)
+    # 随机语言
+    lang = random.choice(_LANGUAGES)
+    options.add_argument(f"--lang={lang.split(',')[0]}")
+    options.add_argument(f"--accept-lang={lang}")
 
-    # 随机窗口尺寸（反检测）。
-    # 注意：不设 Playwright 的 locale 选项——它经 CDP Emulation.setLocaleOverride 生效，
-    # 会被 Cloudflare 检测为受控浏览器，导致 Turnstile 报 "problem with verification"。
-    # 同理不加 --lang 等可能引入模拟指纹的参数。stealth 全交给 Patchright + channel=chrome。
-    w, h = random.choice(_WINDOW_SIZES)
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-popup-blocking")
 
-    # 启动参数保持最小（与真人浏览器一致）
-    launch_args = [
-        "--no-first-run",
-        "--no-default-browser-check",
-        f"--window-size={w},{h}",
-    ]
-    if headless:
-        print("  👻 使用伪无头模式 (Off-screen)...")
-        launch_args.append("--window-position=-10000,-10000")
-
-    def _clear_singleton_locks():
-        # Chrome 异常退出会在 profile 里留下 Singleton 锁，导致下次启动失败
-        # （"Mach rendezvous failed / parent died"）。仅在无浏览器占用该 profile 时安全，
-        # 本应用通过 open_browsers 保证同一 profile 单实例，可安全清理。
-        for _name in ('SingletonLock', 'SingletonCookie', 'SingletonSocket'):
-            _p = os.path.join(user_data_dir, _name)
-            try:
-                if os.path.islink(_p) or os.path.exists(_p):
-                    os.remove(_p)
-            except Exception:
-                pass
-        # 修复损坏/臃肿的 Preferences（正常仅几百 KB；曾出现被写成 GB 级导致 Chrome
-        # 加载崩溃）。Preferences 只存 UI 配置，不含登录 cookie，重置后 Chrome 自动重建，
-        # 登录态（Cookies/Login Data）不受影响。阈值 10MB。
-        _pref = os.path.join(user_data_dir, 'Default', 'Preferences')
-        try:
-            if os.path.exists(_pref) and os.path.getsize(_pref) > 10 * 1024 * 1024:
-                os.rename(_pref, _pref + '.corrupt.bak')
-                print("  🧹 检测到异常臃肿的 Preferences，已重置（登录态保留）")
-        except Exception:
-            pass
-
-    playwright = sync_playwright().start()
-    context = None
-    last_err = None
-    for attempt in range(2):          # 启动失败重试一次（清理残留锁后再试），提升稳定性
-        _clear_singleton_locks()
-        try:
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                channel="chrome",           # 用系统 Google Chrome（隐蔽性关键，非 bundled chromium）
-                headless=False,             # 永不真无头（用户确认仅 headed）
-                no_viewport=True,           # 用真实窗口尺寸（由 --window-size 控制）
-                args=launch_args,
-            )
-            break
-        except Exception as e:
-            last_err = e
-            print(f"  ⚠️ 浏览器启动失败(第{attempt + 1}/2次): {str(e)[:120]}")
-            time.sleep(1.5)
-    if context is None:
-        # 两次都失败，停 playwright 并清理临时 profile，避免孤儿资源
-        print("  ❌ 浏览器初始化失败，正在清理...")
-        try:
-            playwright.stop()
-        except Exception:
-            pass
-        if not is_persistent:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
-        raise last_err
+    driver = uc.Chrome(
+        options=options,
+        use_subprocess=True,
+        user_data_dir=user_data_dir,
+    )
 
     try:
-        page = context.pages[0] if context.pages else context.new_page()
+        # 随机窗口尺寸
+        w, h = random.choice(_WINDOW_SIZES)
+        driver.set_window_size(w, h)
+        print(f"  🖥️ 窗口: {w}x{h}, 语言: {lang.split(',')[0]}")
 
-        # 保守的全局默认超时（稳定性优先，容忍慢网络）
-        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
-        context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+        # macOS 上 --start-minimized 不可靠，直接发 WebDriver 命令最小化
+        if not headless:
+            driver.minimize_window()
 
-        temp_profile = None if is_persistent else user_data_dir
-        session = BrowserSession(playwright, context, page,
-                                 temp_profile=temp_profile, download_dir=download_dir)
+        # 记录 profile 目录，临时 profile 关闭时清理，持久化 profile 保留
+        driver._cf_temp_profile = None if is_persistent else user_data_dir
 
-        # 仅注册网络响应监听（用于充值/支付响应捕获，走 Network 域，Patchright 已适配）。
-        # 关键：绝不注册 page.on("console") —— 它会强制启用 CDP Runtime.enable，
-        # 而 Runtime.enable 是 Cloudflare/Turnstile 检测「CDP 受控浏览器」的头号信号，
-        # 会导致 Turnstile 报 "There was a problem with verification"。
-        # 同理，启动阶段不创建任何 CDP 会话（不做 CDP 窗口操作）以免过早泄漏。
-        page.on("response", session._on_response)
+        # 设置下载目录（用于 invoice PDF 下载等）
+        download_dir = os.path.join(user_data_dir, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
+        driver._cf_download_dir = download_dir
+        try:
+            driver.execute_cdp_cmd('Page.setDownloadBehavior', {
+                'behavior': 'allow',
+                'downloadPath': download_dir,
+            })
+        except Exception:
+            pass
 
-        print(f"  🖥️ 窗口: {w}x{h}")
-        print("✅ 浏览器初始化成功 (Patchright)")
-        return session
+        # 注入控制台拦截器（在所有页面 JS 执行之前生效）
+        # 用于捕获 Cloudflare/Stripe 的错误日志
+        try:
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    window.__cfAutoErrors = [];
+                    (function() {
+                        var methods = ['log', 'error', 'warn'];
+                        methods.forEach(function(method) {
+                            var orig = console[method].bind(console);
+                            console[method] = function() {
+                                var msg = '';
+                                try {
+                                    msg = Array.from(arguments).map(function(a) {
+                                        return typeof a === 'string' ? a : String(a);
+                                    }).join(' ');
+                                } catch(e) {}
+                                if (/setup.intent.error/i.test(msg) ||
+                                    /form.error.handler/i.test(msg) ||
+                                    /payment.intent.failed/i.test(msg) ||
+                                    /failed.to.save.payment/i.test(msg) ||
+                                    /card.*(incorrect|invalid|declined|expired|failed)/i.test(msg) ||
+                                    /security.code.*(incorrect|invalid)/i.test(msg) ||
+                                    /cvc.*(incorrect|invalid|incomplete)/i.test(msg)) {
+                                    window.__cfAutoErrors.push(msg.substring(0, 300));
+                                }
+                                orig.apply(null, arguments);
+                            };
+                        });
+                    })();
+                '''
+            })
+        except Exception:
+            pass
+
+        print("✅ 浏览器初始化成功 (undetected-chromedriver)")
+        return driver
     except Exception:
-        # 后续初始化失败，必须清理避免孤儿进程/资源
+        # Chrome 进程已启动但后续初始化失败，必须清理避免孤儿进程
         print("  ❌ 浏览器初始化失败，正在清理...")
         try:
-            context.close()
+            driver.quit()
         except Exception:
             pass
         try:
-            playwright.stop()
+            shutil.rmtree(user_data_dir, ignore_errors=True)
         except Exception:
             pass
-        if not is_persistent:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
         raise
 
 
 def close_driver(driver):
-    """安全关闭浏览器并清理临时 profile（幂等；quit 内部已含 profile 清理）"""
+    """安全关闭浏览器并清理临时 profile"""
     try:
         driver.quit()
     except Exception:
         pass
+    # 清理临时 profile 目录
+    temp_dir = getattr(driver, '_cf_temp_profile', None)
+    if temp_dir and os.path.exists(temp_dir):
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print(f"  🧹 已清理临时 profile: ...{os.path.basename(temp_dir)}")
+        except Exception:
+            pass
 
 
 def type_slowly(element, text, delay=0.05):
-    """模拟人工缓慢输入。element 为 Playwright Locator。"""
-    element.press_sequentially(str(text), delay=int(delay * 1000))
+    """模拟人工缓慢输入"""
+    for char in text:
+        element.send_keys(char)
+        time.sleep(delay)
 
 
 def inject_network_interceptor(driver, patterns):
@@ -458,11 +221,64 @@ def inject_network_interceptor(driver, patterns):
         patterns: URL 关键词列表，每个元素是一个列表，URL 需同时包含所有关键词才匹配
                   例如: [['api.stripe.com', 'confirm'], ['ai-gateway', 'topup']]
     """
-    # Patchright 版：不再注入页面 JS。响应由 create_driver 挂载的
-    # page.on("response") 监听器在 Python 侧持续收集（更隐蔽，且不受导航清空影响）。
-    # 这里只更新过滤模式并清空累积，语义等价于「开始一段新的拦截」。
-    driver._net_patterns = patterns
-    driver.net_responses = []
+    import json as _json
+    patterns_js = _json.dumps(patterns)
+    driver.execute_script('''
+        window.__netInterceptResponses = [];
+        var patterns = ''' + patterns_js + ''';
+        function matchUrl(url) {
+            for (var i = 0; i < patterns.length; i++) {
+                var keywords = patterns[i];
+                var matched = true;
+                for (var j = 0; j < keywords.length; j++) {
+                    if (url.indexOf(keywords[j]) === -1) { matched = false; break; }
+                }
+                if (matched) return true;
+            }
+            return false;
+        }
+        // 拦截 fetch
+        (function() {
+            var origFetch = window.fetch;
+            window.fetch = function() {
+                var url = typeof arguments[0] === 'string' ? arguments[0] : (arguments[0].url || '');
+                if (matchUrl(url)) {
+                    return origFetch.apply(this, arguments).then(function(response) {
+                        var clone = response.clone();
+                        clone.text().then(function(text) {
+                            try { var data = JSON.parse(text); } catch(e) { var data = text; }
+                            window.__netInterceptResponses.push({
+                                url: url, status: response.status, data: data, ts: Date.now()
+                            });
+                        }).catch(function() {});
+                        return response;
+                    });
+                }
+                return origFetch.apply(this, arguments);
+            };
+        })();
+        // 拦截 XMLHttpRequest
+        (function() {
+            var origOpen = XMLHttpRequest.prototype.open;
+            var origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this._cfInterceptUrl = url;
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                var xhr = this;
+                if (xhr._cfInterceptUrl && matchUrl(xhr._cfInterceptUrl)) {
+                    xhr.addEventListener('load', function() {
+                        try { var data = JSON.parse(xhr.responseText); } catch(e) { var data = xhr.responseText; }
+                        window.__netInterceptResponses.push({
+                            url: xhr._cfInterceptUrl, status: xhr.status, data: data, ts: Date.now()
+                        });
+                    });
+                }
+                return origSend.apply(this, arguments);
+            };
+        })();
+    ''')
     print(f"已注入网络拦截器，监听 {len(patterns)} 个 URL 模式")
 
 
@@ -481,7 +297,7 @@ def collect_intercepted_responses(driver, timeout=60):
 
     for _ in range(timeout):
         time.sleep(1)
-        responses = list(driver.net_responses)
+        responses = driver.execute_script('return window.__netInterceptResponses || [];')
         if responses:
             if first_found_time is None:
                 first_found_time = time.time()
@@ -490,7 +306,7 @@ def collect_intercepted_responses(driver, timeout=60):
             if time.time() - first_found_time >= 3:
                 break
 
-    responses = list(driver.net_responses)
+    responses = driver.execute_script('return window.__netInterceptResponses || [];')
     for resp in responses:
         print(f"[网络响应] URL: {resp.get('url', '')}")
         print(f"[网络响应] HTTP Status: {resp.get('status', '')}")
@@ -513,14 +329,12 @@ def dismiss_overdue_dialog(driver):
     可在任何页面操作前调用，无弹窗时直接返回
     """
     try:
-        page = driver.page
-        dialog = page.locator("div[role='alertdialog']")
-        if dialog.count() == 0:
+        dialog = driver.find_elements(By.CSS_SELECTOR, "div[role='alertdialog']")
+        if not dialog:
             return False
-        # 定位含 "I understand" 文本 span 的按钮（等价原 XPath 精确文本匹配）
-        btn = dialog.first.locator("button:has(span:text-is('I understand'))")
-        if btn.count() > 0:
-            _safe_click(btn.first, session=driver, desc="欠费弹窗 I understand")
+        btn = dialog[0].find_elements(By.XPATH, ".//button[.//span[text()='I understand']]")
+        if btn:
+            btn[0].click()
             print("  已关闭欠费提示弹窗 (I understand)")
             time.sleep(1)
             return True
@@ -555,9 +369,6 @@ def check_and_handle_cf_challenge(driver, max_wait=120):
     user_notified = False
 
     while time.time() - start < max_wait:
-        # 轮询期间刷新截图缓存，保证实时截图流不卡顿（业务线程内调用）
-        driver.capture_frame()
-
         # 检查是否已通过质询
         if not _is_challenge_page(driver):
             elapsed = int(time.time() - start)
@@ -625,7 +436,7 @@ def _is_challenge_page(driver):
 
         # 有些情况 title 不变，检查页面内容
         try:
-            body_text = driver.page.inner_text("body", timeout=SHORT_TIMEOUT_MS).lower()
+            body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
             challenge_keywords = [
                 "checking your browser",
                 "verify you are human",
@@ -651,19 +462,27 @@ def _try_click_turnstile(driver):
 
     返回 True 表示成功点击（不代表通过验证）
     """
-    page = driver.page
+    driver.switch_to.default_content()
 
-    # 注意：不再用 CDP 穿透 shadow DOM 点击 —— 创建 CDP 会话/发送 DOM 命令会破坏
-    # Patchright 隐蔽性，触发 Cloudflare "There was a problem with verification"。
-    # 仅用 Playwright 原生点击（managed 模式通常无需点击即自动通过，交互式才需要点击）。
-
-    # 方法1: 通过容器元素的坐标偏移点击 checkbox 位置（原生 click）
+    # 方法1: 通过 CDP 穿透 closed shadow DOM 找到 iframe 并点击
     try:
-        container = page.locator('div[data-testid="challenge-widget-container"]').first
-        if container.is_visible():
+        clicked = _click_turnstile_via_cdp(driver)
+        if clicked:
+            return True
+    except Exception as e:
+        print(f"    ⚠️ CDP 方式失败: {e}")
+
+    # 方法2: 通过容器元素的坐标偏移点击 checkbox 位置
+    try:
+        container = driver.find_element(
+            By.CSS_SELECTOR,
+            'div[data-testid="challenge-widget-container"]'
+        )
+        if container.is_displayed():
             # Turnstile checkbox 通常在容器左侧偏上的位置
             # iframe 宽度 300px，高度 65px，checkbox 大约在 (30, 33) 的位置
-            container.click(position={"x": 30, "y": 33}, timeout=CLICK_TIMEOUT_MS)
+            actions = ActionChains(driver)
+            actions.move_to_element_with_offset(container, 30, 33).click().perform()
             print("    → 通过坐标偏移点击了 Turnstile 容器")
             time.sleep(2)
             return True
@@ -672,42 +491,49 @@ def _try_click_turnstile(driver):
 
     # 方法3: 查找页面中可见的 iframe（非 shadow DOM 场景的回退）
     try:
-        frames = page.locator("iframe").all()
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
         for frame in frames:
             try:
                 src = frame.get_attribute('src') or ''
                 title_attr = frame.get_attribute('title') or ''
                 if 'challenges' in src or 'turnstile' in src or 'widget' in title_attr.lower():
-                    if not frame.is_visible():
+                    if not frame.is_displayed():
                         continue
-                    try:
-                        frame.click(timeout=CLICK_TIMEOUT_MS)
-                        print("    → 点击了 Turnstile iframe")
-                    except Exception:
-                        pass
+                    actions = ActionChains(driver)
+                    actions.move_to_element(frame).click().perform()
+                    print("    → 点击了 Turnstile iframe")
                     time.sleep(2)
 
-                    # 尝试进入 iframe 查找 checkbox（content_frame 无状态，无需帧切换）
+                    # 尝试切入 iframe 查找 checkbox
                     try:
-                        child = frame.content_frame
-                        if child is not None:
-                            checkboxes = child.locator(
-                                "input[type='checkbox'], .cb-lb, #challenge-stage, .ctp-checkbox-label"
-                            ).all()
-                            for cb in checkboxes:
-                                if cb.is_visible():
-                                    try:
-                                        cb.click(timeout=CLICK_TIMEOUT_MS)
-                                    except Exception:
-                                        cb.evaluate("el => el.click()")
-                                    print("    → 点击了验证框 checkbox")
-                                    return True
+                        driver.switch_to.frame(frame)
+                        checkboxes = driver.find_elements(
+                            By.CSS_SELECTOR,
+                            "input[type='checkbox'], .cb-lb, #challenge-stage, .ctp-checkbox-label"
+                        )
+                        for cb in checkboxes:
+                            if cb.is_displayed():
+                                try:
+                                    cb.click()
+                                except Exception:
+                                    driver.execute_script("arguments[0].click();", cb)
+                                print("    → 点击了验证框 checkbox")
+                                driver.switch_to.default_content()
+                                return True
+                        driver.switch_to.default_content()
                     except Exception:
-                        pass
+                        driver.switch_to.default_content()
             except Exception:
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
                 continue
     except Exception:
-        pass
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
 
     return False
 
@@ -717,8 +543,8 @@ def _click_turnstile_via_cdp(driver):
     使用 Chrome DevTools Protocol (CDP) 穿透 closed shadow DOM
     找到 Turnstile iframe 并模拟点击其 checkbox 区域
     """
-    # 通过 CDP 获取整个 DOM 树（包括 closed shadow DOM，原生 API 无法穿透，必须保留 CDP）
-    doc = driver._cdp().send('DOM.getDocument', {'depth': -1, 'pierce': True})
+    # 通过 CDP 获取整个 DOM 树（包括 shadow DOM）
+    doc = driver.execute_cdp_cmd('DOM.getDocument', {'depth': -1, 'pierce': True})
     root = doc['root']
 
     def find_turnstile_iframe(node):
@@ -752,14 +578,14 @@ def _click_turnstile_via_cdp(driver):
 
     # 获取 iframe 元素在视口中的位置
     try:
-        # 优先使用 getContentQuads 获取视口坐标（CDP 保留：需精确视口坐标做鼠标点击）
+        # 优先使用 getContentQuads 获取视口坐标
         try:
-            quads = driver._cdp().send('DOM.getContentQuads', {'backendNodeId': backend_node_id})
+            quads = driver.execute_cdp_cmd('DOM.getContentQuads', {'backendNodeId': backend_node_id})
             quad = quads['quads'][0]
             click_x = quad[0] + 30
             click_y = (quad[1] + quad[5]) / 2
         except Exception:
-            box_model = driver._cdp().send('DOM.getBoxModel', {'backendNodeId': backend_node_id})
+            box_model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
             content = box_model['model']['content']
             click_x = content[0] + 30
             click_y = (content[1] + content[5]) / 2
@@ -774,26 +600,39 @@ def _click_turnstile_via_cdp(driver):
 
 
 def _cdp_click_at(driver, x, y):
-    """在指定视口坐标处模拟完整鼠标点击（move + down + up）。
-    改用 Playwright 原生 page.mouse（比 CDP Input.dispatchMouseEvent 更隐蔽），
-    保留原三段时序（移动→按下→释放）。"""
-    mouse = driver.page.mouse
-    mouse.move(x, y)
+    """使用 CDP 在指定视口坐标处模拟完整的鼠标点击（mouseMoved + mousePressed + mouseReleased）"""
+    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+        'type': 'mouseMoved',
+        'x': x,
+        'y': y,
+    })
     time.sleep(0.1)
-    mouse.down()
+    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+        'type': 'mousePressed',
+        'x': x,
+        'y': y,
+        'button': 'left',
+        'clickCount': 1,
+    })
     time.sleep(0.05)
-    mouse.up()
+    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+        'type': 'mouseReleased',
+        'x': x,
+        'y': y,
+        'button': 'left',
+        'clickCount': 1,
+    })
 
 
 def _get_viewport_coords(driver, element):
     """
     获取元素相对于视口的坐标（而非页面坐标）。
-    page.mouse 点击需要视口坐标。element 为 Playwright Locator。
+    CDP Input.dispatchMouseEvent 需要视口坐标。
     """
-    return element.evaluate(
-        "el => { var rect = el.getBoundingClientRect();"
-        " return {x: rect.x, y: rect.y, width: rect.width, height: rect.height}; }"
-    )
+    return driver.execute_script("""
+        var rect = arguments[0].getBoundingClientRect();
+        return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+    """, element)
 
 
 def _click_hcaptcha_via_cdp(driver):
@@ -802,24 +641,24 @@ def _click_hcaptcha_via_cdp(driver):
     hCaptcha 通常出现在 LightboxModal 弹窗中的 .HCaptcha-container 内
     """
     try:
-        # 方法1: 通过 locator 找到 hCaptcha iframe 并用 page.mouse 点击
-        hcaptcha_iframes = driver.page.locator(
+        # 方法1: 直接通过 Selenium 找到 hCaptcha iframe 并用 CDP 点击
+        hcaptcha_iframes = driver.find_elements(
+            By.CSS_SELECTOR,
             '#HCaptcha-root iframe[src*="hcaptcha"], '
             '.HCaptcha-container iframe[src*="hcaptcha"], '
             'iframe[data-hcaptcha-widget-id], '
             'iframe[src*="hcaptcha.com"]'
-        ).all()
+        )
 
         # 过滤出 checkbox iframe（尺寸较小，通常宽度 < 400px）
         checkbox_iframe = None
         for iframe in hcaptcha_iframes:
-            if not iframe.is_visible():
+            if not iframe.is_displayed():
                 continue
-            bb = iframe.bounding_box()
-            width = bb['width'] if bb else 0
+            size = iframe.size
             # hCaptcha checkbox iframe 通常尺寸约 302x78 或类似
             # 图片挑战 iframe 尺寸较大 (>400px)
-            if width < 400:
+            if size.get('width', 0) < 400:
                 checkbox_iframe = iframe
                 break
             elif not checkbox_iframe:
@@ -827,7 +666,7 @@ def _click_hcaptcha_via_cdp(driver):
 
         if checkbox_iframe:
             # 先滚动到 iframe 可见
-            checkbox_iframe.evaluate("el => el.scrollIntoView({block: 'center'})")
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox_iframe)
             time.sleep(0.5)
 
             # 使用 getBoundingClientRect 获取视口坐标（非页面坐标）
@@ -860,8 +699,8 @@ def _click_hcaptcha_via_cdp(driver):
 
             return True
 
-        # 方法2: CDP DOM 遍历查找（包括 closed shadow DOM，必须保留 CDP 穿透）
-        doc = driver._cdp().send('DOM.getDocument', {'depth': -1, 'pierce': True})
+        # 方法2: CDP DOM 遍历查找（包括 shadow DOM）
+        doc = driver.execute_cdp_cmd('DOM.getDocument', {'depth': -1, 'pierce': True})
         root = doc['root']
 
         def find_hcaptcha_iframe(node):
@@ -886,16 +725,16 @@ def _click_hcaptcha_via_cdp(driver):
         iframe_node = find_hcaptcha_iframe(root)
         if iframe_node:
             backend_node_id = iframe_node.get('backendNodeId')
-            # 使用 DOM.getContentQuads 获取视口坐标（CDP 保留：比 getBoxModel 更准确）
+            # 使用 DOM.getContentQuads 获取视口坐标（比 getBoxModel 更准确）
             try:
-                quads = driver._cdp().send('DOM.getContentQuads', {'backendNodeId': backend_node_id})
+                quads = driver.execute_cdp_cmd('DOM.getContentQuads', {'backendNodeId': backend_node_id})
                 quad = quads['quads'][0]
                 # quad 是 [x1,y1, x2,y2, x3,y3, x4,y4] 四个角的视口坐标
                 click_x = quad[0] + 30
                 click_y = (quad[1] + quad[5]) / 2
             except Exception:
                 # 回退到 getBoxModel
-                box_model = driver._cdp().send('DOM.getBoxModel', {'backendNodeId': backend_node_id})
+                box_model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
                 content = box_model['model']['content']
                 click_x = content[0] + 30
                 click_y = (content[1] + content[5]) / 2
@@ -921,13 +760,14 @@ def _wait_for_turnstile_widget(driver, timeout=15):
     while time.time() - start < timeout:
         try:
             # 检查 Turnstile 容器
-            containers = driver.page.locator(
+            containers = driver.find_elements(
+                By.CSS_SELECTOR,
                 'div[data-testid="challenge-widget-container"], '
                 '[id*="cf-chl-widget"], .cf-turnstile, [data-sitekey]'
-            ).all()
+            )
             if containers:
                 # 容器存在，再检查内部 iframe 是否加载
-                has_iframe = driver.page.evaluate("""() => {
+                has_iframe = driver.execute_script("""
                     var widgets = document.querySelectorAll(
                         '[id*="cf-chl-widget"], .cf-turnstile, [data-sitekey], '
                         '[data-testid="challenge-widget-container"]'
@@ -946,7 +786,7 @@ def _wait_for_turnstile_widget(driver, timeout=15):
                     var cf = document.querySelector('input[name="cf_challenge_response"]');
                     if (cf) return true;
                     return false;
-                }""")
+                """)
                 if has_iframe:
                     print("  ✅ Turnstile 组件已加载")
                     time.sleep(1)  # 额外等待渲染稳定
@@ -960,54 +800,27 @@ def _wait_for_turnstile_widget(driver, timeout=15):
 
 def _wait_for_stripe_fields_ready(driver, timeout=15):
     """
-    等待 Stripe 输入字段或嵌套 iframe 实际渲染完成。
+    在已切入的 Stripe iframe 内，等待输入字段或嵌套 iframe 实际渲染完成。
     弹窗和外层 iframe 可能先出现，但内部字段延迟加载。
-
-    Patchright 版：不依赖「已切入 iframe」的状态，直接枚举 page.frames
-    （原生穿透所有嵌套层级）查找 Stripe 字段，或统计弹窗内可见 iframe 数量。
     """
-    page = driver.page
-    card_inputs_sel = (
-        'input[name="cardnumber"], input[name="number"], '
-        'input[autocomplete="cc-number"], '
-        'input[data-elements-stable-field-name="cardNumber"]'
-    )
-
-    def _vis(loc):
-        try:
-            return loc.is_visible()
-        except Exception:
-            return False
-
     start = time.time()
     while time.time() - start < timeout:
         try:
-            # 检查1: 主文档或 Stripe frame 内的卡号输入框
-            main = page.main_frame
-            for fr in [main] + [f for f in page.frames if f is not main]:
-                try:
-                    url = (fr.url or '').lower()
-                    name = (fr.name or '').lower()
-                except Exception:
-                    url = name = ''
-                # 主文档也检查一次；其余仅检查 Stripe 相关 frame
-                if fr is not main and not (
-                    'stripe' in url or 'stripe' in name
-                    or name.startswith('__privatestripeframe')
-                    or 'elements-inner' in url):
-                    continue
-                try:
-                    inp = fr.locator(card_inputs_sel).first
-                    if inp.count() > 0 and _vis(inp):
-                        print("  ✅ Stripe 输入字段已就绪")
-                        time.sleep(0.5)
-                        return True
-                except Exception:
-                    continue
+            # 检查1: 直接输入框
+            inputs = driver.find_elements(By.CSS_SELECTOR,
+                'input[name="cardnumber"], input[name="number"], '
+                'input[autocomplete="cc-number"], '
+                'input[data-elements-stable-field-name="cardNumber"]'
+            )
+            for inp in inputs:
+                if inp.is_displayed():
+                    print("  ✅ Stripe 输入字段已就绪")
+                    time.sleep(0.5)
+                    return True
 
             # 检查2: 嵌套 iframe（Stripe 每个字段一个 iframe）
-            inner_frames = page.locator('[role="dialog"] iframe').all()
-            visible_frames = [f for f in inner_frames if _vis(f)]
+            inner_frames = driver.find_elements(By.TAG_NAME, 'iframe')
+            visible_frames = [f for f in inner_frames if f.is_displayed()]
             if len(visible_frames) >= 2:  # 至少有卡号和有效期两个 iframe
                 print(f"  ✅ Stripe 嵌套 iframe 已就绪 ({len(visible_frames)} 个)")
                 time.sleep(0.5)
@@ -1023,27 +836,22 @@ def _wait_for_billing_form_ready(driver, timeout=15):
     """
     等待账单地址表单字段渲染完成。
     弹窗出现后，地址表单可能延迟加载。
-    账单字段在主文档 dialog 内（非 iframe），直接用 page.locator 定位。
     """
-    page = driver.page
-    fields_sel = (
-        '[role="dialog"] input[name="first_name"], '
-        '[role="dialog"] input[name="country"], '
-        '[data-testid="address-form"] input[name="first_name"]'
-    )
+    driver.switch_to.default_content()
     start = time.time()
     while time.time() - start < timeout:
         try:
             # 查找 first_name 或 country 字段（地址表单的标志性字段）
-            fields = page.locator(fields_sel).all()
+            fields = driver.find_elements(By.CSS_SELECTOR,
+                '[role="dialog"] input[name="first_name"], '
+                '[role="dialog"] input[name="country"], '
+                '[data-testid="address-form"] input[name="first_name"]'
+            )
             for f in fields:
-                try:
-                    if f.is_visible():
-                        print("  ✅ 账单地址表单已加载")
-                        time.sleep(0.5)
-                        return True
-                except Exception:
-                    continue
+                if f.is_displayed():
+                    print("  ✅ 账单地址表单已加载")
+                    time.sleep(0.5)
+                    return True
         except Exception:
             pass
         time.sleep(1)
@@ -1066,16 +874,17 @@ def _handle_inline_turnstile(driver, max_wait=120):
     turnstile_found = False
     try:
         # 方法1: 查找 Cloudflare 注册页特有的验证容器
-        containers = driver.page.locator(
+        containers = driver.find_elements(
+            By.CSS_SELECTOR,
             'div[data-testid="challenge-widget-container"], '
             'div.c_v'  # Cloudflare 注册页的验证组件 class
-        ).all()
+        )
         if containers:
             turnstile_found = True
 
         # 方法2: 查找包含人机验证提示文本（支持中英文）
         if not turnstile_found:
-            body_text = driver.page.inner_text("body", timeout=SHORT_TIMEOUT_MS).lower()
+            body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
             if ('let us know you are human' in body_text or
                 'verify you are human' in body_text or
                 '确认您是真人' in body_text or
@@ -1085,7 +894,7 @@ def _handle_inline_turnstile(driver, max_wait=120):
 
         # 方法3: 通过 JS 查找 shadow DOM 中的 Turnstile iframe
         if not turnstile_found:
-            has_turnstile = driver.page.evaluate("""() => {
+            has_turnstile = driver.execute_script("""
                 // 查找 cf_challenge_response 隐藏 input
                 var cf = document.querySelector('input[name="cf_challenge_response"]');
                 if (cf) return true;
@@ -1093,7 +902,7 @@ def _handle_inline_turnstile(driver, max_wait=120):
                 var widget = document.querySelector('[id*="cf-chl-widget"]');
                 if (widget) return true;
                 return false;
-            }""")
+            """)
             if has_turnstile:
                 turnstile_found = True
     except Exception:
@@ -1105,27 +914,20 @@ def _handle_inline_turnstile(driver, max_wait=120):
 
     print("  🔒 检测到内嵌 Turnstile 人机验证")
 
-    # 阶段1：优先等待自动通过。Patchright 隐蔽性下 managed 模式的 Turnstile
-    # 会在几秒内自动出 token（无需任何点击）。绝不在此之前做 CDP 操作。
-    print("  ⏳ 等待 Turnstile 自动通过...")
+    # 尝试自动点击
+    print("  🤖 尝试自动点击验证框...")
+    _try_click_turnstile(driver)
+
+    # CDP 点击后需要等待 Turnstile 后台验证完成（通常 5~20 秒）
+    # 不能过早进入 2Captcha，否则会干扰正在进行的验证导致组件刷新
+    print("  ⏳ 等待 Turnstile 后台验证...")
     for i in range(10):
         time.sleep(3)
-        driver.capture_frame()
         if _is_turnstile_solved(driver):
             print("  ✅ 人机验证已自动通过！")
             return True
         if i == 3:
             print("  ⏳ 仍在等待验证结果...")
-
-    # 阶段2：仍未通过（可能是交互式 Turnstile），尝试 Playwright 原生点击（不用 CDP）
-    print("  🤖 尝试点击验证框（原生）...")
-    if _try_click_turnstile(driver):
-        for i in range(7):
-            time.sleep(3)
-            driver.capture_frame()
-            if _is_turnstile_solved(driver):
-                print("  ✅ 人机验证已通过！")
-                return True
 
     # CDP 点击未能通过，尝试 2Captcha
     if captcha_solver.is_available():
@@ -1152,7 +954,6 @@ def _handle_inline_turnstile(driver, max_wait=120):
 
     start = time.time()
     while time.time() - start < max_wait:
-        driver.capture_frame()
         if _is_turnstile_solved(driver):
             elapsed = int(time.time() - start)
             print(f"  ✅ 人机验证已通过！(耗时 {elapsed} 秒)")
@@ -1170,7 +971,7 @@ def _is_turnstile_truly_solved(driver):
     """
     try:
         # 检查1: Turnstile widget 是否显示已验证状态（绿色勾 / 成功样式）
-        result = driver.page.evaluate("""() => {
+        result = driver.execute_script("""
             // 检查 Turnstile 容器是否有 success 状态
             var containers = document.querySelectorAll(
                 '[data-testid="challenge-widget-container"], .cf-turnstile, [id*="cf-chl-widget"]'
@@ -1201,7 +1002,7 @@ def _is_turnstile_truly_solved(driver):
             }
 
             return false;
-        }""")
+        """)
         if result:
             return True
     except Exception:
@@ -1230,12 +1031,13 @@ def _is_turnstile_solved(driver):
     try:
         # 方法1: 检查隐藏 input 是否有值（最可靠）
         # Cloudflare 注册页使用 name="cf_challenge_response"
-        hidden_inputs = driver.page.locator(
+        hidden_inputs = driver.find_elements(
+            By.CSS_SELECTOR,
             'input[name="cf_challenge_response"], '
             'input[name="cf-turnstile-response"], '
             'input[name*="turnstile"], '
             'input[name*="challenge_response"]'
-        ).all()
+        )
         for inp in hidden_inputs:
             value = inp.get_attribute('value') or ''
             if len(value) > 10:  # Turnstile token 很长
@@ -1243,7 +1045,7 @@ def _is_turnstile_solved(driver):
 
         # 方法2: 通过 JS 检查隐藏 input（可能被 shadow DOM 包裹）
         try:
-            result = driver.page.evaluate("""() => {
+            result = driver.execute_script("""
                 // 直接查找所有 id 包含 response 的 input
                 var inputs = document.querySelectorAll('input[id$="_response"]');
                 for (var i = 0; i < inputs.length; i++) {
@@ -1253,7 +1055,7 @@ def _is_turnstile_solved(driver):
                 var cf = document.querySelector('input[name="cf_challenge_response"]');
                 if (cf && cf.value && cf.value.length > 10) return true;
                 return false;
-            }""")
+            """)
             if result:
                 return True
         except Exception:
@@ -1262,25 +1064,6 @@ def _is_turnstile_solved(driver):
     except Exception:
         pass
 
-    return False
-
-
-def _detect_account_banned(driver):
-    """检测当前页面是否出现 Cloudflare 账号封禁提示。命中则置 driver.account_banned=True 并返回 True。
-    典型文案："Access to your user is blocked due to suspected malicious use of Cloudflare services."
-    """
-    try:
-        body = driver.page.inner_text("body", timeout=SHORT_TIMEOUT_MS).lower()
-    except Exception:
-        return False
-    signals = [
-        "blocked due to suspected malicious",
-        "suspected malicious use of cloudflare",
-    ]
-    if any(s in body for s in signals):
-        driver.account_banned = True
-        print("  🚫 检测到账号已被 Cloudflare 封禁（suspected malicious use）")
-        return True
     return False
 
 
@@ -1295,6 +1078,8 @@ def login_cloudflare(driver, email: str, password: str):
     返回:
         str | None: 成功时返回 account_id，失败返回 None
     """
+    wait = WebDriverWait(driver, MAX_WAIT_TIME)
+
     try:
         url = "https://dash.cloudflare.com/login"
         print(f"正在打开登录页面 {url}...")
@@ -1321,9 +1106,9 @@ def login_cloudflare(driver, email: str, password: str):
                 return account_id
             # 检查登录表单是否出现
             try:
-                loc = driver.page.locator(login_selector).first
-                if loc.is_visible():
-                    email_input = loc
+                els = driver.find_elements(By.CSS_SELECTOR, login_selector)
+                if els and els[0].is_displayed():
+                    email_input = els[0]
                     break
             except Exception:
                 pass
@@ -1338,9 +1123,10 @@ def login_cloudflare(driver, email: str, password: str):
         time.sleep(1)
 
         # 填写密码
-        password_input = driver.page.locator(
+        password_input = driver.find_element(
+            By.CSS_SELECTOR,
             'input[type="password"], input[name="password"], input[id="password"]'
-        ).first
+        )
         password_input.clear()
         type_slowly(password_input, password)
         print("密码已输入")
@@ -1360,9 +1146,12 @@ def login_cloudflare(driver, email: str, password: str):
         clicked = False
         for selector in login_selectors:
             try:
-                btn = driver.page.locator(selector).first
-                if btn.is_visible():
-                    _safe_click(btn, session=driver, desc='登录按钮')
+                btn = driver.find_element(By.CSS_SELECTOR, selector)
+                if btn.is_displayed():
+                    try:
+                        btn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", btn)
                     clicked = True
                     break
             except Exception:
@@ -1370,11 +1159,11 @@ def login_cloudflare(driver, email: str, password: str):
 
         if not clicked:
             try:
-                btns = driver.page.locator('button').all()
+                btns = driver.find_elements(By.TAG_NAME, 'button')
                 for btn in btns:
-                    text = (btn.inner_text() or '').lower()
+                    text = btn.text.lower()
                     if 'log in' in text or 'sign in' in text or 'login' in text:
-                        _safe_click(btn, session=driver, desc='登录按钮(文本)')
+                        driver.execute_script("arguments[0].click();", btn)
                         clicked = True
                         break
             except Exception:
@@ -1407,7 +1196,6 @@ def login_cloudflare(driver, email: str, password: str):
                 print(f"登录成功！Account ID: {account_id}")
                 return account_id
 
-        _detect_account_banned(driver)
         print(f"登录后未能获取 account_id，当前 URL: {driver.current_url}")
         return None
 
@@ -1451,10 +1239,12 @@ def navigate_to_ai_credits(driver, account_id):
             print(f"当前 URL: {driver.current_url}")
 
             # 等待 "Top-up credits" 按钮出现（页面可能加载很慢）
-            topup_btn = driver.page.locator(
-                "xpath=//button[.//span[text()='Top-up credits']]"
-            ).first
-            if not _wait_visible(topup_btn, timeout=120_000):
+            wait = WebDriverWait(driver, 120)
+            try:
+                topup_btn = wait.until(EC.element_to_be_clickable((
+                    By.XPATH, "//button[.//span[text()='Top-up credits']]"
+                )))
+            except Exception:
                 print(f"第 {attempt} 次未找到 Top-up credits 按钮，页面可能未加载完成")
                 if attempt < max_retries:
                     print("刷新页面重试...")
@@ -1462,7 +1252,7 @@ def navigate_to_ai_credits(driver, account_id):
                 return False
 
             print("找到 Top-up credits 按钮，正在点击...")
-            _safe_click(topup_btn, session=driver, desc='Top-up credits 按钮')
+            topup_btn.click()
             time.sleep(2)
             print("已点击 Top-up credits 按钮")
             return True
@@ -1486,15 +1276,15 @@ def extract_topup_card_last4(driver):
     返回:
         str: 卡片后四位，提取失败返回空字符串
     """
+    wait = WebDriverWait(driver, 30)
     try:
         # 等待弹窗加载
-        price_loc = driver.page.locator("input#price").first
-        if not _wait_visible(price_loc, timeout=30_000):
-            print("未能定位 Top-up 弹窗 input#price")
-            return ''
+        wait.until(EC.presence_of_element_located((
+            By.CSS_SELECTOR, "input#price"
+        )))
         time.sleep(2)
         # 通过 input#price 向上找到所属的 dialog（避免匹配到 Cookie 弹窗）
-        card_last4 = driver.page.evaluate(r"""() => {
+        card_last4 = driver.execute_script(r"""
             var priceInput = document.querySelector('input#price');
             if (!priceInput) return '';
             var dialog = priceInput.closest('div[role="dialog"]');
@@ -1502,7 +1292,7 @@ def extract_topup_card_last4(driver):
             var text = dialog.textContent || dialog.innerText || '';
             var m = text.match(/[\u2022\u00b7*\s]+(\d{4})/);
             return m ? m[1] : '';
-        }""")
+        """)
         if card_last4:
             print(f"检测到支付卡片后四位: {card_last4}")
             return card_last4
@@ -1515,17 +1305,17 @@ def extract_topup_card_last4(driver):
 def close_topup_dialog(driver):
     """关闭 Top-up 弹窗"""
     try:
-        close_btn = driver.page.locator(
-            "div[role='dialog'] button[aria-label='Close']"
-        ).first
-        _safe_click(close_btn, session=driver, desc='关闭 Top-up 弹窗')
+        close_btn = driver.find_element(
+            By.CSS_SELECTOR, "div[role='dialog'] button[aria-label='Close']"
+        )
+        close_btn.click()
         time.sleep(1)
         print("已关闭 Top-up 弹窗")
         return True
     except Exception:
         # 备用：按 Escape 键关闭
         try:
-            driver.page.keyboard.press("Escape")
+            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
             time.sleep(1)
             print("已通过 Escape 关闭 Top-up 弹窗")
             return True
@@ -1544,13 +1334,17 @@ def fill_topup_and_confirm(driver, amount=10):
     返回:
         (bool, list, str): (是否成功点击, API 响应列表, 使用的卡片后四位)
     """
+    wait = WebDriverWait(driver, 30)
     card_last4 = extract_topup_card_last4(driver)
 
     try:
-        price_input = driver.page.locator("div[role='dialog'] input#price").first
+        price_input = driver.find_element(By.CSS_SELECTOR, "div[role='dialog'] input#price")
 
-        # 清空并输入金额（回读校验，确保金额正确写入）
-        _safe_fill(price_input, amount, session=driver, verify=True, desc='充值金额')
+        # 清空并输入金额
+        price_input.click()
+        price_input.clear()
+        time.sleep(0.5)
+        price_input.send_keys(str(amount))
         print(f"已输入充值金额: ${amount}")
         time.sleep(1)
 
@@ -1561,15 +1355,13 @@ def fill_topup_and_confirm(driver, amount=10):
         ])
 
         # 等待 "Confirm and pay" 按钮变为可点击（输入金额后 disabled 属性会移除）
-        confirm_btn = driver.page.locator(
-            "xpath=//div[@role='dialog']//button[.//span[text()='Confirm and pay']]"
-        ).first
-        _wait_visible(confirm_btn, timeout=30_000)
+        confirm_btn = wait.until(EC.element_to_be_clickable((
+            By.XPATH, "//div[@role='dialog']//button[.//span[text()='Confirm and pay']]"
+        )))
 
         print("正在点击 Confirm and pay...")
-        _safe_click(confirm_btn, session=driver, desc='Confirm and pay')
+        confirm_btn.click()
         print("已点击 Confirm and pay，等待响应...")
-        driver.capture_frame()
 
         # 收集拦截到的响应
         responses = collect_intercepted_responses(driver, timeout=60)
@@ -1611,61 +1403,69 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         dict: {status, error?}
     """
     try:
-        # 定位 Stripe Payment Element iframe（frame_locator 无状态，无需手工切帧）
-        stripe_frame = driver.page.frame_locator("div#payment-element iframe")
+        # 找到 Stripe Payment Element iframe 并切换进去
+        stripe_iframe = WebDriverWait(driver, 120).until(
+            EC.presence_of_element_located((
+                By.CSS_SELECTOR, "div#payment-element iframe"
+            ))
+        )
+        driver.switch_to.frame(stripe_iframe)
+        print(f"  {invoice_id} 已切换到 Stripe iframe")
+
+        iframe_wait = WebDriverWait(driver, 30)
 
         # 等待卡号输入框出现并填写
-        # 跨域 Stripe 字段：用 press_sequentially 模拟真实输入，触发 Stripe
-        # 的格式化/校验事件（fill 直接赋值可能不触发，且卡号会被重新格式化）
-        number_input = stripe_frame.locator("input#payment-numberInput")
-        if not _wait_visible(number_input, timeout=120_000):
-            raise RuntimeError("未找到 Stripe 卡号输入框")
-        print(f"  {invoice_id} 已定位 Stripe iframe")
+        number_input = iframe_wait.until(EC.visibility_of_element_located((
+            By.CSS_SELECTOR, "input#payment-numberInput"
+        )))
         number_input.click()
         time.sleep(0.3)
-        number_input.press_sequentially(str(card_info.get('number', '')), delay=50)
+        number_input.send_keys(card_info.get('number', ''))
         print(f"  {invoice_id} 已输入卡号")
         time.sleep(0.5)
 
         # 填写有效期 (MM / YY)
-        expiry_input = stripe_frame.locator("input#payment-expiryInput")
+        expiry_input = driver.find_element(By.CSS_SELECTOR, "input#payment-expiryInput")
         expiry_input.click()
         time.sleep(0.3)
         month = str(card_info.get('expiry_month', '')).zfill(2)
         year = str(card_info.get('expiry_year', ''))
         if len(year) == 4:
             year = year[2:]  # 2026 -> 26
-        expiry_input.press_sequentially(f"{month}{year}", delay=50)
+        expiry_input.send_keys(f"{month}{year}")
         print(f"  {invoice_id} 已输入有效期")
         time.sleep(0.5)
 
         # 填写 CVC
-        cvc_input = stripe_frame.locator("input#payment-cvcInput")
+        cvc_input = driver.find_element(By.CSS_SELECTOR, "input#payment-cvcInput")
         cvc_input.click()
         time.sleep(0.3)
-        cvc_input.press_sequentially(str(card_info.get('cvc', '')), delay=50)
+        cvc_input.send_keys(str(card_info.get('cvc', '')))
         print(f"  {invoice_id} 已输入 CVC")
         time.sleep(0.5)
 
         # 选择国家
         country_code = card_info.get('country', 'US')
         if country_code:
-            country_select = stripe_frame.locator("select#payment-countryInput")
-            country_select.select_option(value=country_code)
+            from selenium.webdriver.support.ui import Select
+            country_select = driver.find_element(By.CSS_SELECTOR, "select#payment-countryInput")
+            Select(country_select).select_by_value(country_code)
             print(f"  {invoice_id} 已选择国家: {country_code}")
             time.sleep(0.5)
 
         # 填写 ZIP code
         zip_code = card_info.get('zip', '')
         if zip_code:
-            zip_input = stripe_frame.locator("input#payment-postalCodeInput")
+            zip_input = driver.find_element(By.CSS_SELECTOR, "input#payment-postalCodeInput")
             zip_input.click()
             time.sleep(0.3)
-            zip_input.press_sequentially(str(zip_code), delay=50)
+            zip_input.send_keys(str(zip_code))
             print(f"  {invoice_id} 已输入 ZIP: {zip_code}")
             time.sleep(0.5)
 
-        driver.capture_frame()
+        # 切换回主页面
+        driver.switch_to.default_content()
+        print(f"  {invoice_id} 已切换回主页面")
         time.sleep(1)
 
         # 注入网络拦截器捕获支付结果
@@ -1674,13 +1474,12 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
             ['stripe.com', 'pay'],
         ])
 
-        # 点击 Pay 按钮（位于主文档，不在 iframe 内）
-        pay_btn = driver.page.locator(
-            "button[data-testid='hosted-payment-submit-button']"
-        ).first
-        _wait_visible(pay_btn, timeout=30_000)
+        # 点击 Pay 按钮
+        pay_btn = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((
+            By.CSS_SELECTOR, "button[data-testid='hosted-payment-submit-button']"
+        )))
         print(f"  {invoice_id} 正在点击 Pay...")
-        _safe_click(pay_btn, session=driver, desc='Pay 按钮')
+        pay_btn.click()
         print(f"  {invoice_id} 已点击 Pay，等待支付结果...")
 
         # 收集支付响应
@@ -1694,6 +1493,11 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
 
     except Exception as e:
         print(f"  {invoice_id} Stripe 支付填写失败: {e}")
+        # 确保切换回主页面
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
         return {"status": "failed", "error": f"Stripe 支付填写失败: {e}"}
 
 
@@ -1709,7 +1513,7 @@ def handle_unpaid_invoices(driver):
         list: 处理结果列表 [{invoice, status, pay_url, error}, ...]
     """
     results = []
-    download_dir = getattr(driver, '_download_dir', None)
+    download_dir = getattr(driver, '_cf_download_dir', None)
     if not download_dir:
         print("未配置下载目录，跳过 Unpaid invoice 处理")
         return results
@@ -1723,9 +1527,7 @@ def handle_unpaid_invoices(driver):
         time.sleep(3)
 
         # 查找 Unpaid 行
-        rows = driver.page.locator(
-            "xpath=//table//tr[.//span[text()='Unpaid']]"
-        ).all()
+        rows = driver.find_elements(By.XPATH, "//table//tr[.//span[text()='Unpaid']]")
         if not rows:
             if round_num == 1:
                 print("未发现 Unpaid invoice")
@@ -1736,8 +1538,8 @@ def handle_unpaid_invoices(driver):
         invoice_link = None
         for row in rows:
             try:
-                link = row.locator("xpath=.//a[@role='button']").first
-                iid = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+                link = row.find_element(By.XPATH, ".//a[@role='button']")
+                iid = link.text.strip()
                 if iid and iid not in processed_ids:
                     invoice_id = iid
                     invoice_link = link
@@ -1754,18 +1556,30 @@ def handle_unpaid_invoices(driver):
         print(f"[{len(processed_ids)}/{total_unpaid}] 处理 invoice: {invoice_id}")
 
         try:
-            # 点击下载并通过 Playwright 下载事件保存 PDF 到下载目录
-            safe_iid = re.sub(r'[^\w.\-]', '_', invoice_id)
-            pdf_path = os.path.join(download_dir, f"invoice_{safe_iid}.pdf")
-            try:
-                with driver.page.expect_download(timeout=30_000) as download_info:
-                    invoice_link.click(timeout=CLICK_TIMEOUT_MS)
-                download_info.value.save_as(pdf_path)
-                print(f"  PDF 已下载: {os.path.basename(pdf_path)}")
-            except Exception as e:
-                print(f"  {invoice_id} PDF 下载超时: {e}")
+            # 清空下载目录中的旧 PDF
+            for f in os.listdir(download_dir):
+                if f.endswith('.pdf'):
+                    os.remove(os.path.join(download_dir, f))
+
+            # 点击下载
+            invoice_link.click()
+            print(f"  已点击下载 {invoice_id}...")
+
+            # 等待 PDF 下载完成
+            pdf_path = None
+            for _ in range(30):
+                time.sleep(1)
+                pdfs = [f for f in os.listdir(download_dir) if f.endswith('.pdf') and not f.endswith('.crdownload')]
+                if pdfs:
+                    pdf_path = os.path.join(download_dir, pdfs[0])
+                    break
+
+            if not pdf_path:
+                print(f"  {invoice_id} PDF 下载超时")
                 results.append({"invoice": invoice_id, "status": "failed", "error": "PDF 下载超时"})
                 continue
+
+            print(f"  PDF 已下载: {os.path.basename(pdf_path)}")
 
             # 从 PDF 提取支付链接
             pay_url = _extract_pdf_pay_url(pdf_path)
@@ -1781,31 +1595,46 @@ def handle_unpaid_invoices(driver):
             print(f"  正在等待 {invoice_id} 支付页面加载...")
 
             # 等待 Stripe 支付页面加载完成（Pay 按钮出现）
-            pay_btn = driver.page.locator(
-                "button[data-testid='hosted-payment-submit-button']"
-            ).first
-            if not _wait_visible(pay_btn, timeout=120_000):
+            try:
+                pay_wait = WebDriverWait(driver, 120)
+                pay_wait.until(EC.presence_of_element_located((
+                    By.CSS_SELECTOR, "button[data-testid='hosted-payment-submit-button']"
+                )))
+                print(f"  {invoice_id} 支付页面已加载完成")
+            except Exception:
                 print(f"  {invoice_id} 支付页面加载超时")
                 results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": "支付页面加载超时"})
                 # 回到 credits 页面继续处理下一个
-                driver.page.go_back(wait_until="domcontentloaded")
+                driver.back()
                 time.sleep(3)
                 continue
-            print(f"  {invoice_id} 支付页面已加载完成")
 
-            # 切入 Stripe iframe 点击 Card 支付选项（frame_locator 无状态）
+            # 切入 Stripe iframe 点击 Card 支付选项
             try:
-                stripe_frame = driver.page.frame_locator("div#payment-element iframe")
-                card_btn = stripe_frame.locator("div.p-AccordionButton[data-value='card']")
-                _wait_visible(card_btn, timeout=30_000)
-                _safe_click(card_btn, session=driver, desc='Card 支付选项')
+                stripe_iframe = pay_wait.until(EC.presence_of_element_located((
+                    By.CSS_SELECTOR, "div#payment-element iframe"
+                )))
+                driver.switch_to.frame(stripe_iframe)
+                print(f"  {invoice_id} 已切入 Stripe iframe")
+
+                iframe_wait = WebDriverWait(driver, 30)
+                card_btn = iframe_wait.until(EC.element_to_be_clickable((
+                    By.CSS_SELECTOR, "div.p-AccordionButton[data-value='card']"
+                )))
+                card_btn.click()
                 time.sleep(2)
                 print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
+
+                driver.switch_to.default_content()
             except Exception as e:
                 print(f"  {invoice_id} 点击 Card 选项失败: {e}")
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
                 results.append({"invoice": invoice_id, "status": "failed", "pay_url": pay_url, "error": f"点击 Card 选项失败: {e}"})
                 # 回到 credits 页面继续
-                driver.page.go_back(wait_until="domcontentloaded")
+                driver.back()
                 time.sleep(3)
                 continue
 
@@ -1818,11 +1647,11 @@ def handle_unpaid_invoices(driver):
 
         # 处理完一个 invoice 后，回到 credits 页面重新查找
         print(f"  返回 Credits 页面查找剩余 Unpaid invoices...")
-        driver.page.go_back(wait_until="domcontentloaded")
+        driver.back()
         time.sleep(3)
         # 可能需要多次 back（从 Stripe 页面回到 credits）
         if 'credits' not in driver.current_url:
-            driver.page.go_back(wait_until="domcontentloaded")
+            driver.back()
             time.sleep(3)
 
     return results
@@ -1840,6 +1669,8 @@ def fill_signup_form(driver, email: str, password: str):
     返回:
         bool: 是否成功填写并提交
     """
+    wait = WebDriverWait(driver, MAX_WAIT_TIME)
+
     try:
         url = "https://dash.cloudflare.com/sign-up"
         print(f"🌐 正在打开 {url}...")
@@ -1855,11 +1686,10 @@ def fill_signup_form(driver, email: str, password: str):
 
         # 等待邮箱输入框出现
         print("📧 等待邮箱输入框...")
-        email_input = driver.page.locator(
+        email_input = wait.until(EC.visibility_of_element_located((
+            By.CSS_SELECTOR,
             'input[type="email"], input[name="email"], input[id="email"], input[autocomplete="email"]'
-        ).first
-        if not _wait_visible(email_input):
-            raise RuntimeError("邮箱输入框未出现")
+        )))
         email_input.clear()
         type_slowly(email_input, email)
         print(f"✅ 已输入邮箱: {email}")
@@ -1867,9 +1697,10 @@ def fill_signup_form(driver, email: str, password: str):
 
         # 填写密码
         print("🔑 正在填写密码...")
-        password_input = driver.page.locator(
+        password_input = driver.find_element(
+            By.CSS_SELECTOR,
             'input[type="password"], input[name="password"], input[id="password"]'
-        ).first
+        )
         password_input.clear()
         type_slowly(password_input, password)
         print("✅ 密码已输入")
@@ -1877,22 +1708,26 @@ def fill_signup_form(driver, email: str, password: str):
 
         # 勾选条款复选框（如果存在）
         try:
-            terms_checkbox = driver.page.locator(
+            terms_checkbox = driver.find_element(
+                By.CSS_SELECTOR,
                 'input[type="checkbox"][name*="terms"], input[type="checkbox"][id*="terms"], '
                 'input[type="checkbox"][name*="agree"], input[type="checkbox"][id*="agree"]'
-            ).first
-            if not terms_checkbox.is_checked(timeout=SHORT_TIMEOUT_MS):
-                _safe_click(terms_checkbox, session=driver, desc='服务条款复选框')
+            )
+            if not terms_checkbox.is_selected():
+                try:
+                    terms_checkbox.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", terms_checkbox)
                 print("✅ 已勾选服务条款")
                 time.sleep(0.5)
         except Exception:
             # 尝试通过 label 点击
             try:
-                labels = driver.page.locator('label').all()
+                labels = driver.find_elements(By.CSS_SELECTOR, 'label')
                 for label in labels:
-                    text = (label.inner_text() or '').lower()
+                    text = label.text.lower()
                     if 'agree' in text or 'terms' in text or 'policy' in text:
-                        _safe_click(label, session=driver, desc='服务条款label')
+                        label.click()
                         print("✅ 已勾选服务条款 (通过 label)")
                         break
             except Exception:
@@ -1918,9 +1753,12 @@ def fill_signup_form(driver, email: str, password: str):
         clicked = False
         for selector in signup_selectors:
             try:
-                btn = driver.page.locator(selector).first
-                if btn.is_visible():
-                    _safe_click(btn, session=driver, desc='注册按钮')
+                btn = driver.find_element(By.CSS_SELECTOR, selector)
+                if btn.is_displayed():
+                    try:
+                        btn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", btn)
                     clicked = True
                     break
             except Exception:
@@ -1929,11 +1767,11 @@ def fill_signup_form(driver, email: str, password: str):
         if not clicked:
             # 按文本内容查找按钮
             try:
-                btns = driver.page.locator('button').all()
+                btns = driver.find_elements(By.TAG_NAME, 'button')
                 for btn in btns:
-                    text = (btn.inner_text() or '').lower()
+                    text = btn.text.lower()
                     if 'sign up' in text or 'create' in text or 'register' in text:
-                        _safe_click(btn, session=driver, desc='注册按钮(文本)')
+                        driver.execute_script("arguments[0].click();", btn)
                         clicked = True
                         break
             except Exception:
@@ -1989,22 +1827,23 @@ def handle_email_verification(driver, verification_data):
         else:
             print(f"🔢 正在输入验证码: {verification_data}")
             try:
-                code_input = driver.page.locator(
-                    'input[name="code"], input[type="text"][maxlength="6"], '
-                    'input[autocomplete="one-time-code"]'
-                ).first
-                if not _wait_visible(code_input, timeout=30_000):
-                    raise RuntimeError("验证码输入框未出现")
+                code_input = WebDriverWait(driver, 30).until(
+                    EC.visibility_of_element_located((
+                        By.CSS_SELECTOR,
+                        'input[name="code"], input[type="text"][maxlength="6"], '
+                        'input[autocomplete="one-time-code"]'
+                    ))
+                )
                 code_input.clear()
                 type_slowly(code_input, verification_data)
                 time.sleep(1)
 
                 # 提交验证码
                 try:
-                    submit_btn = driver.page.locator('button[type="submit"]').first
-                    _safe_click(submit_btn, session=driver, desc='验证码提交')
+                    submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                    submit_btn.click()
                 except Exception:
-                    code_input.press("Enter")
+                    code_input.send_keys(Keys.ENTER)
 
                 time.sleep(3)
                 return True
@@ -2026,6 +1865,8 @@ def navigate_to_billing(driver):
     返回:
         bool: 是否成功导航到账单页面
     """
+    wait = WebDriverWait(driver, 30)
+
     try:
         # 等待仪表盘加载
         print("⏳ 等待 Cloudflare 仪表盘加载...")
@@ -2069,10 +1910,10 @@ def navigate_to_billing(driver):
 
         for xpath in manage_selectors:
             try:
-                el = driver.page.locator("xpath=" + xpath).first
-                if el.is_visible():
-                    _safe_click(el, session=driver, desc='Manage Account')
-                    print(f"  🔘 点击了: {el.inner_text()}")
+                el = driver.find_element(By.XPATH, xpath)
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    print(f"  🔘 点击了: {el.text}")
                     time.sleep(3)
                     break
             except Exception:
@@ -2088,10 +1929,10 @@ def navigate_to_billing(driver):
 
         for xpath in billing_selectors:
             try:
-                el = driver.page.locator("xpath=" + xpath).first
-                if el.is_visible():
-                    _safe_click(el, session=driver, desc='Billing 链接')
-                    print(f"  🔘 点击了账单链接: {el.inner_text()}")
+                el = driver.find_element(By.XPATH, xpath)
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    print(f"  🔘 点击了账单链接: {el.text}")
                     time.sleep(3)
                     check_and_handle_cf_challenge(driver)
                     if 'billing' in driver.current_url:
@@ -2104,12 +1945,12 @@ def navigate_to_billing(driver):
         # 方法3: 尝试侧边栏导航
         print("🔍 尝试侧边栏导航...")
         try:
-            sidebar_links = driver.page.locator('a[href*="billing"], nav a').all()
+            sidebar_links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="billing"], nav a')
             for link in sidebar_links:
                 href = link.get_attribute('href') or ''
-                text = (link.inner_text() or '').lower()
+                text = link.text.lower()
                 if 'billing' in href or 'billing' in text:
-                    _safe_click(link, session=driver, desc='侧边栏账单链接')
+                    driver.execute_script("arguments[0].click();", link)
                     print("  🔘 点击了侧边栏的账单链接")
                     time.sleep(3)
                     if 'billing' in driver.current_url:
@@ -2168,10 +2009,11 @@ def get_bound_card_count(driver):
 
         # 方法1: 检查是否显示 "No payment method on file"（0 张卡）
         try:
-            no_payment = driver.page.locator(
-                'xpath=//*[contains(text(), "No payment method on file")]'
-            ).all()
-            visible_no_payment = [el for el in no_payment if el.is_visible()]
+            no_payment = driver.find_elements(
+                By.XPATH,
+                '//*[contains(text(), "No payment method on file")]'
+            )
+            visible_no_payment = [el for el in no_payment if el.is_displayed()]
             if visible_no_payment:
                 print("  💳 检测到 'No payment method on file'，当前无绑定信用卡")
                 return 0
@@ -2179,17 +2021,18 @@ def get_bound_card_count(driver):
             pass
 
         # 方法2: 查找 Billing method 区域内的卡号末四位标识
-        card_elements = driver.page.locator(
-            'xpath=//*[contains(text(), "••••") or contains(text(), "****")]'
-        ).all()
-        visible_cards = [el for el in card_elements if el.is_visible()]
+        card_elements = driver.find_elements(
+            By.XPATH,
+            '//*[contains(text(), "••••") or contains(text(), "****")]'
+        )
+        visible_cards = [el for el in card_elements if el.is_displayed()]
         if visible_cards:
             count = len(visible_cards)
             print(f"  💳 检测到 {count} 张已绑定的信用卡 (通过卡号标识)")
             return count
 
         # 方法3: 通过 JS 在 Billing method 区域计数
-        count = driver.page.evaluate("""() => {
+        count = driver.execute_script("""
             // 查找包含 "Billing method" 文本的 section
             var sections = document.querySelectorAll('div, section');
             for (var i = 0; i < sections.length; i++) {
@@ -2208,7 +2051,7 @@ def get_bound_card_count(driver):
                 }
             }
             return -1;  // 未找到 Billing method 区域
-        }""")
+        """)
         if count > 0:
             print(f"  💳 检测到 {count} 张已绑定的信用卡 (通过 Billing method 区域)")
             return count
@@ -2242,7 +2085,7 @@ def _find_and_click_add_button(driver):
     try:
         # 精确定位: 在 "Billing method" 标题旁边的 "+ Add" 按钮
         # 先找到包含 "Billing method" 文本的容器
-        add_handle = driver.page.evaluate_handle("""() => {
+        add_btn = driver.execute_script("""
             // 查找 "Billing method" 标题所在的卡片容器
             var spans = document.querySelectorAll('span');
             for (var i = 0; i < spans.length; i++) {
@@ -2263,13 +2106,12 @@ def _find_and_click_add_button(driver):
                 }
             }
             return null;
-        }""")
+        """)
 
-        add_btn = add_handle.as_element() if add_handle else None
         if add_btn:
-            add_btn.scroll_into_view_if_needed()
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", add_btn)
             time.sleep(0.5)
-            _safe_click(add_btn, session=driver, desc="Billing method Add 按钮")
+            driver.execute_script("arguments[0].click();", add_btn)
             print("  🔘 点击了 Billing method 区域的 'Add' 按钮")
             return True
 
@@ -2283,13 +2125,13 @@ def _find_and_click_add_button(driver):
     ]
     for xpath in fallback_xpaths:
         try:
-            btns = driver.page.locator("xpath=" + xpath).all()
+            btns = driver.find_elements(By.XPATH, xpath)
             for btn in btns:
-                if btn.is_visible():
-                    btn.scroll_into_view_if_needed()
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                     time.sleep(0.5)
-                    _safe_click(btn, session=driver, desc="Add 按钮(xpath)")
-                    print(f"  🔘 点击了: {(btn.inner_text() or '').strip()}")
+                    driver.execute_script("arguments[0].click();", btn)
+                    print(f"  🔘 点击了: {btn.text.strip()}")
                     return True
         except Exception:
             continue
@@ -2311,16 +2153,13 @@ def _wait_for_payment_dialog(driver, timeout=30):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            dialogs = driver.page.locator('[role="dialog"]').all()
+            dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
             for dialog in dialogs:
-                try:
-                    if dialog.is_visible():
-                        text = (dialog.inner_text() or '').lower()
-                        if 'add a payment method' in text or 'payment' in text:
-                            print("  ✅ 检测到 Add a payment method 弹窗")
-                            return True
-                except Exception:
-                    continue
+                if dialog.is_displayed():
+                    text = dialog.text.lower()
+                    if 'add a payment method' in text or 'payment' in text:
+                        print("  ✅ 检测到 Add a payment method 弹窗")
+                        return True
         except Exception:
             pass
         time.sleep(1)
@@ -2331,94 +2170,98 @@ def _wait_for_payment_dialog(driver, timeout=30):
 
 def _wait_for_stripe_iframe(driver, timeout=60):
     """
-    等待 Stripe 信用卡表单外层 iframe 出现/就绪。
+    等待 Stripe 信用卡表单 iframe 加载完成
 
     Stripe 表单位于:
     div[data-test-id="credit-card-form"] > .StripeElement > .__PrivateStripeElement > iframe
 
-    Patchright 版角色变化：不再返回供 switch_to 用的 iframe 元素——实际填卡的
-    _fill_stripe_payment_element 会自行从 page.frames 定位 Stripe frame。本函数
-    仅负责「等待外层 Stripe iframe 出现」并保留原 4 策略的判定意图，返回 bool。
-
     返回:
-        bool: Stripe iframe 是否已就绪
+        WebElement or None: Stripe iframe 元素
     """
-    page = driver.page
     start = time.time()
     debug_logged = False
 
-    def _attrs(iframe):
-        try:
-            title = (iframe.get_attribute('title') or '')
-        except Exception:
-            title = ''
-        try:
-            name = (iframe.get_attribute('name') or '')
-        except Exception:
-            name = ''
-        try:
-            src = (iframe.get_attribute('src') or '')
-        except Exception:
-            src = ''
-        try:
-            visible = iframe.is_visible()
-        except Exception:
-            visible = False
-        return title, name, src, visible
-
     while time.time() - start < timeout:
         try:
-            # 弹窗 dialog 内的所有 iframe
-            dialog_iframes = page.locator('[role="dialog"] iframe').all()
+            # 确保在主文档上下文
+            driver.switch_to.default_content()
+
+            # 先检查弹窗 dialog 内的所有 iframe
+            dialog_iframes = driver.find_elements(
+                By.CSS_SELECTOR,
+                '[role="dialog"] iframe'
+            )
 
             # 每 10 秒输出一次调试信息
             elapsed = int(time.time() - start)
             if elapsed > 0 and elapsed % 10 == 0 and not debug_logged:
                 debug_logged = True
-                print(f"  🔍 DEBUG: 弹窗内找到 {len(dialog_iframes)} 个 iframe:")
+                iframe_info = []
                 for f in dialog_iframes:
-                    title, name, src, visible = _attrs(f)
-                    print(f"    - title='{title}' name='{name}' visible={visible} src='{src[:80]}...'")
+                    try:
+                        title = f.get_attribute('title') or ''
+                        name = f.get_attribute('name') or ''
+                        src = (f.get_attribute('src') or '')[:80]
+                        visible = f.is_displayed()
+                        iframe_info.append(f"title='{title}' name='{name}' visible={visible} src='{src}...'")
+                    except Exception:
+                        pass
+                print(f"  🔍 DEBUG: 弹窗内找到 {len(dialog_iframes)} 个 iframe:")
+                for info in iframe_info:
+                    print(f"    - {info}")
             elif elapsed % 10 != 0:
                 debug_logged = False
 
             # 策略1: 精确匹配 data-test-id="credit-card-form" 内的 iframe
-            for iframe in page.locator('[data-test-id="credit-card-form"] iframe').all():
-                title, name, src, visible = _attrs(iframe)
-                if visible:
+            stripe_iframes = driver.find_elements(
+                By.CSS_SELECTOR,
+                '[data-test-id="credit-card-form"] iframe'
+            )
+            for iframe in stripe_iframes:
+                if iframe.is_displayed():
+                    title = iframe.get_attribute('title') or ''
                     print(f"  ✅ 找到 credit-card-form 内的 iframe (title='{title}')")
-                    return True
+                    return iframe
 
             # 策略2: 按 title 属性匹配
             for iframe in dialog_iframes:
-                title, name, src, visible = _attrs(iframe)
-                if not visible:
+                try:
+                    if not iframe.is_displayed():
+                        continue
+                    title = (iframe.get_attribute('title') or '').lower()
+                    if 'secure payment' in title or 'payment input' in title:
+                        print(f"  ✅ 找到 Stripe payment iframe (title 匹配)")
+                        return iframe
+                except Exception:
                     continue
-                if 'secure payment' in title.lower() or 'payment input' in title.lower():
-                    print("  ✅ 找到 Stripe payment iframe (title 匹配)")
-                    return True
 
             # 策略3: 按 src 属性匹配 (stripe.com 且是 payment 类型)
             for iframe in dialog_iframes:
-                title, name, src, visible = _attrs(iframe)
-                if not visible:
+                try:
+                    if not iframe.is_displayed():
+                        continue
+                    src = (iframe.get_attribute('src') or '').lower()
+                    name = (iframe.get_attribute('name') or '').lower()
+                    if 'stripe.com' in src and ('payment' in src or 'elements-inner' in src):
+                        # 排除 express checkout iframe
+                        if 'express' not in src and 'express' not in name:
+                            print(f"  ✅ 找到 Stripe iframe (src 匹配)")
+                            return iframe
+                except Exception:
                     continue
-                src_l = src.lower()
-                name_l = name.lower()
-                if 'stripe.com' in src_l and ('payment' in src_l or 'elements-inner' in src_l):
-                    # 排除 express checkout iframe
-                    if 'express' not in src_l and 'express' not in name_l:
-                        print("  ✅ 找到 Stripe iframe (src 匹配)")
-                        return True
 
             # 策略4: 按 iframe name 匹配 (__privateStripeFrame)
             for iframe in dialog_iframes:
-                title, name, src, visible = _attrs(iframe)
-                if not visible:
+                try:
+                    if not iframe.is_displayed():
+                        continue
+                    name = iframe.get_attribute('name') or ''
+                    src = (iframe.get_attribute('src') or '').lower()
+                    if name.startswith('__privateStripeFrame') and 'express' not in src:
+                        print(f"  ✅ 找到 Stripe iframe (name='{name}')")
+                        return iframe
+                except Exception:
                     continue
-                if name.startswith('__privateStripeFrame') and 'express' not in src.lower():
-                    print(f"  ✅ 找到 Stripe iframe (name='{name}')")
-                    return True
 
         except Exception as e:
             print(f"  ⚠️ 查找 iframe 异常: {e}")
@@ -2428,16 +2271,22 @@ def _wait_for_stripe_iframe(driver, timeout=60):
     # 超时，输出最终的 iframe 调试信息
     print("  ❌ 等待 Stripe iframe 超时 (60秒)")
     try:
-        all_iframes = page.locator('[role="dialog"] iframe').all()
+        all_iframes = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"] iframe')
         print(f"  🔍 最终状态: 弹窗内共 {len(all_iframes)} 个 iframe:")
         for f in all_iframes:
-            title, name, src, visible = _attrs(f)
-            print(f"    - title='{title}' name='{name}' visible={visible}")
-            print(f"      src={src[:100]}")
+            try:
+                title = f.get_attribute('title') or ''
+                name = f.get_attribute('name') or ''
+                src = (f.get_attribute('src') or '')[:100]
+                visible = f.is_displayed()
+                print(f"    - title='{title}' name='{name}' visible={visible}")
+                print(f"      src={src}")
+            except Exception:
+                pass
     except Exception:
         pass
 
-    return False
+    return None
 
 
 def _fill_billing_address_in_dialog(driver, card_info):
@@ -2458,29 +2307,33 @@ def _fill_billing_address_in_dialog(driver, card_info):
     card_info 字段:
     - first_name, last_name, country, address, address2, city, state, zip, company
     """
-    page = driver.page
+    driver.switch_to.default_content()
     time.sleep(1)
 
     def fill_input(name_attr, value, label=""):
         if not value:
             return False
-        selectors = [
-            f'[data-testid="address-form"] input[name="{name_attr}"]',
-            f'[role="dialog"] input[name="{name_attr}"]',
-            f'input[name="{name_attr}"]',
-        ]
-        for sel in selectors:
-            try:
-                el = page.locator(sel).first
-                if el.count() == 0 or not el.is_visible():
+        try:
+            selectors = [
+                f'[data-testid="address-form"] input[name="{name_attr}"]',
+                f'[role="dialog"] input[name="{name_attr}"]',
+                f'input[name="{name_attr}"]',
+            ]
+            for sel in selectors:
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, sel)
+                    if el.is_displayed():
+                        el.click()
+                        time.sleep(0.2)
+                        el.clear()
+                        type_slowly(el, value)
+                        print(f"  ✅ 填写 {label or name_attr}: {value}")
+                        time.sleep(0.3)
+                        return True
+                except Exception:
                     continue
-                # 账单文本字段在主文档 dialog（非跨域 Stripe iframe），用 _safe_fill 回读校验
-                _safe_fill(el, value, session=driver, verify=True, desc=label or name_attr)
-                print(f"  ✅ 填写 {label or name_attr}: {value}")
-                time.sleep(0.3)
-                return True
-            except Exception:
-                continue
+        except Exception:
+            pass
         print(f"  ❌ 未找到 {label or name_attr} 输入框")
         return False
 
@@ -2498,34 +2351,34 @@ def _fill_billing_address_in_dialog(driver, card_info):
                 '[role="dialog"] input[name="country"]',
             ]:
                 try:
-                    el = page.locator(sel).first
-                    if el.count() > 0 and el.is_visible():
+                    el = driver.find_element(By.CSS_SELECTOR, sel)
+                    if el.is_displayed():
                         country_input = el
                         break
                 except Exception:
                     continue
 
-            if country_input is not None:
+            if country_input:
                 country_input.click()
                 time.sleep(0.3)
-                # 清除已有内容：用 Control+a + Backspace（Playwright press 组合键不会
-                # 像 Windows 下 send_keys(CONTROL+'a') 那样泄漏字母 'a'）
-                country_input.press("Control+a")
-                time.sleep(0.1)
-                country_input.press("Backspace")
+                # 清除已有内容: 用 ActionChains 确保修饰键正确按住
+                # send_keys(Keys.CONTROL + 'a') 在 Windows 上可能泄漏字母 'a'
+                actions = ActionChains(driver)
+                actions.click(country_input)
+                actions.key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL)
+                actions.pause(0.1)
+                actions.send_keys(Keys.BACKSPACE)
+                actions.perform()
                 time.sleep(0.3)
                 # 输入国家名称
-                country_input.press_sequentially(str(country), delay=50)
+                type_slowly(country_input, country)
                 time.sleep(1.5)
                 # 从下拉列表中找到精确匹配的选项并点击
                 exact_matched = False
                 try:
-                    options = page.locator('[role="option"], [role="listbox"] li, ul[id] li').all()
+                    options = driver.find_elements(By.CSS_SELECTOR, '[role="option"], [role="listbox"] li, ul[id] li')
                     for opt in options:
-                        try:
-                            opt_text = (opt.inner_text() or '').strip()
-                        except Exception:
-                            continue
+                        opt_text = opt.text.strip()
                         if opt_text.lower() == country.lower():
                             opt.click()
                             exact_matched = True
@@ -2534,9 +2387,9 @@ def _fill_billing_address_in_dialog(driver, card_info):
                     pass
                 if not exact_matched:
                     # 回退：选择第一项
-                    country_input.press("ArrowDown")
+                    country_input.send_keys(Keys.ARROW_DOWN)
                     time.sleep(0.3)
-                    country_input.press("Enter")
+                    country_input.send_keys(Keys.ENTER)
                 print(f"  ✅ 填写 Country: {country}")
                 time.sleep(0.5)
             else:
@@ -2599,25 +2452,27 @@ def add_credit_card(driver, card_info):
 
         # 3. 等待 Stripe iframe 加载
         print("⏳ 等待 Stripe 信用卡表单加载...")
-        stripe_ready = _wait_for_stripe_iframe(driver)
-        if not stripe_ready:
+        stripe_iframe = _wait_for_stripe_iframe(driver)
+        if not stripe_iframe:
             return False, "[操作失败] Stripe表单未加载"
 
         time.sleep(2)
 
-        # 4. 填写信用卡信息
-        # Patchright 版：_fill_stripe_payment_element 自行从 page.frames 定位 Stripe
-        # frame（frame_locator/page.frames 无状态、原生穿透跨域嵌套），无需先 switch_to.frame。
+        # 4. 切入 Stripe iframe 填写信用卡信息
         print("💳 正在填写信用卡信息 (Stripe iframe)...")
+        driver.switch_to.default_content()
+        driver.switch_to.frame(stripe_iframe)
         time.sleep(1)
 
-        # 等待 Stripe 内部组件（输入字段/嵌套 iframe）实际渲染完成
+        # 等待 Stripe iframe 内部组件（输入字段/嵌套 iframe）实际渲染完成
         # 弹窗和外层 iframe 出现后，内部字段可能仍在加载中
         _wait_for_stripe_fields_ready(driver)
 
         # Stripe Payment Element 使用统一的表单，字段可能在嵌套 iframe 中
+        # 尝试在当前 iframe 内直接查找并填写
         card_filled = _fill_stripe_payment_element(driver, card_info)
-        driver.capture_frame()
+
+        driver.switch_to.default_content()
 
         if not card_filled:
             print("  ❌ 填写信用卡信息失败")
@@ -2646,10 +2501,8 @@ def add_credit_card(driver, card_info):
         time.sleep(1)
 
         # 6. 清空旧错误日志（确保只检测本次提交产生的错误）
-        # Patchright 版：错误检测已改事件驱动（page.on("console") → driver.console_errors），
-        # 清空累积错误列表，避免跨重试的旧错误导致误报。
         try:
-            driver.console_errors.clear()
+            driver.execute_script("window.__cfAutoErrors = [];")
         except Exception:
             pass
 
@@ -2665,13 +2518,10 @@ def add_credit_card(driver, card_info):
             return False, "[操作失败] 未找到提交按钮"
 
         # 先滚动到按钮可见
-        try:
-            submit_btn.scroll_into_view_if_needed()
-        except Exception:
-            pass
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", submit_btn)
         time.sleep(0.5)
 
-        # 优先使用原生点击（更好地触发 React/Stripe 事件），失败回退 JS 点击
+        # 优先使用原生 Selenium 点击（更好地触发 React/Stripe 事件）
         try:
             submit_btn.click()
             print("  🔘 已点击 'Add payment method' 按钮 (原生点击)")
@@ -2679,7 +2529,7 @@ def add_credit_card(driver, card_info):
         except Exception as e1:
             print(f"  ⚠️ 原生点击失败: {e1}, 尝试 JS 点击...")
             try:
-                submit_btn.evaluate("el => el.click()")
+                driver.execute_script("arguments[0].click();", submit_btn)
                 print("  🔘 已点击 'Add payment method' 按钮 (JS 点击)")
                 submitted = True
             except Exception as e2:
@@ -2689,13 +2539,15 @@ def add_credit_card(driver, card_info):
             print("  ❌ 点击提交按钮失败")
             return False, "[浏览器中断] 点击提交按钮失败"
 
-        driver.capture_frame()
-
         # 8. 等待提交结果（含人机验证检测）
         return _wait_for_payment_submit_result(driver)
 
     except Exception as e:
         print(f"❌ 添加信用卡失败: {e}")
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
         return False, f"[浏览器中断] {str(e)[:150]}"
 
 
@@ -2707,6 +2559,8 @@ def _handle_dialog_turnstile(driver, max_wait=120):
 
     注意: 卡片错误可能和 Turnstile 同时出现，优先检测卡片错误
     """
+    driver.switch_to.default_content()
+
     # 优先检查是否已有卡片错误（卡信息有误时过验证码也没用）
     card_error = _check_dialog_card_error(driver)
     if card_error:
@@ -2716,11 +2570,11 @@ def _handle_dialog_turnstile(driver, max_wait=120):
     # 检查弹窗内是否存在 Turnstile
     has_turnstile = False
     try:
-        dialog = driver.page.locator('[role="dialog"]').first
-        if not dialog.is_visible():
+        dialog = driver.find_element(By.CSS_SELECTOR, '[role="dialog"]')
+        if not dialog.is_displayed():
             return True
 
-        dialog_text = dialog.inner_text().lower()
+        dialog_text = dialog.text.lower()
         if ("let us know you" in dialog_text or
             "verify you are human" in dialog_text or
             "captcha is required" in dialog_text or
@@ -2730,14 +2584,14 @@ def _handle_dialog_turnstile(driver, max_wait=120):
 
         # 也检查弹窗内是否有 Turnstile iframe 或容器
         if not has_turnstile:
-            turnstile_els = dialog.locator(
+            turnstile_els = dialog.find_elements(By.CSS_SELECTOR,
                 'iframe[src*="challenges.cloudflare.com"], '
                 'iframe[src*="turnstile"], '
                 '[data-testid="challenge-widget-container"], '
                 'iframe[title*="challenge"], '
                 'iframe[title*="Turnstile"], '
-                '[id*="cf-chl-widget"]').all()
-            if any(el.is_visible() for el in turnstile_els):
+                '[id*="cf-chl-widget"]')
+            if any(el.is_displayed() for el in turnstile_els):
                 has_turnstile = True
     except Exception:
         return True
@@ -2756,7 +2610,6 @@ def _handle_dialog_turnstile(driver, max_wait=120):
     print("  ⏳ 等待 Turnstile 后台验证...")
     for i in range(10):
         time.sleep(3)
-        driver.capture_frame()
         if _is_dialog_turnstile_solved(driver):
             print("  ✅ 弹窗内 Turnstile 验证已通过！")
             return True
@@ -2785,7 +2638,6 @@ def _handle_dialog_turnstile(driver, max_wait=120):
 
     start = time.time()
     while time.time() - start < max_wait:
-        driver.capture_frame()
         if _is_dialog_turnstile_solved(driver):
             elapsed = int(time.time() - start)
             print(f"  ✅ 弹窗内 Turnstile 验证已通过！(耗时 {elapsed} 秒)")
@@ -2799,13 +2651,16 @@ def _handle_dialog_turnstile(driver, max_wait=120):
 def _is_dialog_turnstile_solved(driver):
     """检测弹窗内 Turnstile 验证是否已完成"""
     try:
+        driver.switch_to.default_content()
+
         # 方法1: 检查隐藏 input 是否有 token 值
-        hidden_inputs = driver.page.locator(
+        hidden_inputs = driver.find_elements(
+            By.CSS_SELECTOR,
             'input[name="cf_challenge_response"], '
             'input[name="cf-turnstile-response"], '
             'input[name*="turnstile"], '
             'input[name*="challenge_response"]'
-        ).all()
+        )
         for inp in hidden_inputs:
             value = inp.get_attribute('value') or ''
             if len(value) > 10:
@@ -2813,7 +2668,7 @@ def _is_dialog_turnstile_solved(driver):
 
         # 方法2: 通过 JS 查找（包括弹窗内部）
         try:
-            result = driver.page.evaluate("""() => {
+            result = driver.execute_script("""
                 var dialog = document.querySelector('[role="dialog"]');
                 if (!dialog) return false;
                 // 弹窗内查找 token input
@@ -2831,7 +2686,7 @@ def _is_dialog_turnstile_solved(driver):
                 var cf2 = document.querySelector('input[name="cf_challenge_response"]');
                 if (cf2 && cf2.value && cf2.value.length > 10) return true;
                 return false;
-            }""")
+            """)
             if result:
                 return True
         except Exception:
@@ -2839,9 +2694,9 @@ def _is_dialog_turnstile_solved(driver):
 
         # 方法3: 检查弹窗中的验证提示文字是否消失
         try:
-            dialog = driver.page.locator('[role="dialog"]').first
-            if dialog.is_visible():
-                dialog_text = dialog.inner_text().lower()
+            dialog = driver.find_element(By.CSS_SELECTOR, '[role="dialog"]')
+            if dialog.is_displayed():
+                dialog_text = dialog.text.lower()
                 # 如果 "captcha is required" 和 "verify you are human" 都不在了
                 if ('captcha is required' not in dialog_text and
                     'let us know you' not in dialog_text and
@@ -2852,7 +2707,7 @@ def _is_dialog_turnstile_solved(driver):
 
         # 方法4: 检查 Turnstile iframe 中的 checkbox 是否已勾选（通过 aria-checked）
         try:
-            result = driver.page.evaluate("""() => {
+            result = driver.execute_script("""
                 var iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
                 for (var i = 0; i < iframes.length; i++) {
                     if (!iframes[i].offsetParent) continue;
@@ -2866,7 +2721,7 @@ def _is_dialog_turnstile_solved(driver):
                     }
                 }
                 return false;
-            }""")
+            """)
             if result:
                 return True
         except Exception:
@@ -2880,15 +2735,14 @@ def _is_dialog_turnstile_solved(driver):
 
 def _check_browser_console_for_errors(driver):
     """
-    从事件驱动收集的控制台日志中检测 Stripe/支付错误。
-    Patchright 版：不再注入页面 JS（避免暴露自动化），改读 create_driver 挂载的
-    page.on("console") 监听器收集到的 driver.console_errors（已按 _CARD_ERROR_PATTERNS 过滤）。
+    从拦截的控制台日志中检测 Stripe/支付错误
+    通过 Page.addScriptToEvaluateOnNewDocument 在页面 JS 执行前注入拦截器，
     捕获 Cloudflare 输出的如:
       ⛔️ Setup intent error: Your card's CVC is incorrect.
       ⚠️ Form error handler [There was an error processing your card...]
     """
     try:
-        errors = list(driver.console_errors or [])
+        errors = driver.execute_script("return window.__cfAutoErrors || [];")
         if not errors:
             return None
         for err in errors:
@@ -2912,6 +2766,8 @@ def _check_browser_console_for_errors(driver):
         pass
     return None
 
+    return None
+
 
 def _check_stripe_iframe_errors(driver):
     """
@@ -2925,41 +2781,14 @@ def _check_stripe_iframe_errors(driver):
     if console_err:
         return console_err
 
-    # 方法2: 原生 frame 枚举（优先，隐蔽）——Patchright 的 page.frames 原生支持
-    # 跨域 Stripe iframe，可直接在其内读取 .p-FieldError 文本，无需 CDP 隔离世界。
-    err_selector = ('.p-FieldError, [role="alert"][id*="Error"], '
-                    '[role="alert"].Error, [id*="Error"].Error')
+    # 方法2: CDP - 在每个 iframe 的独立执行上下文中查询 DOM
     try:
-        for fr in driver.page.frames:
-            try:
-                field_errors = fr.locator(err_selector).all()
-            except Exception:
-                continue
-            for fe in field_errors:
-                try:
-                    if not fe.is_visible():
-                        continue
-                    err_text = (fe.inner_text() or '').strip()
-                    if err_text and len(err_text) > 3:
-                        try:
-                            furl = (fr.url or '?')[:50]
-                        except Exception:
-                            furl = '?'
-                        print(f"  [frame FieldError] 在 frame {furl} 中发现错误")
-                        return err_text[:200]
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    # 方法3: CDP - 在每个 iframe 的独立执行上下文中查询 DOM（跨域 + closed shadow 兜底）
-    try:
-        frame_tree = driver._cdp().send('Page.getFrameTree', {})
+        frame_tree = driver.execute_cdp_cmd('Page.getFrameTree', {})
         all_frames = _collect_all_child_frames(frame_tree.get('frameTree', {}))
 
         for frame_info in all_frames:
             try:
-                world = driver._cdp().send('Page.createIsolatedWorld', {
+                world = driver.execute_cdp_cmd('Page.createIsolatedWorld', {
                     'frameId': frame_info['id'],
                     'worldName': 'err_chk_' + str(int(time.time() * 1000)),
                     'grantUniversalAccess': True,
@@ -2968,7 +2797,7 @@ def _check_stripe_iframe_errors(driver):
                 if not ctx_id:
                     continue
 
-                result = driver._cdp().send('Runtime.evaluate', {
+                result = driver.execute_cdp_cmd('Runtime.evaluate', {
                     'expression': '''
                         (function() {
                             var sels = [
@@ -2999,14 +2828,56 @@ def _check_stripe_iframe_errors(driver):
     except Exception:
         pass
 
-    # 方法4: CDP DOM 穿透遍历（closed shadow DOM 最终兜底）
+    # 方法3: CDP DOM 穿透遍历
     try:
-        doc = driver._cdp().send('DOM.getDocument', {'depth': -1, 'pierce': True})
+        doc = driver.execute_cdp_cmd('DOM.getDocument', {'depth': -1, 'pierce': True})
         error_text = _find_stripe_field_errors_in_dom(doc['root'])
         if error_text:
             return error_text
     except Exception:
         pass
+
+    # 方法4: Selenium frame 切换（最后兜底）
+    try:
+        driver.switch_to.default_content()
+        target_iframes = []
+        all_dialog_iframes = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"] iframe')
+        for iframe in all_dialog_iframes:
+            try:
+                if not iframe.is_displayed():
+                    continue
+                name = iframe.get_attribute('name') or ''
+                src = (iframe.get_attribute('src') or '').lower()
+                title = (iframe.get_attribute('title') or '').lower()
+                if ('stripe' in src or 'payment' in title.lower() or
+                    name.startswith('__privateStripeFrame')):
+                    if 'express' not in src:
+                        target_iframes.append(iframe)
+            except Exception:
+                continue
+
+        for sf in target_iframes:
+            try:
+                driver.switch_to.default_content()
+                driver.switch_to.frame(sf)
+                field_errors = driver.find_elements(By.CSS_SELECTOR,
+                    '.p-FieldError, [role="alert"][id*="Error"], '
+                    '[role="alert"].Error, [id*="Error"].Error')
+                for fe in field_errors:
+                    if fe.is_displayed():
+                        err_text = fe.text.strip()
+                        if err_text:
+                            driver.switch_to.default_content()
+                            return err_text[:200]
+            except Exception:
+                pass
+
+        driver.switch_to.default_content()
+    except Exception:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
 
     return None
 
@@ -3120,18 +2991,15 @@ def _check_dialog_card_error(driver):
 
     try:
         dialog = None
-        dialogs = driver.page.locator('[role="dialog"]').all()
+        dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
         for d in dialogs:
-            try:
-                if d.is_visible():
-                    dialog = d
-                    break
-            except Exception:
-                continue
+            if d.is_displayed():
+                dialog = d
+                break
         if not dialog:
             return None
 
-        dialog_text = dialog.inner_text()
+        dialog_text = dialog.text
 
         # 中文错误信息检测 —— 按分类分组
         cn_declined = ['银行卡被拒', '交易被拒绝', '卡片被拒绝', '信用卡被拒', '资金不足', '余额不足']
@@ -3196,13 +3064,13 @@ def _check_dialog_card_error(driver):
         # 检测弹窗内的错误提示元素（role="alert" 等）
         # 排除 captcha 相关的提示（如 "Captcha is required."）
         try:
-            error_els = dialog.locator(
+            error_els = dialog.find_elements(By.CSS_SELECTOR,
                 '[role="alert"], [data-error], '
-                '.field-error, .form-error, .validation-error').all()
+                '.field-error, .form-error, .validation-error')
             for err_el in error_els:
-                if not err_el.is_visible():
+                if not err_el.is_displayed():
                     continue
-                err_text = (err_el.inner_text() or '').strip()
+                err_text = err_el.text.strip()
                 if not err_text:
                     continue
                 # 排除 captcha 相关提示
@@ -3226,20 +3094,23 @@ def _check_dialog_card_error(driver):
 
 
 def _find_payment_submit_button(driver):
-    """在弹窗中查找 'Add payment method' 提交按钮。返回 Playwright Locator 或 None。"""
-    page = driver.page
-
-    # 方法1: 弹窗内 data-kumo-component 按钮中精确匹配 "Add payment method"
+    """在弹窗中查找 'Add payment method' 提交按钮"""
+    # 方法1: 精确匹配 data-kumo-component 按钮
     try:
-        dialog = page.locator('[role="dialog"]').first
-        if dialog.count() > 0:
-            buttons = dialog.locator('button[data-kumo-component="Button"]').all()
-            for btn in buttons:
-                try:
-                    if (btn.inner_text() or '').strip() == 'Add payment method' and btn.is_visible():
-                        return btn
-                except Exception:
-                    continue
+        submit_btn = driver.execute_script("""
+            var dialog = document.querySelector('[role="dialog"]');
+            if (!dialog) return null;
+            var buttons = dialog.querySelectorAll('button[data-kumo-component="Button"]');
+            for (var i = 0; i < buttons.length; i++) {
+                var text = buttons[i].textContent.trim();
+                if (text === 'Add payment method') {
+                    return buttons[i];
+                }
+            }
+            return null;
+        """)
+        if submit_btn and submit_btn.is_displayed():
+            return submit_btn
     except Exception:
         pass
 
@@ -3251,13 +3122,10 @@ def _find_payment_submit_button(driver):
     ]
     for xpath in submit_xpaths:
         try:
-            btns = page.locator("xpath=" + xpath).all()
+            btns = driver.find_elements(By.XPATH, xpath)
             for btn in btns:
-                try:
-                    if btn.is_visible() and 'Cancel' not in (btn.inner_text() or ''):
-                        return btn
-                except Exception:
-                    continue
+                if btn.is_displayed() and 'Cancel' not in btn.text:
+                    return btn
         except Exception:
             continue
 
@@ -3275,26 +3143,11 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     4. 页面跳转到 3DS 验证页面 → 等待用户完成
 
     参数:
-        driver: 浏览器驱动（BrowserSession）
+        driver: 浏览器驱动
         max_wait: 最大等待时间（秒），默认 180 秒
     返回:
         tuple[bool, str]: (是否成功添加, 错误原因字符串)
     """
-    page = driver.page
-
-    def _vis(loc):
-        try:
-            return loc.is_visible()
-        except Exception:
-            return False
-
-    def _no_visible_dialog():
-        try:
-            dialogs = page.locator('[role="dialog"]').all()
-            return not any(_vis(d) for d in dialogs)
-        except Exception:
-            return False
-
     print("⏳ 等待提交结果...")
     time.sleep(5)
 
@@ -3306,9 +3159,14 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         return False, card_error
 
     # 检查弹窗是否已关闭（提交成功）
-    if _no_visible_dialog():
-        print("🎉 信用卡添加成功！(弹窗已关闭)")
-        return True, ""
+    try:
+        dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+        visible_dialogs = [d for d in dialogs if d.is_displayed()]
+        if not visible_dialogs:
+            print("🎉 信用卡添加成功！(弹窗已关闭)")
+            return True, ""
+    except Exception:
+        pass
 
     print("  ⏳ 开始检测结果...")
 
@@ -3320,13 +3178,20 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     start = time.time()
 
     while time.time() - start < max_wait:
-        # 每轮刷新截图缓存，让实时截图流保持流畅（业务线程内调用）
-        driver.capture_frame()
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
 
         # 检查1: 弹窗是否已关闭（成功标志）
-        if _no_visible_dialog():
-            print("🎉 信用卡添加成功！(弹窗已关闭)")
-            return True, ""
+        try:
+            dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+            visible_dialogs = [d for d in dialogs if d.is_displayed()]
+            if not visible_dialogs:
+                print("🎉 信用卡添加成功！(弹窗已关闭)")
+                return True, ""
+        except Exception:
+            pass
 
         # 检查2: 弹窗内是否有表单/卡片错误（优先于 captcha 检测）
         card_error = _check_dialog_card_error(driver)
@@ -3339,19 +3204,22 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         captcha_type = None  # 'turnstile', 'hcaptcha', 'unknown'
         try:
             # Cloudflare Turnstile
-            turnstile = page.locator(
+            turnstile = driver.find_elements(
+                By.CSS_SELECTOR,
                 'iframe[src*="challenges.cloudflare.com"], '
                 'iframe[src*="turnstile"], '
                 '[data-testid="challenge-widget-container"], '
                 'iframe[title*="challenge"], '
                 'iframe[title*="Turnstile"]'
-            ).all()
-            if any(_vis(el) for el in turnstile):
+            )
+            visible_turnstile = [el for el in turnstile if el.is_displayed()]
+            if visible_turnstile:
                 captcha_type = 'turnstile'
 
             # hCaptcha (主文档 + 所有 iframe 内部)
             if not captcha_type:
-                hcaptcha = page.locator(
+                hcaptcha = driver.find_elements(
+                    By.CSS_SELECTOR,
                     'iframe[src*="hcaptcha.com"], '
                     'iframe[src*="hcaptcha"], '
                     '.HCaptcha-container, '
@@ -3361,50 +3229,59 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                     'iframe[title*="hcaptcha"], '
                     'iframe[data-hcaptcha-widget-id], '
                     '[data-hcaptcha-widget-id]'
-                ).all()
-                if any(_vis(el) for el in hcaptcha):
+                )
+                visible_hcaptcha = [el for el in hcaptcha if el.is_displayed()]
+                if visible_hcaptcha:
                     captcha_type = 'hcaptcha'
 
-                # 在嵌套 iframe 中查找 hCaptcha（page.frames 已含全部嵌套层级，
-                # 原生穿透跨域，替代旧的 switch_to.frame 逐层遍历）
+                # 在嵌套 iframe 中查找 hCaptcha
                 if not captcha_type:
                     try:
-                        main = page.main_frame
-                        for fr in page.frames:
-                            if fr is main:
-                                continue
+                        all_iframes = driver.find_elements(By.TAG_NAME, 'iframe')
+                        for iframe in all_iframes:
                             try:
-                                inner_hcaptcha = fr.locator(
+                                if not iframe.is_displayed():
+                                    continue
+                                driver.switch_to.frame(iframe)
+                                inner_hcaptcha = driver.find_elements(
+                                    By.CSS_SELECTOR,
                                     'iframe[src*="hcaptcha.com"], '
                                     'iframe[src*="hcaptcha-inner"], '
                                     'iframe[src*="hcaptcha"], '
                                     '.h-captcha, '
                                     '[data-hcaptcha-widget-id]'
-                                ).all()
-                                if any(_vis(el) for el in inner_hcaptcha):
+                                )
+                                if any(el.is_displayed() for el in inner_hcaptcha):
                                     captcha_type = 'hcaptcha'
+                                driver.switch_to.default_content()
+                                if captcha_type:
                                     break
                             except Exception:
-                                continue
+                                try:
+                                    driver.switch_to.default_content()
+                                except Exception:
+                                    pass
                     except Exception:
-                        pass
+                        try:
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
 
             # Stripe 3DS 验证弹窗
             if not captcha_type:
-                threed_frames = page.locator(
+                threed_frames = driver.find_elements(
+                    By.CSS_SELECTOR,
                     'iframe[name*="__stripeJSAuth"], '
                     'iframe[src*="3ds"], '
                     'iframe[title*="3D Secure"]'
-                ).all()
-                if any(_vis(el) for el in threed_frames):
+                )
+                visible_3ds = [el for el in threed_frames if el.is_displayed()]
+                if visible_3ds:
                     captcha_type = 'unknown'
 
             # 页面文本检测
             if not captcha_type:
-                try:
-                    body_text = (page.inner_text('body', timeout=SHORT_TIMEOUT_MS) or '').lower()
-                except Exception:
-                    body_text = ''
+                body_text = driver.find_element(By.TAG_NAME, 'body').text.lower()
                 captcha_keywords = [
                     'verify you are human', 'human verification',
                     '确认您是真人', '验证您不是机器人',
@@ -3415,8 +3292,8 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                     if kw in body_text:
                         # 再判断具体类型
                         try:
-                            hc = page.locator('iframe[src*="hcaptcha.com"]').all()
-                            if any(_vis(el) for el in hc):
+                            hc = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="hcaptcha.com"]')
+                            if any(el.is_displayed() for el in hc):
                                 captcha_type = 'hcaptcha'
                             else:
                                 captcha_type = 'unknown'
@@ -3443,15 +3320,19 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                         challenge_loaded = False
                         for _ in range(15):
                             time.sleep(2)
-                            driver.capture_frame()
                             # 先检查是否意外直接通过了
-                            if _no_visible_dialog():
-                                print("  🎉 hCaptcha 直接通过，信用卡添加成功！")
-                                return True, ""
                             try:
-                                modals = page.locator(
-                                    '.LightboxModal-open, .HCaptcha-container').all()
-                                if not any(_vis(m) for m in modals):
+                                dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+                                visible_dialogs = [d for d in dialogs if d.is_displayed()]
+                                if not visible_dialogs:
+                                    print("  🎉 hCaptcha 直接通过，信用卡添加成功！")
+                                    return True, ""
+                            except Exception:
+                                pass
+                            try:
+                                modals = driver.find_elements(By.CSS_SELECTOR,
+                                    '.LightboxModal-open, .HCaptcha-container')
+                                if not any(m.is_displayed() for m in modals):
                                     print("  ✅ hCaptcha 验证已通过！")
                                     solved = True
                                     break
@@ -3459,19 +3340,13 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                                 pass
                             # 检测图片挑战 iframe 是否已加载
                             try:
-                                challenge_iframes = page.locator(
+                                challenge_iframes = driver.find_elements(By.CSS_SELECTOR,
                                     'iframe[src*="hcaptcha.com/challenge"], '
                                     'iframe[src*="hcaptcha.com/getcaptcha"], '
-                                    'iframe[src*="newassets.hcaptcha.com"][style*="position"]').all()
+                                    'iframe[src*="newassets.hcaptcha.com"][style*="position"]')
                                 # 图片挑战 iframe 通常尺寸较大（宽>300px）
                                 for cf in challenge_iframes:
-                                    if not _vis(cf):
-                                        continue
-                                    try:
-                                        bb = cf.bounding_box()
-                                    except Exception:
-                                        bb = None
-                                    if bb and bb.get('width', 0) > 300:
+                                    if cf.is_displayed() and cf.size.get('width', 0) > 300:
                                         challenge_loaded = True
                                         break
                             except Exception:
@@ -3491,10 +3366,13 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                     if _click_turnstile_via_cdp(driver):
                         for _ in range(8):
                             time.sleep(2)
-                            driver.capture_frame()
-                            if _no_visible_dialog():
-                                print("  🎉 Turnstile 通过，信用卡添加成功！")
-                                return True, ""
+                            try:
+                                dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+                                if not any(d.is_displayed() for d in dialogs):
+                                    print("  🎉 Turnstile 通过，信用卡添加成功！")
+                                    return True, ""
+                            except Exception:
+                                pass
                     if captcha_solver.is_available():
                         print("  🤖 尝试使用 2Captcha 解决 Turnstile...")
                         solved = captcha_solver.solve_turnstile(driver)
@@ -3505,30 +3383,31 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
 
                 if solved:
                     time.sleep(5)
-                    driver.capture_frame()
-                    if _no_visible_dialog():
-                        print("  🎉 验证解决成功，信用卡添加成功！")
-                        return True, ""
+                    try:
+                        dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+                        visible_dialogs = [d for d in dialogs if d.is_displayed()]
+                        if not visible_dialogs:
+                            print("  🎉 验证解决成功，信用卡添加成功！")
+                            return True, ""
+                    except Exception:
+                        pass
                     # 检查 LightboxModal 是否关闭
                     try:
-                        modals = page.locator(
-                            '.LightboxModal-open, .HCaptcha-container').all()
-                        if not any(_vis(m) for m in modals):
+                        modals = driver.find_elements(By.CSS_SELECTOR,
+                            '.LightboxModal-open, .HCaptcha-container')
+                        if not any(m.is_displayed() for m in modals):
                             print("  ✅ 验证已通过，等待页面响应...")
                     except Exception:
                         pass
                     # 验证完成后弹窗仍在 → 重新点击提交按钮
                     try:
                         resubmit_btn = _find_payment_submit_button(driver)
-                        if resubmit_btn is not None and resubmit_btn.is_enabled():
+                        if resubmit_btn and resubmit_btn.is_enabled():
                             print("  🔄 验证解决后重新点击提交按钮...")
                             try:
                                 resubmit_btn.click()
                             except Exception:
-                                try:
-                                    resubmit_btn.evaluate("el => el.click()")
-                                except Exception:
-                                    pass
+                                driver.execute_script("arguments[0].click();", resubmit_btn)
                             last_retry_click_time = time.time()
                             time.sleep(3)
                     except Exception:
@@ -3549,15 +3428,13 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         # (卡片错误检测已在循环开头的 _check_dialog_card_error 中处理)
 
         # 检查4: 提交按钮状态检测 → 可点击则重试，loading 超时则放弃
+        elapsed = int(time.time() - start)
         if time.time() - last_retry_click_time > 7:
             try:
                 retry_btn = _find_payment_submit_button(driver)
-                if retry_btn is not None:
-                    try:
-                        btn_enabled = retry_btn.is_enabled()
-                    except Exception:
-                        btn_enabled = False
-                    aria_disabled = (retry_btn.get_attribute('aria-disabled') or '') == 'true'
+                if retry_btn:
+                    btn_enabled = retry_btn.is_enabled()
+                    aria_disabled = retry_btn.get_attribute('aria-disabled') == 'true'
                     # 只依赖原生 disabled 属性和 aria-disabled 判断，避免 class 名误判
                     is_loading = (not btn_enabled or aria_disabled)
                     btn_classes = retry_btn.get_attribute('class') or ''
@@ -3581,7 +3458,7 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
                                 retry_btn.click()
                             except Exception:
                                 try:
-                                    retry_btn.evaluate("el => el.click()")
+                                    driver.execute_script("arguments[0].click();", retry_btn)
                                 except Exception:
                                     pass
                             time.sleep(3)
@@ -3593,8 +3470,8 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
         elapsed = int(time.time() - start)
         if elapsed % 30 < 4:
             try:
-                iframe_count = len(page.locator('iframe').all())
-                dialog_count = len([d for d in page.locator('[role="dialog"]').all() if _vis(d)])
+                iframe_count = len(driver.find_elements(By.TAG_NAME, 'iframe'))
+                dialog_count = len([d for d in driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]') if d.is_displayed()])
                 print(f"  ⏳ 等待中... ({elapsed}s) 弹窗:{dialog_count} iframe:{iframe_count}")
             except Exception:
                 pass
@@ -3603,9 +3480,14 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     # 超时
     print(f"  ⚠️ 等待提交结果超时 ({max_wait}秒)")
     # 最后检查一次弹窗状态
-    if _no_visible_dialog():
-        print("🎉 信用卡添加成功！(弹窗已关闭)")
-        return True, ""
+    try:
+        dialogs = driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
+        visible_dialogs = [d for d in dialogs if d.is_displayed()]
+        if not visible_dialogs:
+            print("🎉 信用卡添加成功！(弹窗已关闭)")
+            return True, ""
+    except Exception:
+        pass
 
     _close_payment_dialog(driver)
     return False, f"[超时] 等待提交结果超过{max_wait}秒"
@@ -3620,14 +3502,12 @@ def _fill_stripe_payment_element(driver, card_info):
     或嵌套 iframe 的方式渲染
 
     参数:
-        driver: 浏览器驱动（BrowserSession）。Patchright 版不依赖「已切入 iframe」的
-                状态——frame_locator/page.frames 无状态，函数自行从页面根定位 Stripe 字段。
+        driver: 已切入 Stripe iframe 的驱动
         card_info: 信用卡信息
     返回:
         bool: 是否成功填写
     """
     filled_any = False
-    page = driver.page
 
     # 尝试直接在当前 iframe 中查找输入框
     card_selectors = [
@@ -3710,166 +3590,164 @@ def _fill_stripe_payment_element(driver, card_info):
         ], lambda ci: ci.get('country', '')),
     ]
 
-    def _stripe_field_frames():
-        """收集与 Stripe 支付表单相关的 frame（page.frames 已含所有嵌套层级，
-        原生穿透跨域，替代旧的手工逐层切帧遍历）。排除 express checkout。"""
-        result = []
-        try:
-            main = page.main_frame
-        except Exception:
-            main = None
-        for fr in page.frames:
-            if main is not None and fr == main:
-                continue
-            try:
-                url = (fr.url or '').lower()
-                name = (fr.name or '').lower()
-            except Exception:
-                continue
-            if 'express' in url or 'express' in name:
-                continue
-            if ('stripe' in url or 'stripe' in name
-                    or name.startswith('__privatestripeframe')
-                    or 'elements-inner' in url):
-                result.append(fr)
-        return result
-
-    def try_fill_selectors(ctx, selectors, value, label):
-        """在给定上下文 ctx（Page 或 Frame）内按选择器列表填写。
-        跨域 Stripe 字段用 press_sequentially 逐字输入（触发 Stripe 格式化/校验事件，
-        不用 fill+回读——Stripe 会重格式化导致失配）。"""
+    def try_fill_selectors(selectors, value, label):
         nonlocal filled_any
         if not value:
             return False
         for sel in selectors:
             try:
-                el = ctx.locator(sel).first
-                if el.count() == 0 or not el.is_visible():
-                    continue
-                tag = el.evaluate("el => el.tagName.toLowerCase()")
-                if tag == 'select':
-                    # 下拉选择框：先按可见文本，再按 value，最后模糊匹配
-                    try:
-                        el.select_option(label=value)
-                    except Exception:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                if el.is_displayed():
+                    tag = el.tag_name.lower()
+                    if tag == 'select':
+                        # 下拉选择框：用 JS 设置值
+                        from selenium.webdriver.support.ui import Select
+                        select = Select(el)
                         try:
-                            el.select_option(value=value)
+                            select.select_by_visible_text(value)
                         except Exception:
                             try:
-                                opts = el.locator('option').all()
-                                for opt in opts:
-                                    ot = (opt.inner_text() or '')
-                                    if value.lower() in ot.lower():
-                                        ov = opt.get_attribute('value') or ot
-                                        el.select_option(value=ov)
-                                        break
+                                select.select_by_value(value)
                             except Exception:
-                                pass
-                else:
-                    el.click()
-                    time.sleep(0.3)
-                    el.press_sequentially(str(value), delay=50)
-                print(f"  ✅ 填写 {label}")
-                filled_any = True
-                return True
+                                # 尝试模糊匹配
+                                for opt in select.options:
+                                    if value.lower() in opt.text.lower():
+                                        opt.click()
+                                        break
+                    else:
+                        el.click()
+                        time.sleep(0.3)
+                        type_slowly(el, value)
+                    print(f"  ✅ 填写 {label}")
+                    filled_any = True
+                    return True
             except Exception:
                 continue
         return False
 
+    # 先尝试在当前 frame 直接填写
     number = card_info.get('number', '')
     exp_month = card_info.get('expiry_month', '')
     exp_year = card_info.get('expiry_year', '')
     expiry = f"{exp_month}{exp_year[-2:]}" if exp_year else exp_month
     cvc = card_info.get('cvc', '')
 
-    def try_fill_billing_fields(ctx):
-        """尝试在指定上下文内填写 Stripe 表单账单地址字段"""
+    def try_fill_billing_fields():
+        """尝试填写 Stripe iframe 内的账单地址字段"""
         for field_name, selectors, value_fn in billing_fields:
             value = value_fn(card_info)
             if value:
-                try_fill_selectors(ctx, selectors, value, field_name)
+                try_fill_selectors(selectors, value, field_name)
                 time.sleep(0.3)
 
-    # 策略1: 主文档直接查找（Stripe 字段通常在 iframe 内，此层多为空跑，成本低）
-    if try_fill_selectors(page, card_selectors, number, '卡号'):
+    if try_fill_selectors(card_selectors, number, '卡号'):
         time.sleep(0.5)
-        try_fill_selectors(page, expiry_selectors, expiry, '有效期')
+        try_fill_selectors(expiry_selectors, expiry, '有效期')
         time.sleep(0.5)
-        try_fill_selectors(page, cvc_selectors, cvc, 'CVC')
+        try_fill_selectors(cvc_selectors, cvc, 'CVC')
         time.sleep(0.5)
-        try_fill_billing_fields(page)
+        # 同一 frame 内可能也有账单地址字段
+        try_fill_billing_fields()
         return filled_any
 
-    # 策略2: 枚举 Stripe 相关 frame（每字段各自在独立嵌套 iframe 中）
+    # 当前 iframe 没有直接字段，可能有嵌套 iframe
+    # Stripe Payment Element 每个字段（卡号、有效期、CVC、账单地址）各自在独立的嵌套 iframe 中
     card_filled_nested = False
     expiry_filled_nested = False
     cvc_filled_nested = False
     billing_filled_in_nested = False
-    for fr in _stripe_field_frames():
-        try:
-            if not card_filled_nested and try_fill_selectors(fr, card_selectors, number, '卡号'):
-                card_filled_nested = True
-            elif not expiry_filled_nested and try_fill_selectors(fr, expiry_selectors, expiry, '有效期'):
-                expiry_filled_nested = True
-            elif not cvc_filled_nested and try_fill_selectors(fr, cvc_selectors, cvc, 'CVC'):
-                cvc_filled_nested = True
-            else:
-                for field_name, selectors, value_fn in billing_fields:
-                    value = value_fn(card_info)
-                    if value and try_fill_selectors(fr, selectors, value, field_name):
-                        billing_filled_in_nested = True
-                        time.sleep(0.2)
-            time.sleep(0.3)
-        except Exception:
-            continue
-
-    if card_filled_nested or expiry_filled_nested or cvc_filled_nested:
-        # 卡信息填了部分，也尝试在主文档层填写账单地址
-        if not billing_filled_in_nested:
-            try_fill_billing_fields(page)
-        return filled_any
-
-    # 策略3: 最后兜底 —— 用 Tab 键在表单字段间切换输入
-    # 在首个 Stripe 字段 frame 内点击获焦，然后逐字符输入 + Tab 到下一字段
-    print("  ⚠️ 未找到独立字段，尝试 Tab 键导航输入...")
     try:
-        target_frames = _stripe_field_frames()
-        focus_frame = target_frames[0] if target_frames else None
-
-        # 获取焦点：优先点 frame 内任意可见输入/元素，失败则点 frame body
-        if focus_frame is not None:
+        inner_frames = driver.find_elements(By.TAG_NAME, 'iframe')
+        for frame in inner_frames:
             try:
-                any_input = focus_frame.locator('input, div[contenteditable], span, label, p').first
-                if any_input.count() > 0:
-                    any_input.click(timeout=SHORT_TIMEOUT_MS)
+                if not frame.is_displayed():
+                    continue
+                driver.switch_to.frame(frame)
+
+                if not card_filled_nested and try_fill_selectors(card_selectors, number, '卡号'):
+                    card_filled_nested = True
+                elif not expiry_filled_nested and try_fill_selectors(expiry_selectors, expiry, '有效期'):
+                    expiry_filled_nested = True
+                elif not cvc_filled_nested and try_fill_selectors(cvc_selectors, cvc, 'CVC'):
+                    cvc_filled_nested = True
                 else:
-                    focus_frame.locator('body').first.click(timeout=SHORT_TIMEOUT_MS)
+                    # 尝试填写账单地址字段（可能分布在不同嵌套 iframe 中）
+                    for field_name, selectors, value_fn in billing_fields:
+                        value = value_fn(card_info)
+                        if value and try_fill_selectors(selectors, value, field_name):
+                            billing_filled_in_nested = True
+                            time.sleep(0.2)
+
+                driver.switch_to.parent_frame()
+                time.sleep(0.3)
             except Exception:
                 try:
-                    focus_frame.locator('body').first.click(timeout=SHORT_TIMEOUT_MS)
+                    driver.switch_to.parent_frame()
                 except Exception:
                     pass
+    except Exception:
+        pass
+
+    if card_filled_nested or expiry_filled_nested or cvc_filled_nested:
+        # 卡信息填了部分，也尝试在父 frame 层填写账单地址
+        if not billing_filled_in_nested:
+            try_fill_billing_fields()
+        return filled_any
+
+    # 最后尝试: 用 Tab 键在表单字段间切换输入
+    print("  ⚠️ 未找到独立字段，尝试 Tab 键导航输入...")
+    try:
+        # 点击 iframe 区域获取焦点
+        # Windows 上 Stripe iframe 内 body 可能尺寸为零，无法直接 click()
+        # 使用 JS focus + ActionChains 点击坐标作为回退
+        try:
+            body = driver.find_element(By.TAG_NAME, 'body')
+            body.click()
+        except Exception:
+            # body 尺寸为零时，用 JS 聚焦 + ActionChains 点击 iframe 中心
+            driver.execute_script("document.body.focus();")
+            try:
+                # 尝试找到任意可见元素并点击
+                first_el = driver.execute_script(
+                    "return document.querySelector('div, span, input, label, p');"
+                )
+                if first_el:
+                    ActionChains(driver).move_to_element(first_el).click().perform()
+                else:
+                    ActionChains(driver).send_keys("").perform()
+            except Exception:
+                pass
         time.sleep(0.5)
 
-        kb = page.keyboard
-
         # 输入卡号
-        kb.type(str(number), delay=50)
+        actions = ActionChains(driver)
+        for char in number:
+            actions.send_keys(char)
+            actions.pause(0.05)
+        actions.perform()
         print("  ✅ 输入卡号 (Tab 方式)")
         filled_any = True
         time.sleep(0.5)
 
         # Tab 到有效期
-        kb.press("Tab")
+        ActionChains(driver).send_keys(Keys.TAB).perform()
         time.sleep(0.3)
-        kb.type(str(expiry), delay=50)
+        actions = ActionChains(driver)
+        for char in expiry:
+            actions.send_keys(char)
+            actions.pause(0.05)
+        actions.perform()
         print("  ✅ 输入有效期 (Tab 方式)")
         time.sleep(0.5)
 
         # Tab 到 CVC
-        kb.press("Tab")
+        ActionChains(driver).send_keys(Keys.TAB).perform()
         time.sleep(0.3)
-        kb.type(str(cvc), delay=50)
+        actions = ActionChains(driver)
+        for char in cvc:
+            actions.send_keys(char)
+            actions.pause(0.05)
+        actions.perform()
         print("  ✅ 输入 CVC (Tab 方式)")
 
     except Exception as e:
@@ -3881,38 +3759,25 @@ def _fill_stripe_payment_element(driver, card_info):
 def _close_payment_dialog(driver):
     """关闭 Add a payment method 弹窗"""
     try:
-        dialog = driver.page.locator('[role="dialog"]').first
-        if dialog.count() == 0:
-            return
-
-        # 1) Cancel 按钮（精确文本匹配）
-        try:
-            cancel_btn = dialog.get_by_role("button", name="Cancel", exact=True)
-            if cancel_btn.count() > 0 and cancel_btn.first.is_visible():
-                _safe_click(cancel_btn.first, session=driver, desc='Cancel 按钮')
-                print("  🔘 已关闭弹窗")
-                time.sleep(2)
-                return
-        except Exception:
-            pass
-
-        # 2) 关闭按钮 (aria-label="Close")
-        try:
-            close_btn = dialog.locator('button[aria-label="Close"]').first
-            if close_btn.count() > 0 and close_btn.is_visible():
-                _safe_click(close_btn, session=driver, desc='关闭按钮')
-                print("  🔘 已关闭弹窗")
-                time.sleep(2)
-                return
-        except Exception:
-            pass
-
-        # 3) 兜底：ESC 关闭
-        try:
-            driver.page.keyboard.press("Escape")
-            time.sleep(1)
-        except Exception:
-            pass
+        driver.switch_to.default_content()
+        # 点击 Cancel 按钮
+        cancel_btn = driver.execute_script("""
+            var dialog = document.querySelector('[role="dialog"]');
+            if (!dialog) return null;
+            var buttons = dialog.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                if (buttons[i].textContent.trim() === 'Cancel') {
+                    return buttons[i];
+                }
+            }
+            // 查找关闭按钮 (aria-label="Close")
+            var close = dialog.querySelector('button[aria-label="Close"]');
+            return close;
+        """)
+        if cancel_btn:
+            cancel_btn.click()
+            print("  🔘 已关闭弹窗")
+            time.sleep(2)
     except Exception:
         pass
 
@@ -3920,52 +3785,68 @@ def _close_payment_dialog(driver):
 def _fill_stripe_field(driver, field_name, selectors_str, value):
     """
     填写 Stripe 表单字段
-    先在主文档查找，找不到则遍历所有 frame（page.frames 已含全部嵌套层级）
+    先在主文档查找，找不到则递归遍历所有 iframe
     """
     selectors = [s.strip() for s in selectors_str.split(',')]
-    page = driver.page
 
-    def try_fill(ctx):
+    def try_fill():
         for selector in selectors:
             try:
-                el = ctx.locator(selector).first
-                if el.count() == 0 or not el.is_visible():
-                    continue
-                try:
-                    el.scroll_into_view_if_needed(timeout=SHORT_TIMEOUT_MS)
-                except Exception:
-                    pass
-                el.click()
-                el.press_sequentially(str(value), delay=50)
-                return True
+                el = driver.find_element(By.CSS_SELECTOR, selector)
+                if el.is_displayed():
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                    except Exception:
+                        pass
+                    type_slowly(el, value)
+                    return True
             except Exception:
                 continue
         return False
 
     # 在主文档中查找
-    if try_fill(page):
+    if try_fill():
         print(f"  ✅ 在主文档找到 {field_name}")
         return True
 
-    # 遍历所有 frame（page.frames 原生穿透跨域，等价原 2 层嵌套切帧遍历）
-    try:
-        main = page.main_frame
-    except Exception:
-        main = None
-    for fr in page.frames:
-        if main is not None and fr == main:
-            continue
-        try:
-            if try_fill(fr):
-                try:
-                    furl = (fr.url or '?')[:50]
-                except Exception:
-                    furl = '?'
-                print(f"  ✅ 在 iframe ({furl}) 中找到 {field_name}")
-                return True
-        except Exception:
-            continue
+    # 递归遍历 iframe（支持 2 层嵌套）
+    driver.switch_to.default_content()
 
+    def traverse_frames(depth=0, max_depth=2):
+        if depth >= max_depth:
+            return False
+
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        for i, frame in enumerate(frames):
+            try:
+                if not frame.is_displayed():
+                    continue
+
+                driver.switch_to.frame(frame)
+
+                if try_fill():
+                    print(f"  ✅ 在 iframe (d={depth}, i={i}) 中找到 {field_name}")
+                    driver.switch_to.default_content()
+                    return True
+
+                if traverse_frames(depth + 1, max_depth):
+                    return True
+
+                driver.switch_to.parent_frame()
+
+            except Exception:
+                try:
+                    driver.switch_to.parent_frame()
+                except Exception:
+                    pass
+                continue
+
+        return False
+
+    if traverse_frames():
+        return True
+
+    driver.switch_to.default_content()
     print(f"  ❌ 未找到 {field_name} 输入框")
     return False
 
@@ -3973,52 +3854,50 @@ def _fill_stripe_field(driver, field_name, selectors_str, value):
 def _fill_visible_field(driver, field_name, selectors_str, value):
     """填写主文档或 iframe 中的可见字段"""
     selectors = [s.strip() for s in selectors_str.split(',')]
-    page = driver.page
-
-    def try_ctx(ctx, in_iframe=False):
-        for selector in selectors:
-            try:
-                el = ctx.locator(selector).first
-                if el.count() == 0 or not el.is_visible():
-                    continue
-                tag = el.evaluate("el => el.tagName.toLowerCase()")
-                if tag == 'select':
-                    try:
-                        el.select_option(label=value)
-                    except Exception:
-                        try:
-                            el.select_option(value=value)
-                        except Exception:
-                            pass
-                else:
-                    try:
-                        el.fill('')
-                    except Exception:
-                        pass
-                    el.press_sequentially(str(value), delay=50)
-                suffix = ' (iframe)' if in_iframe else ''
-                print(f"  ✅ 填写 {field_name}: {value}{suffix}")
-                return True
-            except Exception:
-                continue
-        return False
 
     # 在主文档中查找
-    if try_ctx(page):
-        return True
-
-    # 在 iframe 中查找（page.frames 已含全部嵌套 frame）
-    try:
-        main = page.main_frame
-    except Exception:
-        main = None
-    for fr in page.frames:
-        if main is not None and fr == main:
-            continue
+    for selector in selectors:
         try:
-            if try_ctx(fr, in_iframe=True):
+            el = driver.find_element(By.CSS_SELECTOR, selector)
+            if el.is_displayed():
+                if el.tag_name == 'select':
+                    el.send_keys(value)
+                    el.send_keys(Keys.ENTER)
+                else:
+                    el.clear()
+                    type_slowly(el, value)
+                print(f"  ✅ 填写 {field_name}: {value}")
                 return True
         except Exception:
             continue
+
+    # 在 iframe 中查找
+    driver.switch_to.default_content()
+    frames = driver.find_elements(By.TAG_NAME, "iframe")
+    for frame in frames:
+        try:
+            if not frame.is_displayed():
+                continue
+            driver.switch_to.frame(frame)
+            for selector in selectors:
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, selector)
+                    if el.is_displayed():
+                        if el.tag_name == 'select':
+                            el.send_keys(value)
+                        else:
+                            el.clear()
+                            type_slowly(el, value)
+                        print(f"  ✅ 填写 {field_name}: {value} (iframe)")
+                        driver.switch_to.default_content()
+                        return True
+                except Exception:
+                    continue
+            driver.switch_to.default_content()
+        except Exception:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
 
     return False
