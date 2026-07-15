@@ -1620,25 +1620,22 @@ def extract_topup_card_last4(driver):
 
 
 def close_topup_dialog(driver):
-    """关闭 Top-up 弹窗"""
+    """关闭 Top-up 弹窗。
+
+    直接按 Escape：该弹窗的 Close 按钮长期不满足 Playwright actionability，
+    _safe_click 会重试到超时（实测累计 ~45s 全部失败），而 Escape 一次即可关闭，
+    且后续账单表格交互本身带 dismiss_overdue_dialog + 滚动/force 兜底，
+    即便有残留弹窗也不阻塞。故不再前置点击重试、也不做过宽的弹窗计数校验
+    （页面可能同时存在欠费提示弹窗，会导致误判未关闭）。
+    """
     try:
-        close_btn = driver.page.locator(
-            "div[role='dialog'] button[aria-label='Close']"
-        ).first
-        _safe_click(close_btn, session=driver, desc='关闭 Top-up 弹窗')
+        driver.page.keyboard.press("Escape")
         time.sleep(1)
-        print("已关闭 Top-up 弹窗")
+        print("已通过 Escape 关闭 Top-up 弹窗")
         return True
-    except Exception:
-        # 备用：按 Escape 键关闭
-        try:
-            driver.page.keyboard.press("Escape")
-            time.sleep(1)
-            print("已通过 Escape 关闭 Top-up 弹窗")
-            return True
-        except Exception as e:
-            print(f"关闭弹窗失败: {e}")
-            return False
+    except Exception as e:
+        print(f"关闭弹窗失败: {e}")
+        return False
 
 
 def fill_topup_and_confirm(driver, amount=10):
