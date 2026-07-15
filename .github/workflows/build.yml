@@ -50,6 +50,8 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
+          # 仅作 release job 的中转产物，正式产物挂在 Release assets；短期过期避免占满 500MB 存储配额
+          retention-days: 1
 
   release:
     needs: build
