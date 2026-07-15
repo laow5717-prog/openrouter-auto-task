@@ -842,35 +842,54 @@ def get_valid_cards():
 
 @api.route('/api/valid-cards/export')
 def export_valid_cards():
-    """导出全部有效卡为 xlsx（列对齐信用卡模板 + 绑定账号/状态）。"""
+    """导出全部有效卡为 xlsx：中文表头 + 关联 Cloudflare 账号信息 + 完整信用卡信息（不脱敏）。"""
     import openpyxl
+    from openpyxl.utils import get_column_letter
     from datetime import datetime
     models = get_models()
     source_type = request.args.get('source_type', '')
     cards = models['valid_card'].get_all_for_export(source_type)
 
-    headers = ['card_number', 'expiry_month', 'expiry_year', 'cvc',
-               'first_name', 'last_name', 'country', 'address', 'address2',
-               'city', 'state', 'zip', 'company',
-               'source_type', 'bound_email', 'status', 'validated_at']
+    # 关联账号信息：source_email -> {cf_password, email_password, status}
+    acct_map = {a['email']: a for a in models['account'].get_all(order_desc=False)}
+
+    headers = ['卡号', '有效期(月)', '有效期(年)', '安全码CVC', '名', '姓',
+               '国家', '地址', '地址2', '城市', '州', '邮编', '公司',
+               '来源', '关联CF账号', 'CF登录密码', '邮箱密码', '账号状态',
+               '卡状态', '验证时间']
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = 'ValidCards'
+    ws.title = '有效卡'
     ws.append(headers)
     for c in cards:
         _valid_card_status(models, c)
+        email = c.get('source_email', '') or ''
+        acct = acct_map.get(email, {})
         ws.append([
             c.get('card_number', ''), c.get('expiry_month', ''), c.get('expiry_year', ''),
             c.get('cvc', ''), c.get('first_name', ''), c.get('last_name', ''),
             c.get('country', ''), c.get('address', ''), c.get('address2', ''),
             c.get('city', ''), c.get('state', ''), c.get('zip', ''), c.get('company', ''),
-            c.get('source_type', ''), c.get('bound_email', ''), c.get('status_text', ''),
-            c.get('validated_at', ''),
+            ('绑定' if c.get('source_type') == 'bind' else '支付'),
+            email, acct.get('cf_password', ''), acct.get('email_password', ''),
+            acct.get('status', ''), c.get('status_text', ''), c.get('validated_at', ''),
         ])
+
+    # 列宽自适应（按每列最长内容估算，含表头）
+    for col_idx in range(1, len(headers) + 1):
+        letter = get_column_letter(col_idx)
+        maxlen = 0
+        for cell in ws[letter]:
+            v = '' if cell.value is None else str(cell.value)
+            # 中文按 2 宽度估算
+            w = sum(2 if ord(ch) > 127 else 1 for ch in v)
+            maxlen = max(maxlen, w)
+        ws.column_dimensions[letter].width = min(max(maxlen + 2, 8), 60)
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    fname = f"valid_cards_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    fname = f"有效卡_{datetime.now().strftime('%Y%m%d')}.xlsx"
     return send_file(
         buf, as_attachment=True, download_name=fname,
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',

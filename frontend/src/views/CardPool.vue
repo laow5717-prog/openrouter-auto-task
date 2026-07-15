@@ -177,7 +177,7 @@
       <button class="filter-btn filter-btn-primary" style="background:#059669" @click="exportValidCards">导出 Excel</button>
     </FilterBar>
     <div style="overflow-x:auto">
-      <table>
+      <table class="valid-table">
         <thead>
           <tr>
             <th>卡号</th>
@@ -197,7 +197,7 @@
             <td colspan="7" class="table-empty">暂无有效卡记录</td>
           </tr>
           <tr v-for="c in validCards" :key="c.id">
-            <td style="font-family:monospace">{{ maskCard(c.card_number) }}</td>
+            <td style="font-family:monospace">{{ c.card_number }}</td>
             <td>{{ c.expiry_month }}/{{ c.expiry_year }}</td>
             <td>{{ c.first_name }} {{ c.last_name }}</td>
             <td>
@@ -399,6 +399,10 @@ onMounted(() => {
 </script>
 
 <style scoped>
+/* 有效卡表格：列宽按内容自适应，不换行、不脱敏；超宽时容器横向滚动 */
+.valid-table { table-layout: auto; width: auto; min-width: 100%; }
+.valid-table th, .valid-table td { white-space: nowrap; }
+
 .info-banner {
   padding: 12px 16px;
   margin-bottom: 16px;
