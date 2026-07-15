@@ -1926,7 +1926,7 @@ def _reveal_payment_form_if_saved_card(driver, invoice_id=''):
     return False
 
 
-def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
+def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_stop=None):
     """
     在 Stripe 支付页面的 iframe 内填写信用卡信息并点击 Pay
 
@@ -2053,6 +2053,10 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         confirm_clicks = 0
         deadline = time.time() + 90
         while time.time() < deadline:
+            # 支付结果等待是本流程最长的一段（最多 90s）：期间响应停止请求，
+            # 否则用户点停止后仍要空等一整轮。抛 InterruptedError 由上层 break。
+            if should_stop and should_stop():
+                raise InterruptedError("用户请求停止")
             driver.page.wait_for_timeout(2000)     # 驱动 Playwright 事件循环 + 等待
             # 0) "确认付款"二次确认卡片：提交卡后 Stripe 可能返回「确认 US$xx 的付款」
             #    卡片（含"银行会要求您验证您的身份"），不点则页面永远停在这里。
@@ -2107,6 +2111,10 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id=''):
         return {"status": "uncertain", "error": "支付结果未确认",
                 "card_fault": False, "responses": collected}
 
+    except InterruptedError:
+        # 用户请求停止：不吞掉，向上传递让 handle_unpaid_invoices break、
+        # 最终由 recharge_account 的 finally 关闭浏览器。
+        raise
     except Exception as e:
         # 填表/定位异常属于脚本侧失败，与卡是否有效无关 → 不标记卡
         print(f"  {invoice_id} Stripe 支付填写失败: {e}")
@@ -2146,7 +2154,8 @@ def _invoice_still_unpaid(driver, invoice_id):
     return True   # 表格已加载但找不到该 invoice 行 → 保守视为未支付（避免误记成功）
 
 
-def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, account_id=None):
+def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, account_id=None,
+                           should_stop=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
     打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
@@ -2174,6 +2183,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                    （拒付 / 卡号错 / 已过期 / 需要 3DS），调用方应把该卡标记为无效；
                    False 表示脚本侧失败（页面超时、元素定位失败、结果未确认），不应动卡状态。
         account_id: Cloudflare 账号 ID，用于拼出 credits 页面 URL（返回时整页刷新）。
+        should_stop: 无参 callable，返回 True 表示用户请求停止；每轮发票开头检查，
+                     命中即中断循环（换卡重试可能持续很久，这是唯一的中途叫停入口）。
     返回:
         list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, balance?, error?}, ...]
               status: paid / opened / failed / skipped
@@ -2239,6 +2250,12 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             print(f"  {iid} 脚本侧失败（第 {n}/{SCRIPT_RETRY_LIMIT} 次），将用同一张卡重试该发票: {reason}")
 
     while round_num < MAX_ROUNDS:
+        # 每轮开头检查停止请求：换卡重试会持续换卡，若无此闸门用户无法中途叫停，
+        # 只能 kill 进程（force_stop 已 quit driver，后续 driver 调用会抛异常并被
+        # try/except 吞成 _script_fail 继续跑，掩盖了停止意图）。
+        if should_stop and should_stop():
+            print("  收到停止请求，中断账单支付流程")
+            break
         round_num += 1
         pending = None   # 本轮是否尝试了支付（用于返回 credits 后权威判定成功与否）
 
@@ -2384,7 +2401,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 nth = card_tries.get(invoice_id, 1)
                 how = "复用同一张卡重试" if reuse_card else f"第 {nth} 张卡"
                 print(f"  {invoice_id} 使用卡 ****{card_last4}（{how}）填写并提交...")
-                pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id)
+                pay_result = _fill_stripe_payment_and_submit(driver, card, invoice_id,
+                                                             should_stop=should_stop)
                 pending = {"invoice": invoice_id, "card": card, "last4": card_last4,
                            "amount": amount, "pay_url": pay_url,
                            "responses": pay_result.get('responses'),
@@ -2394,6 +2412,10 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             else:
                 results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
 
+        except InterruptedError:
+            # 用户请求停止：立即跳出整个发票循环（不当作脚本失败重试）
+            print("  收到停止请求，中断账单支付流程")
+            break
         except Exception as e:
             print(f"  处理 {invoice_id} 异常: {e}")
             _script_fail(invoice_id, str(e))

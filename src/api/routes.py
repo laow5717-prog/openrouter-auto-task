@@ -503,6 +503,7 @@ def recharge_account():
                 valid_card_model=models['valid_card'],
                 card_pool_model=models['card_pool'],
                 account_model=models['account'],
+                should_stop=lambda: state.stop_requested,
             )
 
             # 用页面提取的后四位匹配完整卡号

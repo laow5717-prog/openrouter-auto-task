@@ -291,7 +291,8 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
 
 def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
                      skip_invoice=False, payment_cards=None,
-                     valid_card_model=None, card_pool_model=None, account_model=None):
+                     valid_card_model=None, card_pool_model=None, account_model=None,
+                     should_stop=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -458,7 +459,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 # 直接在当前 credits 页面处理 Unpaid invoices
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
-                    on_failed=_on_invoice_failed, account_id=account_id)
+                    on_failed=_on_invoice_failed, account_id=account_id,
+                    should_stop=should_stop)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
@@ -489,7 +491,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
 
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
-                    on_failed=_on_invoice_failed, account_id=account_id)
+                    on_failed=_on_invoice_failed, account_id=account_id,
+                    should_stop=should_stop)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)

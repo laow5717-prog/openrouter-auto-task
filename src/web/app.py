@@ -113,20 +113,19 @@ class AppState:
             self._active_driver = None
 
     def force_stop(self):
-        """强制停止：设置标志、关闭浏览器、重置状态"""
+        """协作式停止：设置标志、停截图。不从本线程 quit driver。
+
+        driver 由执行任务的工作线程持有；从请求线程跨线程 quit 会让工作线程里
+        正在进行的 Patchright/Playwright sync 操作永久 hang（sync API 非线程安全，
+        transport 被关后挂起的调用等不到响应）。改为设置 stop_requested，工作线程
+        在各自的 should_stop / _monitor 检查点抛出中断、冒泡到其 finally 里 close_driver
+        自行关闭浏览器。三条任务流程（register_one_account / register_and_bind_cards /
+        recharge_account）都有 finally close_driver，故无需在此额外 quit。"""
         self.stop_requested = True
         self._stop_screenshot_loop()
-
-        # 强制关闭活跃的 driver
-        with self._active_driver_lock:
-            if self._active_driver:
-                try:
-                    self._active_driver.quit()
-                except Exception:
-                    pass
-                self._active_driver = None
-
-        self.add_log("已强制停止任务并关闭浏览器")
+        # 仅解除活跃 driver 引用，不 quit（quit 交给工作线程的 finally）
+        self.clear_active_driver()
+        self.add_log("已请求停止任务（工作线程将在下个检查点安全退出并关闭浏览器）")
 
     def _hooked_print(self, *args, **kwargs):
         sep = kwargs.get('sep', ' ')
