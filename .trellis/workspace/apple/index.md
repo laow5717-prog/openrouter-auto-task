@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 20
-- **Last Active**: 2026-07-15
+- **Total Sessions**: 21
+- **Last Active**: 2026-07-16
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~683 | Active |
+| `journal-1.md` | ~716 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 21 | 2026-07-16 | 每日流水线轮询式 top-up 补生成账单至30条/账号/天 | `b868e45` | `main` |
 | 20 | 2026-07-15 | 卡池分组管理 + 有效卡导出/池内状态展示 + 3DS误标订正 | `826e365`, `e7c3723`, `f25eb2f`, `b80896d` | `main` |
 | 19 | 2026-07-15 | 充值 Top-up 拒付修复 + 账单支付选卡规则 + 每日启动/填卡修复 | `084536f`, `5c77031` | `main` |
 | 18 | 2026-07-15 | 每日流水线白屏排查：修正已绑卡数误读 bug | `29dd179` | `main` |

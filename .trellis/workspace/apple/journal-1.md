@@ -681,3 +681,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 21: 每日流水线轮询式 top-up 补生成账单至30条/账号/天
+
+**Date**: 2026-07-16
+**Task**: 每日流水线轮询式 top-up 补生成账单至30条/账号/天
+**Branch**: `main`
+
+### Summary
+
+充值阶段从逐账号跑完整流程改为轮询式：每账号每轮只生成1张账单+付1张随即切下一个账号，一整轮跑完再循环，直到当日账单数达上限30(以CF invoice-history接口为权威计数)/停止/卡池耗尽/全轮无进展。新增 config 常量、driver.fetch_today_invoice_count()、handle_unpaid_invoices 的 max_invoices 参数、recharge_account 单步模式(6元组含info)、app 阶段2 轮询编排。全量模式与单账号充值按钮行为不变。待用户实跑验证 invoice-history fetch 返回200 + 轮询达30停止。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b868e45` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
