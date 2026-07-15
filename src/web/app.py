@@ -394,7 +394,12 @@ class AppState:
                     time.sleep(1)
 
     def _recharge_one_account(self, email, cf_password, payment_group_id=None):
-        """充值单个账号并记账，返回 (success, err)。
+        """充值单个账号并记账，返回 (result, err)。
+
+        result 取值：
+          - "success"      实际 Top-up 成功
+          - "invoice_only" 未充值（今日已充），仅检查/处理了账单，预建 log 已删除，不计充值
+          - "failed"       充值失败或异常
 
         只负责一个账号的 Top-up + 记账，不管理 is_running / 截图收尾（由调用方负责，
         以便批量场景复用）。InterruptedError 向上抛出，供批量循环感知停止。"""
@@ -416,7 +421,7 @@ class AppState:
         log_id = models['recharge_log'].create(email, card_display='', amount=10)
 
         try:
-            success, err, responses, card_last4 = registration.recharge_account(
+            success, err, responses, card_last4, outcome = registration.recharge_account(
                 email, cf_password,
                 recharge_log_model=models['recharge_log'],
                 monitor_callback=self._monitor,
@@ -427,6 +432,14 @@ class AppState:
                 account_model=models['account'],
                 should_stop=lambda: self.stop_requested,
             )
+
+            # 仅处理/检查了账单、未实际 Top-up：删除预建占位 log，避免误记为 $10 充值成功。
+            # 账单支付本身的记账已由 recharge_account 内部（_on_invoice_paid/_on_invoice_failed）完成。
+            if outcome == "invoice_only":
+                models['recharge_log'].delete(log_id)
+                self.current_action = f"{email} 未重复充值（已检查/处理账单）"
+                self.add_log(f"{email} 今日已充值，已执行账单支付检查，未重复 Top-up")
+                return "invoice_only", ''
 
             # 用页面提取的后四位匹配完整卡号
             matched_card = ''
@@ -462,7 +475,7 @@ class AppState:
                                     c, source_type='payment', source_email=email,
                                 )
                                 break
-                    return True, ''
+                    return "success", ''
                 else:
                     # API 返回了错误（如 409 重复充值）
                     error_msg = ''
@@ -477,18 +490,18 @@ class AppState:
                     models['recharge_log'].mark_failed(log_id, error=f"[HTTP {http_status}] {error_msg}", api_response=topup_resp)
                     self.current_action = f"{email} 充值失败: {error_msg}"
                     self.add_log(f"{email} 充值失败: {error_msg}")
-                    return False, error_msg
+                    return "failed", error_msg
             elif success:
                 # 点击成功但未捕获到 API 响应
                 models['recharge_log'].mark_success(log_id)
                 self.current_action = f"{email} 充值已提交（未捕获响应）"
                 self.add_log(f"{email} AI Credits 充值 $10 已提交")
-                return True, ''
+                return "success", ''
             else:
                 models['recharge_log'].mark_failed(log_id, error=err)
                 self.current_action = f"{email} 充值失败: {err}"
                 self.add_log(f"{email} 充值失败: {err}")
-                return False, err or 'recharge failed'
+                return "failed", err or 'recharge failed'
         except InterruptedError:
             models['recharge_log'].mark_failed(log_id, error='用户中断')
             raise
@@ -496,7 +509,7 @@ class AppState:
             models['recharge_log'].mark_failed(log_id, error=str(e))
             self.current_action = f"充值异常: {e}"
             self.add_log(f"充值异常: {e}")
-            return False, str(e)
+            return "failed", str(e)
 
     def run_daily_pipeline(self, bind_group_id, payment_group_id, cf_password,
                            max_bindable_cards, captcha_api_key):
@@ -521,6 +534,7 @@ class AppState:
         bind_success_total = 0
         recharge_success_total = 0
         recharge_fail_total = 0
+        recharge_invoice_only_total = 0
 
         try:
             # ===== 阶段0：准备卡池 =====
@@ -640,11 +654,13 @@ class AppState:
                 accts_after = account_model.get_all(order_desc=False)
                 emails_after = [a['email'] for a in accts_after]
                 counts_after = card_binding_model.count_by_emails(emails_after)
+                # 放行所有绑卡≥1 的账号：今日已充过的也要进入，由 recharge_account 内部
+                # 决定是 Top-up 还是仅执行账单支付（Unpaid invoice）。不再用 has_today_record
+                # 在此一刀切排除，否则绑卡账号的待付账单永远得不到处理。
                 recharge_targets = [
                     a for a in accts_after
                     if a.get('cf_password')
                     and counts_after.get(a['email'], 0) >= 1
-                    and not recharge_log_model.has_today_record(a['email'])
                 ]
                 self._hooked_print(f"充值候选账号 {len(recharge_targets)} 个")
 
@@ -661,9 +677,13 @@ class AppState:
                     email = acct['email']
                     self.current_action = f"充值账号 {email}"
                     try:
-                        ok, _err = self._recharge_one_account(email, acct['cf_password'], payment_group_id)
-                        if ok:
+                        result, _err = self._recharge_one_account(email, acct['cf_password'], payment_group_id)
+                        if result == "success":
                             recharge_success_total += 1
+                            consecutive_failures = 0
+                        elif result == "invoice_only":
+                            # 未实际充值，仅处理/检查了账单：不计成功也不计失败，不累加连续失败
+                            recharge_invoice_only_total += 1
                             consecutive_failures = 0
                         else:
                             recharge_fail_total += 1
@@ -724,7 +744,8 @@ class AppState:
 
             self.current_action = (
                 f"每日流水线完成（补绑 {bind_success_total} 张 / "
-                f"充值成功 {recharge_success_total} / 充值失败 {recharge_fail_total}）"
+                f"充值成功 {recharge_success_total} / 充值失败 {recharge_fail_total} / "
+                f"仅账单处理 {recharge_invoice_only_total}）"
             )
             self._hooked_print(f"\n{'#' * 50}")
             self._hooked_print(self.current_action)

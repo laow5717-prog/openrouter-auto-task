@@ -401,7 +401,9 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         card_pool_model: CardPoolModel，支付成功后把底料卡状态标为 'paid'
         account_model: AccountModel，每笔发票支付成功后记录该账号最新的 Credits 余额
     返回:
-        (bool, str, list, str): (是否成功, 错误信息, API 响应列表, 卡片后四位)
+        (bool, str, list, str, str): (是否成功, 错误信息, API 响应列表, 卡片后四位, 结局)
+        结局(outcome): "topup"=实际执行了充值; "invoice_only"=未充值仅处理/检查账单;
+                       "failed"=失败或异常。调用方据此记账：invoice_only 不得记为充值成功。
     """
     driver = None
 
@@ -416,7 +418,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         print(f"正在登录账号: {email}")
         account_id = login_cloudflare(driver, email, cf_password)
         if not account_id:
-            return False, "登录失败，无法获取 account_id", [], ''
+            return False, "登录失败，无法获取 account_id", [], '', "failed"
         _report("logged_in")
 
         # === 账单支付选卡策略 ===
@@ -525,7 +527,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         _report("navigated_to_credits")
 
         if not success:
-            return False, "导航到充值页面或点击 Top-up 按钮失败", [], ''
+            return False, "导航到充值页面或点击 Top-up 按钮失败", [], '', "failed"
 
         # 弹窗已打开，提取卡片后四位并检查今日是否已支付
         card_last4 = extract_topup_card_last4(driver)
@@ -534,7 +536,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         if not card_last4:
             print("未能从弹窗提取到信用卡信息，无法继续充值")
             close_topup_dialog(driver)
-            return False, "未获取到有效信用卡信息", [], ''
+            return False, "未获取到有效信用卡信息", [], '', "failed"
 
         card_already_used_today = False
         if recharge_log_model:
@@ -544,7 +546,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             if skip_invoice:
                 print(f"卡片 ****{card_last4} 今日已有充值记录，且未选择支付卡分组，跳过")
                 close_topup_dialog(driver)
-                return True, "今日已充值，跳过", [], card_last4
+                return True, "今日已充值，跳过", [], card_last4, "invoice_only"
             else:
                 print(f"卡片 ****{card_last4} 今日已有充值记录，跳过 Top-up，执行账单支付流程")
                 close_topup_dialog(driver)
@@ -562,7 +564,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     print("未发现 Unpaid invoice")
 
                 _record_final_balance()
-                return True, "跳过充值，已处理账单", [], card_last4
+                return True, "跳过充值，已处理账单", [], card_last4, "invoice_only"
 
         # 今日未支付过，继续充值流程
         print("正在填写充值金额并确认支付...")
@@ -596,11 +598,11 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         else:
             print(f"账号 {email} 充值确认失败")
 
-        return pay_success, "" if pay_success else "填写金额或确认支付失败", responses or [], card_last4
+        return pay_success, "" if pay_success else "填写金额或确认支付失败", responses or [], card_last4, ("topup" if pay_success else "failed")
 
     except Exception as e:
         print(f"充值过程异常: {e}")
-        return False, str(e), [], ''
+        return False, str(e), [], '', "failed"
 
     finally:
         if driver:

@@ -35,6 +35,14 @@ class RechargeLogModel:
             (error, json.dumps(api_response, ensure_ascii=False) if api_response else None, log_id),
         )
 
+    def delete(self, log_id):
+        """删除一条充值记录。用于撤销「仅执行账单支付、未实际 Top-up」时预建的占位记录，
+        避免其被误记为 $10 充值成功。账单支付本身的记账由充值流程内部独立完成。"""
+        self.db.execute(
+            "DELETE FROM recharge_logs WHERE id=?",
+            (log_id,),
+        )
+
     def has_today_record(self, email, card_last4=''):
         """检查今日是否已有充值记录（不管成功失败）"""
         conditions = ["email=?", "DATE(created_at)=DATE('now','localtime')"]
