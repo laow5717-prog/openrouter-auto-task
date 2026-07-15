@@ -510,3 +510,38 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: 账单支付换卡重试 + 中途停止 + 关弹窗提速
+
+**Date**: 2026-07-15
+**Task**: 账单支付换卡重试 + 中途停止 + 关弹窗提速
+**Branch**: `main`
+
+### Summary
+
+1) 账单支付失败改为换卡重试同一张发票而非跳过：handle_unpaid_invoices 原在尝试支付前就把 invoice 写入 processed_ids，失败即跳到下一张、欠费遗留；改为 done_ids（仅成功或重试耗尽才写），按 card_fault 分流——卡问题（拒付/3DS）标记无效卡后换下一张卡重试同发票（不限次直到卡池耗尽），脚本侧失败复用同卡重开支付页最多2次。实测发票 IN-71575091 换 9 张卡付掉，余额 $20→$30。2) 账单支付支持中途停止：原 force_stop 从请求线程 driver.quit() 致 Patchright sync 操作跨线程卡死；改协作式取消——force_stop 只设 stop_requested 不 quit，should_stop 经 routes→registration→driver 透传，循环开头 + 90s 支付等待循环内检查，命中抛 InterruptedError，由各流程 finally close_driver。实测填卡中途停止 30s 干净退出。3) 关闭 Top-up 弹窗直接按 Escape，省去 Close 按钮 ~45s 点击重试空等（45s→1s）。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `70cc717` | (see git log) |
+| `d532b0c` | (see git log) |
+| `7a4d209` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
