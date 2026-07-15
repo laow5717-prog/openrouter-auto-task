@@ -73,6 +73,29 @@ class RechargeLogModel:
         )
         return set(r['card_display'] for r in rows)
 
+    def success_count_since(self, card_number, hours=24):
+        """该卡号在最近 hours 小时内的成功支付次数（R2 次数/冷却判定）。"""
+        if not card_number:
+            return 0
+        row = self.db.fetchone(
+            "SELECT COUNT(*) as cnt FROM recharge_logs "
+            "WHERE card_display=? AND status='success' "
+            "AND created_at >= datetime('now','localtime',?)",
+            (card_number, f'-{int(hours)} hours'),
+        )
+        return row['cnt'] if row else 0
+
+    def last_success_at(self, card_number):
+        """该卡号最近一次成功支付时间（localtime 字符串），无则 None。"""
+        if not card_number:
+            return None
+        row = self.db.fetchone(
+            "SELECT MAX(created_at) as ts FROM recharge_logs "
+            "WHERE card_display=? AND status='success'",
+            (card_number,),
+        )
+        return row['ts'] if row and row['ts'] else None
+
     def get_paginated(self, page=1, page_size=20, email='', status='', date_from='', date_to=''):
         conditions = []
         params = []

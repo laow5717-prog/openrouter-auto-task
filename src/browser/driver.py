@@ -2025,15 +2025,27 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_sto
         except Exception as e:
             print(f"  {invoice_id} 国家选择失败(继续): {str(e)[:60]}")
 
-        # 填写 ZIP code
+        # 选完国家后地址区会重新渲染，邮编字段随之重挂载——留足时间再定位，避免拿到
+        # 正在被替换的旧节点导致后续 click 长时间等待。
+        driver.page.wait_for_timeout(1500)
+
+        # 填写 ZIP code（防御：邮编字段对部分卡/表单变体渲染慢或根本不出现——
+        # 存在才填、缺失/超时则跳过、不致命。否则 click 默认死等 30s，一张账单会白白
+        # 耗掉两次脚本重试仍失败，如 IN-71449467/IN-71450046 的 postalCodeInput 超时。）
         zip_code = card_info.get('zip', '')
         if zip_code:
-            zip_input = stripe_frame.locator("input#payment-postalCodeInput")
-            zip_input.click()
-            time.sleep(0.3)
-            zip_input.press_sequentially(str(zip_code), delay=50)
-            print(f"  {invoice_id} 已输入 ZIP: {zip_code}")
-            time.sleep(0.5)
+            try:
+                zip_input = stripe_frame.locator("input#payment-postalCodeInput")
+                if _wait_visible(zip_input, timeout=15_000):
+                    zip_input.click(timeout=SHORT_TIMEOUT_MS)
+                    time.sleep(0.3)
+                    zip_input.press_sequentially(str(zip_code), delay=50)
+                    print(f"  {invoice_id} 已输入 ZIP: {zip_code}")
+                    time.sleep(0.5)
+                else:
+                    print(f"  {invoice_id} 未见邮编字段（等待 15s），跳过 ZIP 填写")
+            except Exception as e:
+                print(f"  {invoice_id} ZIP 填写失败(继续): {str(e)[:60]}")
 
         driver.capture_frame()
         time.sleep(1)
@@ -2124,11 +2136,12 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_sto
         if collected:
             print(f"  {invoice_id} 收到 {len(collected)} 条支付响应")
         if is_3ds:
-            # 3DS 银行验证无法自动完成，这张卡在本流程里就是不可用的 → 按卡无效处理
-            print(f"  {invoice_id} 出现 3DS 银行验证，取消并判为失败（卡标记无效）")
+            # 3DS 银行验证无法自动完成，本流程内这张卡不可用（换卡重试同发票）。
+            # tds=True 供上层区分：曾成功的卡遇 3DS 走"临时冷却"而非永久作废（R3）。
+            print(f"  {invoice_id} 出现 3DS 银行验证，取消并判为失败（本轮不可用）")
             _cancel_3ds_challenge(driver)
             return {"status": "failed", "error": "需要 3DS 银行验证（已取消）",
-                    "card_fault": True, "responses": collected}
+                    "card_fault": True, "tds": True, "responses": collected}
         if reason:
             print(f"  {invoice_id} 支付失败，原因: {reason}（卡自身问题: {'是' if card_fault else '否'}）")
             return {"status": "failed", "error": reason,
@@ -2453,6 +2466,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                            "responses": pay_result.get('responses'),
                            "error": pay_result.get('error'),
                            "card_fault": pay_result.get('card_fault', False),
+                           "tds": pay_result.get('tds', False),
                            "fill_status": pay_result.get('status')}
             else:
                 results.append({"invoice": invoice_id, "status": "opened", "pay_url": pay_url})
@@ -2518,7 +2532,8 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 # 下一轮 get_card 就自然跳过它、返回下一张卡。
                 if on_failed:
                     try:
-                        on_failed(inv, pending["card"], fail_reason, card_fault)
+                        on_failed(inv, pending["card"], fail_reason, card_fault,
+                                  bool(pending.get("tds")))
                     except Exception as _e:
                         print(f"  on_failed 回调异常: {_e}")
 

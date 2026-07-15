@@ -30,6 +30,29 @@ class ValidCardModel:
         except Exception:
             pass
 
+    def get_bound_email(self, card_number):
+        """该卡首次支付成功绑定的账号（source_type='payment' 的 source_email）。
+        因 valid_cards 对 (card_number, source_type) 唯一且 INSERT OR IGNORE，首次写入后不被覆盖，
+        故此值即"永久绑定账号"。无记录返回 ''。"""
+        if not card_number:
+            return ''
+        row = self.db.fetchone(
+            "SELECT source_email FROM valid_cards "
+            "WHERE card_number=? AND source_type='payment' LIMIT 1",
+            (card_number,),
+        )
+        return (row['source_email'] or '') if row else ''
+
+    def get_all_for_export(self, source_type=''):
+        """导出用：取全部有效卡（不分页），可按 source_type 过滤。"""
+        if source_type:
+            rows = self.db.fetchall(
+                "SELECT * FROM valid_cards WHERE source_type=? ORDER BY id DESC", (source_type,)
+            )
+        else:
+            rows = self.db.fetchall("SELECT * FROM valid_cards ORDER BY id DESC")
+        return [dict(r) for r in rows]
+
     def get_all(self, page=1, page_size=20, source_type='', keyword=''):
         conditions = []
         params = []

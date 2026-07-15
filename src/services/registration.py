@@ -387,7 +387,7 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
 def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
-                     should_stop=None, card_binding_model=None):
+                     should_stop=None, card_binding_model=None, card_state_model=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -433,6 +433,34 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         _all_cards, _expired_cards = filter_expired_cards(payment_cards or [], card_pool_model)
         if _expired_cards:
             print(f"  已跳过 {len(_expired_cards)} 张过期卡（已标记为无效）")
+
+        # === 选卡资格闸门（R1 一卡绑一账号 / R2 单卡24h≤2次 / R3 3DS临时冷却）===
+        # 在既有"新卡优先/复用"逻辑之前先过滤，被排除的按原因计数打印（可见性）。
+        def _eligible(num):
+            if not num:
+                return False, "无卡号"
+            if valid_card_model:
+                bound = valid_card_model.get_bound_email(num)
+                if bound and bound != email:
+                    return False, "已绑定其他账号"
+            if recharge_log_model and recharge_log_model.success_count_since(num, 24) >= 2:
+                return False, "24h内已支付2次(冷却中)"
+            if card_state_model and card_state_model.in_tds_cooldown(num):
+                return False, "3DS临时冷却中"
+            return True, ""
+
+        _skip_reasons = {}
+        _eligible_cards = []
+        for c in _all_cards:
+            ok, why = _eligible(c.get('number', ''))
+            if ok:
+                _eligible_cards.append(c)
+            else:
+                _skip_reasons[why] = _skip_reasons.get(why, 0) + 1
+        if _skip_reasons:
+            print("  选卡规则跳过: " + "，".join(f"{k}×{v}" for k, v in _skip_reasons.items()))
+        _all_cards = _eligible_cards
+
         _invalid_numbers = set()      # 本次任务内被判定为无效的卡（拒付/3DS）
         _paid_numbers = set(recharge_log_model.get_success_card_numbers(email)) if recharge_log_model else set()
         _new_cards = [c for c in _all_cards if c.get('number') not in _paid_numbers]
@@ -485,15 +513,25 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}"
                   f"（该账号累计 {len(_paid_numbers)} 张成功卡）{bal_txt}")
 
-        def _on_invoice_failed(invoice_id, card, reason, card_fault=False):
+        def _on_invoice_failed(invoice_id, card, reason, card_fault=False, tds=False):
             """每笔发票支付失败后：记录失败原因；仅当失败归因于卡本身时才把底料卡标为无效。
 
             card_fault=True（拒付 / 卡过期 / 需要 3DS）→ 卡不可用，标记 invalid 并不再选用；
             card_fault=False（页面超时、元素定位失败、结果未确认等脚本侧问题）→ 不动卡状态，
             否则一次脚本抖动就会误杀一张好卡。
-            """
+
+            R3 例外：tds=True（3DS）且该卡**曾支付成功**（已绑定）→ 标"临时3DS冷却24h"而非永久
+            作废，冷却到期自动恢复；本轮仍加入 _invalid_numbers 以跳过（无法完成 3DS）。"""
             num = card.get('number', '')
-            if card_fault and card_pool_model:
+            was_successful = bool(valid_card_model and valid_card_model.get_bound_email(num))
+            if tds and was_successful and card_state_model:
+                try:
+                    card_state_model.set_tds(num, hours=24, reason=reason)
+                    _invalid_numbers.add(num)     # 本轮跳过，但不永久作废
+                    print(f"  卡 ****{str(num)[-4:]} 曾成功、本次 3DS → 临时冷却24h（未永久作废）")
+                except Exception:
+                    pass
+            elif card_fault and card_pool_model:
                 try:
                     card_pool_model.mark_invalid_by_number(num)
                     _invalid_numbers.add(num)     # 本次任务内后续选卡也立即跳过

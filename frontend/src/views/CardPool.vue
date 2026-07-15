@@ -174,6 +174,7 @@
       </select>
       <button class="filter-btn filter-btn-primary" @click="validPage = 1; loadValidCards()">查询</button>
       <button class="filter-btn filter-btn-reset" @click="validFilters.keyword = ''; validFilters.source_type = ''; validPage = 1; loadValidCards()">重置</button>
+      <button class="filter-btn filter-btn-primary" style="background:#059669" @click="exportValidCards">导出 Excel</button>
     </FilterBar>
     <div style="overflow-x:auto">
       <table>
@@ -184,15 +185,16 @@
             <th>持卡人</th>
             <th>来源</th>
             <th>关联账号</th>
+            <th>状态</th>
             <th>验证时间</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="validLoading">
-            <td colspan="6" class="table-loading">加载中...</td>
+            <td colspan="7" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="validCards.length === 0">
-            <td colspan="6" class="table-empty">暂无有效卡记录</td>
+            <td colspan="7" class="table-empty">暂无有效卡记录</td>
           </tr>
           <tr v-for="c in validCards" :key="c.id">
             <td style="font-family:monospace">{{ maskCard(c.card_number) }}</td>
@@ -204,6 +206,11 @@
               </span>
             </td>
             <td>{{ c.source_email || '-' }}</td>
+            <td>
+              <span class="status-tag" :class="(c.tds_cooldown || c.rate_cooldown) ? 'fail' : 'success'">
+                {{ c.status_text || '可用' }}
+              </span>
+            </td>
             <td style="font-size:11px">{{ c.validated_at }}</td>
           </tr>
         </tbody>
@@ -375,6 +382,11 @@ async function loadValidCards() {
     validTotal.value = data.total || 0
     if (data.summary) Object.assign(validSummary, data.summary)
   } catch (e) { console.error(e) } finally { validLoading.value = false }
+}
+
+function exportValidCards() {
+  const q = validFilters.source_type ? `?source_type=${encodeURIComponent(validFilters.source_type)}` : ''
+  window.open(`/api/valid-cards/export${q}`, '_blank')
 }
 
 onMounted(() => {

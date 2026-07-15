@@ -810,6 +810,19 @@ def clear_card_pool(group_id):
 
 # ==================== 有效卡 ====================
 
+def _valid_card_status(models, card):
+    """给一张有效卡补充选卡状态：绑定账号、3DS临时冷却、24h次数冷却、汇总状态文案。"""
+    num = card.get('card_number', '')
+    tds = models['card_state'].in_tds_cooldown(num)
+    rate = models['recharge_log'].success_count_since(num, 24) >= 2
+    card['bound_email'] = card.get('source_email', '') if card.get('source_type') == 'payment' else ''
+    card['tds_cooldown'] = bool(tds)
+    card['rate_cooldown'] = bool(rate)
+    card['tds_until'] = models['card_state'].get_tds_until(num)
+    card['status_text'] = '3DS临时冷却' if tds else ('24h达2次冷却' if rate else '可用')
+    return card
+
+
 @api.route('/api/valid-cards')
 def get_valid_cards():
     models = get_models()
@@ -821,8 +834,47 @@ def get_valid_cards():
         page=page, page_size=page_size,
         source_type=source_type, keyword=keyword,
     )
+    for c in cards:
+        _valid_card_status(models, c)
     summary = models['valid_card'].get_summary()
     return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size, "summary": summary})
+
+
+@api.route('/api/valid-cards/export')
+def export_valid_cards():
+    """导出全部有效卡为 xlsx（列对齐信用卡模板 + 绑定账号/状态）。"""
+    import openpyxl
+    from datetime import datetime
+    models = get_models()
+    source_type = request.args.get('source_type', '')
+    cards = models['valid_card'].get_all_for_export(source_type)
+
+    headers = ['card_number', 'expiry_month', 'expiry_year', 'cvc',
+               'first_name', 'last_name', 'country', 'address', 'address2',
+               'city', 'state', 'zip', 'company',
+               'source_type', 'bound_email', 'status', 'validated_at']
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'ValidCards'
+    ws.append(headers)
+    for c in cards:
+        _valid_card_status(models, c)
+        ws.append([
+            c.get('card_number', ''), c.get('expiry_month', ''), c.get('expiry_year', ''),
+            c.get('cvc', ''), c.get('first_name', ''), c.get('last_name', ''),
+            c.get('country', ''), c.get('address', ''), c.get('address2', ''),
+            c.get('city', ''), c.get('state', ''), c.get('zip', ''), c.get('company', ''),
+            c.get('source_type', ''), c.get('bound_email', ''), c.get('status_text', ''),
+            c.get('validated_at', ''),
+        ])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"valid_cards_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    return send_file(
+        buf, as_attachment=True, download_name=fname,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
 
 
 # ==================== 修改绑卡任务：支持从分组启动 ====================
@@ -891,7 +943,10 @@ def start_daily_pipeline():
     max_bindable_cards = data.get('max_bindable_cards', 2)
     captcha_api_key = data.get('captcha_api_key')
 
-    # 校验：绑卡分组有可用卡 或 有可充值账号，二者至少其一，否则无事可做
+    # 校验：绑卡分组有可用卡 或 有已绑卡账号可充值，二者至少其一，否则无事可做。
+    # 注意：这里不再用 has_today_record 排除今日已充账号——流水线阶段2 会放行所有绑卡账号
+    # （今日已充的转去执行账单支付/复查），启动门若继续排除会与流水线不一致，导致「没有绑卡
+    # 数据、只想跑充值」的场景被误拦。只要有账号绑卡数≥1 即允许启动，无卡时自动跳过补绑/注册。
     cards, unusable = models['card_pool'].get_usable_cards_as_list(bind_group_id)
     has_rechargeable = False
     if not cards:
@@ -899,15 +954,13 @@ def start_daily_pipeline():
         emails = [a['email'] for a in accts]
         counts = models['card_binding'].count_by_emails(emails)
         has_rechargeable = any(
-            a.get('cf_password')
-            and counts.get(a['email'], 0) >= 1
-            and not models['recharge_log'].has_today_record(a['email'])
+            a.get('cf_password') and counts.get(a['email'], 0) >= 1
             for a in accts
         )
         if not has_rechargeable:
             if unusable:
-                return jsonify({"error": f"绑卡分组 {len(unusable)} 张卡均已无效，且无可充值账号"}), 400
-            return jsonify({"error": "绑卡分组无可用卡，且无可充值账号，无事可做"}), 400
+                return jsonify({"error": f"绑卡分组 {len(unusable)} 张卡均已无效，且无已绑卡账号可充值，无事可做"}), 400
+            return jsonify({"error": "绑卡分组无可用卡，且无已绑卡账号可充值，无事可做"}), 400
 
     import threading
     threading.Thread(

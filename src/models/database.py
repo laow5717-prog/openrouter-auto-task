@@ -117,12 +117,23 @@ ALTER TABLE accounts ADD COLUMN credits_balance REAL;
 ALTER TABLE accounts ADD COLUMN balance_updated_at TEXT;
 """
 
+# 账单支付选卡规则：3DS 临时冷却状态（一卡一账号绑定/次数冷却由 valid_cards/recharge_logs 实时派生，无需落库）
+_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS card_payment_state (
+    card_number TEXT PRIMARY KEY,
+    tds_until   TEXT,
+    tds_reason  TEXT DEFAULT '',
+    updated_at  TEXT DEFAULT (datetime('now','localtime'))
+);
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
     3: _SCHEMA_V3,
     4: _SCHEMA_V4,
     5: _SCHEMA_V5,
+    6: _SCHEMA_V6,
 }
 
 

@@ -21,6 +21,7 @@ from src.models.recharge_log import RechargeLogModel
 from src.models.card_group import CardGroupModel
 from src.models.card_pool import CardPoolModel
 from src.models.valid_card import ValidCardModel
+from src.models.card_payment_state import CardPaymentStateModel
 from src.services import registration, card as card_service
 from src.api.routes import api
 
@@ -432,6 +433,7 @@ class AppState:
                 account_model=models['account'],
                 should_stop=lambda: self.stop_requested,
                 card_binding_model=models['card_binding'],
+                card_state_model=models['card_state'],
             )
 
             # 仅处理/检查了账单、未实际 Top-up：删除预建占位 log，避免误记为 $10 充值成功。
@@ -773,6 +775,12 @@ def create_app(db_path=None):
         static_dir = str(base_dir / 'static')
 
     app = Flask(__name__, static_url_path='', static_folder=static_dir)
+    # 让 jsonify 直接输出中文，而非 \uXXXX 转义（错误提示等含中文时更可读）
+    app.config['JSON_AS_ASCII'] = False
+    try:
+        app.json.ensure_ascii = False   # Flask 2.3+ 新式 JSON provider
+    except Exception:
+        pass
 
     # 初始化数据库（路径独立于程序目录，升级版本不丢数据）
     if db_path is None:
@@ -788,6 +796,7 @@ def create_app(db_path=None):
         'card_group': CardGroupModel(db),
         'card_pool': CardPoolModel(db),
         'valid_card': ValidCardModel(db),
+        'card_state': CardPaymentStateModel(db),
     }
 
     # 创建应用状态
