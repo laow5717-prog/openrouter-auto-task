@@ -849,8 +849,11 @@ def clear_card_pool(group_id):
 
 # ==================== 有效卡 ====================
 
+_POOL_STATUS_ZH = {'': '在库(未验证)', 'paid': '有效(已支付)', 'invalid': '无效', 'expired': '已过期'}
+
+
 def _valid_card_status(models, card):
-    """给一张有效卡补充选卡状态：绑定账号、3DS临时冷却、24h次数冷却、汇总状态文案。"""
+    """给一张有效卡补充选卡状态：绑定账号、3DS临时冷却、24h次数冷却、汇总状态文案、池内分组/状态。"""
     num = card.get('card_number', '')
     tds = models['card_state'].in_tds_cooldown(num)
     rate = models['recharge_log'].success_count_since(num, 24) >= 2
@@ -859,6 +862,14 @@ def _valid_card_status(models, card):
     card['rate_cooldown'] = bool(rate)
     card['tds_until'] = models['card_state'].get_tds_until(num)
     card['status_text'] = '3DS临时冷却' if tds else ('24h达2次冷却' if rate else '可用')
+    # 池内位置：该有效卡当前在卡池哪个分组、什么状态（解释"为何不计入某分组的有效桶"）
+    locs = models['card_pool'].get_locations_by_number(num)
+    if locs:
+        card['pool_group'] = '，'.join((l.get('group_name') or str(l.get('group_id'))) for l in locs)
+        card['pool_status'] = '，'.join(_POOL_STATUS_ZH.get(l.get('status') or '', l.get('status') or '') for l in locs)
+    else:
+        card['pool_group'] = ''
+        card['pool_status'] = '不在卡池'
     return card
 
 

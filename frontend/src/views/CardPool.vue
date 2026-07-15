@@ -79,9 +79,10 @@
     <!-- 状态筛选 + 桶数量 -->
     <div style="display:flex;gap:8px;align-items:center;padding:10px 16px;flex-wrap:wrap">
       <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === '' }" @click="setBucket('')">全部 {{ poolBuckets.total }}</button>
-      <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === 'valid' }" @click="setBucket('valid')">有效 {{ poolBuckets.valid }}</button>
+      <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === 'valid' }" @click="setBucket('valid')">有效(在库) {{ poolBuckets.valid }}</button>
       <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === 'unverified' }" @click="setBucket('unverified')">未验证 {{ poolBuckets.unverified }}</button>
       <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === 'invalid' }" @click="setBucket('invalid')">无效 {{ poolBuckets.invalid }}</button>
+      <span style="font-size:11px;color:var(--text-sub)">「有效(在库)」= 本分组内已验证且当前可用的卡；全局历史验证卡见上方「查看有效卡」</span>
     </div>
 
     <div v-if="uploadMsg" style="padding:8px 16px;font-size:12px" v-html="uploadMsg"></div>
@@ -191,7 +192,7 @@
   </Modal>
 
   <!-- 有效卡弹窗 -->
-  <Modal :visible="validModal.visible" title="有效卡列表" @close="validModal.visible = false" wide>
+  <Modal :visible="validModal.visible" title="有效卡列表（全局历史验证卡）" @close="validModal.visible = false" wide>
     <div class="stats-grid" style="margin-bottom:12px">
       <div class="stat-card small">
         <div class="stat-label">总计</div>
@@ -217,6 +218,10 @@
       <button class="filter-btn filter-btn-reset" @click="validFilters.keyword = ''; validFilters.source_type = ''; validPage = 1; loadValidCards()">重置</button>
       <button class="filter-btn filter-btn-primary" style="background:#059669" @click="exportValidCards">导出 Excel</button>
     </FilterBar>
+    <div style="font-size:12px;color:var(--text-sub);margin-bottom:8px;line-height:1.5">
+      此处为<strong>全局历史验证卡</strong>（跨所有分组、一经验证成功即长期保留）。它与"某个分组的有效桶"口径不同：
+      分组的"有效(在库)"只统计当前在该分组卡池、且未被标记无效的卡。看「池内位置」列可知每张卡当前在哪个分组、什么状态。
+    </div>
     <div style="overflow-x:auto">
       <table class="valid-table">
         <thead>
@@ -226,16 +231,17 @@
             <th>持卡人</th>
             <th>来源</th>
             <th>关联账号</th>
+            <th>池内位置</th>
             <th>状态</th>
             <th>验证时间</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="validLoading">
-            <td colspan="7" class="table-loading">加载中...</td>
+            <td colspan="8" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="validCards.length === 0">
-            <td colspan="7" class="table-empty">暂无有效卡记录</td>
+            <td colspan="8" class="table-empty">暂无有效卡记录</td>
           </tr>
           <tr v-for="c in validCards" :key="c.id">
             <td style="font-family:monospace">{{ c.card_number }}</td>
@@ -247,6 +253,10 @@
               </span>
             </td>
             <td>{{ c.source_email || '-' }}</td>
+            <td style="font-size:12px">
+              <template v-if="c.pool_group">{{ c.pool_group }} · {{ c.pool_status }}</template>
+              <span v-else style="color:var(--text-sub)">{{ c.pool_status || '不在卡池' }}</span>
+            </td>
             <td>
               <span class="status-tag" :class="(c.tds_cooldown || c.rate_cooldown) ? 'fail' : 'success'">
                 {{ c.status_text || '可用' }}

@@ -260,3 +260,16 @@ class CardPoolModel:
     def count_by_group(self, group_id):
         row = self.db.fetchone("SELECT COUNT(*) as cnt FROM card_pool WHERE group_id=?", (group_id,))
         return row['cnt'] if row else 0
+
+    def get_locations_by_number(self, card_number):
+        """返回该卡号当前在卡池中的位置列表：[{group_id, group_name, status}]。
+        通常 0 或 1 条（add_cards 阻止跨组同号）；用于有效卡弹窗展示"池内分组/状态"。"""
+        if not card_number:
+            return []
+        rows = self.db.fetchall(
+            "SELECT p.group_id, g.name AS group_name, COALESCE(p.status,'') AS status "
+            "FROM card_pool p LEFT JOIN card_groups g ON g.id=p.group_id "
+            "WHERE p.card_number=?",
+            (card_number,),
+        )
+        return [dict(r) for r in rows]
