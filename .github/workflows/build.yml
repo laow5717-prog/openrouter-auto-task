@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     strategy:
+      max-parallel: 1
       matrix:
         include:
           - os: macos-latest
@@ -20,6 +21,8 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     name: Build ${{ matrix.name }}
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -45,29 +48,9 @@ jobs:
         if: runner.os == 'Windows'
         run: Compress-Archive -Path dist\CloudflareAutoTask\* -DestinationPath ${{ matrix.artifact }}.zip
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.zip
-          # 仅作 release job 的中转产物，正式产物挂在 Release assets；短期过期避免占满 500MB 存储配额
-          retention-days: 1
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-
-      - name: Create Release
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            CloudflareAutoTask-macOS/CloudflareAutoTask-macOS.zip
-            CloudflareAutoTask-Windows/CloudflareAutoTask-Windows.zip
+          files: ${{ matrix.artifact }}.zip
           generate_release_notes: true
