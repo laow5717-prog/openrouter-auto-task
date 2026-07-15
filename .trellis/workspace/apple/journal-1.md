@@ -645,3 +645,39 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 20: 卡池分组管理 + 有效卡导出/池内状态展示 + 3DS误标订正
+
+**Date**: 2026-07-15
+**Task**: 卡池分组管理 + 有效卡导出/池内状态展示 + 3DS误标订正
+**Branch**: `main`
+
+### Summary
+
+有效卡弹窗去脱敏+列宽自适应，导出改中文表头并含CF账号(邮箱/CF密码/邮箱密码)与完整卡信息。新增卡池分组管理：按状态桶(有效在库/未验证/无效)筛选查看、多分组'非无效卡'去重移动合并到新分组、一键删除分组内无效卡(invalid+expired)；card_pool 加 count_buckets/bucket过滤/move_non_invalid_to_group/delete_invalid_by_group。有效卡弹窗加'池内位置'列并澄清全局历史验证卡 vs 分组在库有效的口径差异。确认R3(曾成功卡遇3DS→临时冷却非永久作废)代码正确，订正R3上线前被旧代码误标invalid的4张仅3DS失败卡(9358/6098/0847/1996)为paid，4673因另有真拒付保留invalid。分组卡片列表状态列增加3DS临时/24h次数冷却徽标。均已合并main并推送。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `826e365` | (see git log) |
+| `e7c3723` | (see git log) |
+| `f25eb2f` | (see git log) |
+| `b80896d` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
