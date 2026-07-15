@@ -7,22 +7,25 @@
 
     <nav class="nav-menu">
       <router-link to="/" class="nav-item" active-class="active" exact-active-class="active">
-        <span>&#128202;</span> 运行监控
+        <Icon name="bolt" /> 每日任务
+      </router-link>
+      <router-link to="/monitor" class="nav-item" active-class="active">
+        <Icon name="dashboard" /> 运行监控
       </router-link>
       <router-link to="/card-pool" class="nav-item" active-class="active">
-        <span>&#128451;</span> 卡片管理
+        <Icon name="cards" /> 卡片管理
       </router-link>
       <router-link to="/cardmode" class="nav-item" active-class="active">
-        <span>&#128179;</span> 导入绑卡
+        <Icon name="bind" /> 导入绑卡
       </router-link>
       <router-link to="/accounts" class="nav-item" active-class="active">
-        <span>&#128101;</span> 账号管理
+        <Icon name="accounts" /> 账号管理
       </router-link>
       <router-link to="/card-history" class="nav-item" active-class="active">
-        <span>&#128203;</span> 绑卡记录
+        <Icon name="history" /> 绑卡记录
       </router-link>
       <router-link to="/recharge-logs" class="nav-item" active-class="active">
-        <span>&#128176;</span> 充值记录
+        <Icon name="wallet" /> 充值记录
       </router-link>
     </nav>
 
@@ -45,10 +48,11 @@
 import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAppStore } from './stores/app'
+import Icon from './components/Icon.vue'
 const store = useAppStore()
 const route = useRoute()
 
-const titleMap = { dashboard: '运行监控', cardPool: '卡片管理', cardmode: '导入绑卡', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录' }
+const titleMap = { workbench: '每日任务', monitor: '运行监控', cardPool: '卡片管理', cardmode: '导入绑卡', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录' }
 const pageTitle = computed(() => titleMap[route.name] || '系统概览')
 
 onMounted(() => store.startPolling())

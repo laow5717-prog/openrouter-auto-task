@@ -118,6 +118,7 @@
           </tr>
         </tbody>
       </table>
+        <div v-if="!poolCards || !poolCards.length" class="empty-state">暂无数据</div>
     </div>
 
     <Pagination :total="poolTotal" :page="poolPage" :page-size="poolPageSize"

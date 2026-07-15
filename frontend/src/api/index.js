@@ -103,3 +103,6 @@ export const getValidCards = (params) => get('/api/valid-cards', params)
 
 // Card group driven task
 export const startCardTaskFromGroup = (data) => post('/api/card/start-from-group', data)
+
+// Daily one-click pipeline
+export const startDailyPipeline = (data) => post('/api/daily/start', data)

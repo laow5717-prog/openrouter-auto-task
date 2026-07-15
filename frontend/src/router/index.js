@@ -1,7 +1,8 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 
 const routes = [
-  { path: '/', name: 'dashboard', component: () => import('../views/Dashboard.vue') },
+  { path: '/', name: 'workbench', component: () => import('../views/Workbench.vue') },
+  { path: '/monitor', name: 'monitor', component: () => import('../views/Dashboard.vue') },
   { path: '/card-pool', name: 'cardPool', component: () => import('../views/CardPool.vue') },
   { path: '/cardmode', name: 'cardmode', component: () => import('../views/CardMode.vue') },
   { path: '/accounts', name: 'accounts', component: () => import('../views/Accounts.vue') },

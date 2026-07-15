@@ -58,6 +58,7 @@
           </tr>
         </tbody>
       </table>
+        <div v-if="!logs || !logs.length" class="empty-state">暂无数据</div>
     </div>
 
     <Pagination :total="total" :page="page" :page-size="pageSize"

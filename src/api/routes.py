@@ -474,99 +474,12 @@ def recharge_account():
 
     import threading
 
-    # 是否有支付卡分组 → 决定是否处理 Unpaid invoices
-    skip_invoice = not payment_group_id
-    payment_cards = []
-    if payment_group_id:
-        # 只取可用卡：过期卡在此被标记为无效并剔除，不用于账单支付
-        payment_cards, unusable = models['card_pool'].get_usable_cards_as_list(payment_group_id)
-        if unusable:
-            state.add_log(f"支付卡分组已跳过 {len(unusable)} 张无效卡（过期/被拒）")
-        if not payment_cards:
-            state.add_log(f"支付卡分组无可用卡片数据，将仅执行 Top-up Credits")
-            skip_invoice = True
-
-    # 获取该账号绑定的卡片列表，后续根据页面实际使用的卡片后四位匹配完整卡号
-    cards = models['card_binding'].get_by_email(email)
-
-    # 先创建充值记录，card_display 稍后根据实际使用的卡片更新
-    log_id = models['recharge_log'].create(email, card_display='', amount=10)
-
     def _do_recharge():
         try:
-            success, err, responses, card_last4 = registration.recharge_account(
-                email, cf_password,
-                recharge_log_model=models['recharge_log'],
-                monitor_callback=state._monitor,
-                skip_invoice=skip_invoice,
-                payment_cards=payment_cards,
-                valid_card_model=models['valid_card'],
-                card_pool_model=models['card_pool'],
-                account_model=models['account'],
-                should_stop=lambda: state.stop_requested,
-            )
-
-            # 用页面提取的后四位匹配完整卡号
-            matched_card = ''
-            if card_last4:
-                for c in cards:
-                    if c.get('card_number', '').endswith(card_last4):
-                        matched_card = c['card_number']
-                        break
-                if not matched_card:
-                    matched_card = f'•••• {card_last4}'
-            if matched_card:
-                models['recharge_log'].update_card(log_id, matched_card)
-            # 从 API 响应中提取结果
-            topup_resp = None
-            for resp in responses:
-                url = resp.get('url', '')
-                if 'topup' in url or 'payment_intents' in url:
-                    topup_resp = resp
-                    break
-
-            if success and topup_resp:
-                resp_data = topup_resp.get('data', {})
-                http_status = topup_resp.get('status', 0)
-                # CF topup API: success=true 表示成功
-                if isinstance(resp_data, dict) and resp_data.get('success') is True:
-                    models['recharge_log'].mark_success(log_id, api_response=topup_resp)
-                    state.current_action = f"{email} 充值成功"
-                    state.add_log(f"{email} AI Credits 充值 $10 成功")
-                    # 记录有效卡（支付成功）
-                    if matched_card and card_last4:
-                        for c in cards:
-                            if c.get('card_number', '').endswith(card_last4):
-                                models['valid_card'].record(
-                                    c, source_type='payment', source_email=email,
-                                )
-                                break
-                else:
-                    # API 返回了错误（如 409 重复充值）
-                    error_msg = ''
-                    if isinstance(resp_data, dict):
-                        errors = resp_data.get('errors', [])
-                        if errors:
-                            error_msg = errors[0].get('message', str(resp_data))
-                        else:
-                            error_msg = str(resp_data)
-                    else:
-                        error_msg = str(resp_data)
-                    models['recharge_log'].mark_failed(log_id, error=f"[HTTP {http_status}] {error_msg}", api_response=topup_resp)
-                    state.current_action = f"{email} 充值失败: {error_msg}"
-                    state.add_log(f"{email} 充值失败: {error_msg}")
-            elif success:
-                # 点击成功但未捕获到 API 响应
-                models['recharge_log'].mark_success(log_id)
-                state.current_action = f"{email} 充值已提交（未捕获响应）"
-                state.add_log(f"{email} AI Credits 充值 $10 已提交")
-            else:
-                models['recharge_log'].mark_failed(log_id, error=err)
-                state.current_action = f"{email} 充值失败: {err}"
-                state.add_log(f"{email} 充值失败: {err}")
+            state._recharge_one_account(email, cf_password, payment_group_id)
+        except InterruptedError:
+            state.add_log("充值已中断")
         except Exception as e:
-            models['recharge_log'].mark_failed(log_id, error=str(e))
-            state.current_action = f"充值异常: {e}"
             state.add_log(f"充值异常: {e}")
         finally:
             state.clear_active_driver()
@@ -954,3 +867,55 @@ def start_card_task_from_group():
 
     return jsonify({"status": "started", "total_cards": len(cards),
                     "skipped_invalid": len(unusable), "group_name": group['name']})
+
+
+@api.route('/api/daily/start', methods=['POST'])
+def start_daily_pipeline():
+    """启动每日一键流水线：补绑已有账号 → 注册新号 → 批量充值"""
+    state = get_app_state()
+    if state.is_running:
+        return jsonify({"error": "有任务正在运行"}), 400
+
+    models = get_models()
+    data = request.json or {}
+    bind_group_id = data.get('bind_group_id')
+    if not bind_group_id:
+        return jsonify({"error": "未指定绑卡分组"}), 400
+
+    group = models['card_group'].get_by_id(bind_group_id)
+    if not group:
+        return jsonify({"error": "绑卡分组不存在"}), 404
+
+    cf_password = data.get('cf_password')
+    payment_group_id = data.get('payment_group_id') or None
+    max_bindable_cards = data.get('max_bindable_cards', 2)
+    captcha_api_key = data.get('captcha_api_key')
+
+    # 校验：绑卡分组有可用卡 或 有可充值账号，二者至少其一，否则无事可做
+    cards, unusable = models['card_pool'].get_usable_cards_as_list(bind_group_id)
+    has_rechargeable = False
+    if not cards:
+        accts = models['account'].get_all(order_desc=False)
+        emails = [a['email'] for a in accts]
+        counts = models['card_binding'].count_by_emails(emails)
+        has_rechargeable = any(
+            a.get('cf_password')
+            and counts.get(a['email'], 0) >= 1
+            and not models['recharge_log'].has_today_record(a['email'])
+            for a in accts
+        )
+        if not has_rechargeable:
+            if unusable:
+                return jsonify({"error": f"绑卡分组 {len(unusable)} 张卡均已无效，且无可充值账号"}), 400
+            return jsonify({"error": "绑卡分组无可用卡，且无可充值账号，无事可做"}), 400
+
+    import threading
+    threading.Thread(
+        target=state.run_daily_pipeline,
+        args=(bind_group_id, payment_group_id, cf_password,
+              max_bindable_cards, captcha_api_key),
+        daemon=True,
+    ).start()
+
+    return jsonify({"status": "started", "usable_cards": len(cards),
+                    "group_name": group['name']})

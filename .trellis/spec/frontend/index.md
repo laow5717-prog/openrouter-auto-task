@@ -20,7 +20,7 @@
 frontend/
 ├── src/
 │   ├── api/index.js        # All API calls
-│   ├── components/          # Reusable: FilterBar, Pagination, Modal, SidebarControls, CardEntry
+│   ├── components/          # Reusable: FilterBar, Pagination, Modal, Icon, SidebarControls, CardEntry
 │   ├── router/index.js      # Hash router, lazy-loaded routes
 │   ├── stores/              # Pinia stores
 │   ├── styles/global.css    # CSS variables, base styles, table/stat-card styles
@@ -49,6 +49,21 @@ All list pages follow the same structure:
 ### Modal with `wide` Prop
 
 `<Modal>` accepts optional `wide` boolean prop for 720px width (default 560px).
+
+### Icons: `components/Icon.vue`
+
+Nav and action buttons use `<Icon name="..." size="18" />` — a stroke-based 24×24 SVG
+library keyed by name (`bolt`, `play`, `stop`, `monitor`, `terminal`, `dashboard`, `cards`,
+`bind`, `accounts`, `history`, `wallet`, …). Add new glyphs to the `ICONS` map in that file
+rather than inlining raw `<svg>` or emoji `<span>` in views. Unknown names render nothing.
+
+### Form Params: persist via settings store, not local refs
+
+Automation forms (e.g. `Workbench.vue`) bind inputs directly to `useSettingsStore()` fields
+(`dailyBindGroupId`, `dailyPaymentGroupId`, `cfPassword`, `captchaApiKey`, `maxBindableCards`),
+call `settings.save()` on submit to write localStorage, so values auto-restore next visit.
+When a group dropdown has exactly one option and the stored value is empty, auto-select it.
+`save()` writes empty strings too (so clearing a field persists) — don't gate writes on truthiness.
 
 ### Build & Deploy
 

@@ -289,6 +289,100 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
     return email, password, bound_count
 
 
+def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
+                                   email, cf_password, batch_records,
+                                   max_bindable_cards=2, captcha_api_key=None,
+                                   monitor_callback=None):
+    """登录已有 Cloudflare 账号并补绑信用卡，补到账号总绑卡数达 max_bindable_cards。
+
+    与 register_and_bind_cards 的区别：跳过注册，直接登录已有账号。以账单页真实
+    已绑卡数（get_bound_card_count）决定还需补几张，避免超绑。
+
+    返回: (bound_count, login_ok)
+      - login_ok=False → bound_count=0，且 batch_records 里的卡未被消耗（保留 pending），
+        由上层跳过该账号、把卡留给下一个账号。
+      - login_ok=True 但 bound_count=0 → 账号已满或账单页异常，视为已处理，卡不消耗。
+    """
+    driver = None
+    bound_count = 0
+
+    def _report(step_name):
+        if monitor_callback and driver:
+            monitor_callback(driver, step_name)
+
+    try:
+        driver = create_driver(headless=False, profile_id=email)
+        _report("init_browser")
+
+        if captcha_api_key:
+            captcha_solver.init_solver(captcha_api_key)
+
+        print(f"正在登录账号: {email}")
+        account_id = login_cloudflare(driver, email, cf_password)
+        if not account_id:
+            print("登录失败，跳过该账号（卡片保留待下个账号处理）")
+            return 0, False
+        _report("logged_in")
+
+        if not navigate_to_billing(driver):
+            print("导航到账单页面失败，跳过该账号")
+            return 0, True
+        _report("billing_page")
+
+        # 以页面真实已绑卡数决定还需补几张，避免超绑
+        current = get_bound_card_count(driver)
+        if current is None:
+            current = 0
+        need = max_bindable_cards - current
+        print(f"账号 {email} 当前已绑 {current} 张，目标 {max_bindable_cards} 张，需补 {max(need, 0)} 张")
+        if need <= 0:
+            print("账号已达目标绑卡数，无需补绑")
+            return 0, True
+
+        for idx, record in enumerate(batch_records):
+            if bound_count >= need:
+                print(f"已补满 {need} 张，剩余卡片留待下个账号处理")
+                break
+
+            card_info = record["card"]
+            card_display = f"****{record['card_display']}"
+            binding_id = record["id"]
+            print(f"\n补绑 {idx + 1}: {card_display}...")
+
+            _success, _err_reason = add_credit_card(driver, card_info)
+            if _success:
+                bound_count += 1
+                card_binding_model.mark_success(binding_id, email)
+                print(f"{card_display} 绑定成功！(本轮已绑 {bound_count} 张)")
+                _report("card_added")
+                if bound_count < need and idx < len(batch_records) - 1:
+                    navigate_to_billing(driver)
+                    time.sleep(3)
+            else:
+                card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")
+                print(f"{card_display} 绑定失败，尝试下一张... ({_err_reason})")
+                _report("card_failed")
+                if idx < len(batch_records) - 1:
+                    navigate_to_billing(driver)
+                    time.sleep(3)
+
+        if bound_count > 0:
+            account_model.update_status(email, f"bound_{current + bound_count}_cards")
+
+    except InterruptedError:
+        print("任务被用户中断")
+        raise
+    except Exception as e:
+        print(f"补绑出错: {e}")
+        return bound_count, True
+    finally:
+        if driver:
+            print("正在关闭浏览器...")
+            close_driver(driver)
+
+    return bound_count, True
+
+
 def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
