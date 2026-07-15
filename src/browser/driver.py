@@ -2843,46 +2843,29 @@ def get_bound_card_count(driver):
         except Exception:
             pass
 
-        # 方法2: 查找 Billing method 区域内的卡号末四位标识
-        card_elements = driver.page.locator(
-            'xpath=//*[contains(text(), "••••") or contains(text(), "****")]'
-        ).all()
-        visible_cards = [el for el in card_elements if el.is_visible()]
-        if visible_cards:
-            count = len(visible_cards)
-            print(f"  💳 检测到 {count} 张已绑定的信用卡 (通过卡号标识)")
-            return count
-
-        # 方法3: 通过 JS 在 Billing method 区域计数
+        # 方法2: 按「掩码段 + 末四位数字」模式计数（如 "•••• 4673"）。
+        # 关键：一张卡的完整掩码号渲染为多段 "•••• •••• •••• 4673"，只有最后一段
+        # 跟着真实的 4 位数字。用 /[•*·]{2,}\s*\d{4}/ 锚定这一段，每张卡恰好匹配一次，
+        # 避免把前面的每个 "••••" 段各数成一张卡（曾导致 1 张卡被误读为 3 张而跳过补绑）。
+        # 优先在 "Billing method" 区域内统计，找不到该区域时退回整页文本。
         count = driver.page.evaluate("""() => {
-            // 查找包含 "Billing method" 文本的 section
+            var re = /[\\u2022\\*\\u00b7]{2,}\\s*\\d{4}/g;
             var sections = document.querySelectorAll('div, section');
             for (var i = 0; i < sections.length; i++) {
                 var header = sections[i].querySelector('span');
                 if (header && header.textContent.trim() === 'Billing method') {
-                    // 在此区域内查找卡号标识或卡品牌元素
-                    var cards = sections[i].querySelectorAll(
-                        '[class*="payment"], [class*="card"], [data-testid*="payment"]'
-                    );
-                    // 过滤掉 "Add" 按钮等非卡片元素，计算实际卡片行数
-                    var cardCount = 0;
-                    var texts = sections[i].innerText || '';
-                    var matches = texts.match(/[•\\*]{4}\\s*\\d{4}/g);
-                    if (matches) cardCount = matches.length;
-                    return cardCount;
+                    var m = (sections[i].innerText || '').match(re);
+                    return m ? m.length : 0;   // 找到区域：以区域内计数为准（含 0）
                 }
             }
-            return -1;  // 未找到 Billing method 区域
+            var mb = (document.body.innerText || '').match(re);
+            return mb ? mb.length : 0;         // 未找到区域：退回整页计数
         }""")
         if count > 0:
-            print(f"  💳 检测到 {count} 张已绑定的信用卡 (通过 Billing method 区域)")
-            return count
-        if count == 0:
-            print("  💳 Billing method 区域未检测到已绑定的信用卡")
-            return 0
-
-        print("  💳 未检测到已绑定的信用卡")
-        return 0
+            print(f"  💳 检测到 {count} 张已绑定的信用卡")
+        else:
+            print("  💳 未检测到已绑定的信用卡")
+        return count
 
     except Exception as e:
         print(f"  ⚠️ 检测已绑定信用卡数量失败: {e}")
