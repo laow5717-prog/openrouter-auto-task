@@ -15,9 +15,6 @@
       <router-link to="/card-pool" class="nav-item" active-class="active">
         <Icon name="cards" /> 卡片管理
       </router-link>
-      <router-link to="/cardmode" class="nav-item" active-class="active">
-        <Icon name="bind" /> 导入绑卡
-      </router-link>
       <router-link to="/accounts" class="nav-item" active-class="active">
         <Icon name="accounts" /> 账号管理
       </router-link>
@@ -52,7 +49,7 @@ import Icon from './components/Icon.vue'
 const store = useAppStore()
 const route = useRoute()
 
-const titleMap = { workbench: '每日任务', monitor: '运行监控', cardPool: '卡片管理', cardmode: '导入绑卡', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录' }
+const titleMap = { workbench: '每日任务', monitor: '运行监控', cardPool: '卡片管理', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录' }
 const pageTitle = computed(() => titleMap[route.name] || '系统概览')
 
 onMounted(() => store.startPolling())

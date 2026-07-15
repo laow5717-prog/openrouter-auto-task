@@ -63,16 +63,6 @@ export const getOpenBrowsers = () => get('/api/accounts/open-browsers')
 export const getRechargeLogs = (params) => get('/api/recharge-logs', params)
 export const getRechargeLogsByEmail = (email) => get(`/api/recharge-logs/${encodeURIComponent(email)}`)
 
-// Card mode
-export const uploadCardExcel = (file) => {
-  const fd = new FormData()
-  fd.append('file', file)
-  return postFile('/api/card/upload', fd)
-}
-export const checkUnfinishedCards = () => get('/api/card/check-unfinished')
-export const startCardTask = (data) => post('/api/card/start', data)
-export const getCardStatus = (params) => get('/api/card/status', params)
-
 // Card history
 export const getCardHistory = (params) => get('/api/card/history', params)
 export const exportCardHistory = (body) => postBlob('/api/card/history/export', body)
@@ -102,9 +92,6 @@ export const deleteInvalidCards = (groupId) => post(`/api/card-pool/${groupId}/d
 
 // Valid cards
 export const getValidCards = (params) => get('/api/valid-cards', params)
-
-// Card group driven task
-export const startCardTaskFromGroup = (data) => post('/api/card/start-from-group', data)
 
 // Daily one-click pipeline
 export const startDailyPipeline = (data) => post('/api/daily/start', data)
