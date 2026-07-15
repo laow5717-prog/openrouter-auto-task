@@ -431,6 +431,7 @@ class AppState:
                 card_pool_model=models['card_pool'],
                 account_model=models['account'],
                 should_stop=lambda: self.stop_requested,
+                card_binding_model=models['card_binding'],
             )
 
             # 仅处理/检查了账单、未实际 Top-up：删除预建占位 log，避免误记为 $10 充值成功。
@@ -441,7 +442,7 @@ class AppState:
                 self.add_log(f"{email} 今日已充值，已执行账单支付检查，未重复 Top-up")
                 return "invoice_only", ''
 
-            # 用页面提取的后四位匹配完整卡号
+            # 用页面提取的后四位匹配完整卡号（用于 log 展示与有效卡记录）
             matched_card = ''
             if card_last4:
                 for c in cards:
@@ -453,52 +454,25 @@ class AppState:
             if matched_card:
                 models['recharge_log'].update_card(log_id, matched_card)
 
-            # 从 API 响应中提取 Top-up 结果
-            topup_resp = None
-            for resp in responses:
-                url = resp.get('url', '')
-                if 'topup' in url or 'payment_intents' in url:
-                    topup_resp = resp
-                    break
-
-            if success and topup_resp:
-                resp_data = topup_resp.get('data', {})
-                http_status = topup_resp.get('status', 0)
-                if isinstance(resp_data, dict) and resp_data.get('success') is True:
-                    models['recharge_log'].mark_success(log_id, api_response=topup_resp)
-                    self.current_action = f"{email} 充值成功"
-                    self.add_log(f"{email} AI Credits 充值 $10 成功")
-                    if matched_card and card_last4:
-                        for c in cards:
-                            if c.get('card_number', '').endswith(card_last4):
-                                models['valid_card'].record(
-                                    c, source_type='payment', source_email=email,
-                                )
-                                break
-                    return "success", ''
-                else:
-                    # API 返回了错误（如 409 重复充值）
-                    error_msg = ''
-                    if isinstance(resp_data, dict):
-                        errors = resp_data.get('errors', [])
-                        if errors:
-                            error_msg = errors[0].get('message', str(resp_data))
-                        else:
-                            error_msg = str(resp_data)
-                    else:
-                        error_msg = str(resp_data)
-                    models['recharge_log'].mark_failed(log_id, error=f"[HTTP {http_status}] {error_msg}", api_response=topup_resp)
-                    self.current_action = f"{email} 充值失败: {error_msg}"
-                    self.add_log(f"{email} 充值失败: {error_msg}")
-                    return "failed", error_msg
-            elif success:
-                # 点击成功但未捕获到 API 响应
-                models['recharge_log'].mark_success(log_id)
-                self.current_action = f"{email} 充值已提交（未捕获响应）"
-                self.add_log(f"{email} AI Credits 充值 $10 已提交")
+            # 收尾完全信任 registration 给出的 outcome——其内部以 Stripe payment_intents/confirm
+            # 为权威、confirm 未捕获时用余额兜底判定。不再从 CF topup 200/success 推断成功
+            # （那只代表已创建支付意图，非实际扣款成功）。
+            if outcome == "topup":
+                models['recharge_log'].mark_success(log_id, api_response={'responses': responses})
+                self.current_action = f"{email} 充值成功"
+                self.add_log(f"{email} AI Credits 充值 $10 成功")
+                if card_last4:
+                    for c in cards:
+                        if c.get('card_number', '').endswith(card_last4):
+                            models['valid_card'].record(
+                                c, source_type='payment', source_email=email,
+                            )
+                            break
                 return "success", ''
             else:
-                models['recharge_log'].mark_failed(log_id, error=err)
+                # outcome == "failed"：err 带拒付/未到账原因；拒付卡的失效标记已在 registration 内完成
+                models['recharge_log'].mark_failed(log_id, error=err or 'Top-up 未成功',
+                                                   api_response={'responses': responses})
                 self.current_action = f"{email} 充值失败: {err}"
                 self.add_log(f"{email} 充值失败: {err}")
                 return "failed", err or 'recharge failed'
@@ -546,23 +520,30 @@ class AppState:
             if unusable:
                 self._hooked_print(f"绑卡分组已跳过 {len(unusable)} 张无效卡（过期/被拒）")
 
-            # 过滤已成功绑定过的卡，以及 Stripe 字段错误的卡（数据无效，重试无意义）
+            # 过滤已成功绑定过的卡、Stripe 字段错误的卡，以及 Top-up 拒付被标记失效的卡
+            # （数据无效或卡已失效，重试无意义）
             already_bound_numbers = card_binding_model.get_successfully_bound_card_numbers()
             stripe_error_numbers = card_binding_model.get_stripe_field_error_card_numbers()
+            declined_numbers = card_binding_model.get_declined_card_numbers()
             filtered_cards = []
             skipped = 0
             skipped_stripe_err = 0
+            skipped_declined = 0
             for c in cards:
                 if c.get('number') in already_bound_numbers:
                     skipped += 1
                 elif c.get('number') in stripe_error_numbers:
                     skipped_stripe_err += 1
+                elif c.get('number') in declined_numbers:
+                    skipped_declined += 1
                 else:
                     filtered_cards.append(c)
             if skipped > 0:
                 self._hooked_print(f"跳过 {skipped} 张已绑定的卡")
             if skipped_stripe_err > 0:
                 self._hooked_print(f"跳过 {skipped_stripe_err} 张 Stripe 字段错误的卡")
+            if skipped_declined > 0:
+                self._hooked_print(f"跳过 {skipped_declined} 张 Top-up 拒付已失效的卡")
 
             if filtered_cards:
                 task_id = self.models['task'].create('daily', config={

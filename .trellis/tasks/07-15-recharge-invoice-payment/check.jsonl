@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "校验记账写入/订正是否符合 DB 约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验 Top-up 拒付/余额兜底/账单重试的失败处理与日志"}

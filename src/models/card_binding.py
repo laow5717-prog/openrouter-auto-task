@@ -83,6 +83,47 @@ class CardBindingModel:
                 pass
         return numbers
 
+    def mark_declined_by_number(self, card_number, reason=''):
+        """把指定卡号的**成功绑定**记录标记为失效（Top-up 因卡本身被拒）。
+
+        复用 status+error 前缀模式（与 [Stripe字段错误] 同类）：置 status='failed'、
+        error 以 '[充值拒付]' 开头，使该卡：①不再计入 count_by_emails（status='success'）、
+        ②被 get_declined_card_numbers 收集从而在补绑阶段被跳过。返回受影响行数（幂等）。"""
+        if not card_number:
+            return 0
+        rows = self.db.fetchall(
+            "SELECT id, card_data_json FROM card_bindings WHERE status='success' AND card_data_json IS NOT NULL"
+        )
+        ids = []
+        for r in rows:
+            try:
+                card = json.loads(r['card_data_json'])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if card.get('number') == card_number:
+                ids.append(r['id'])
+        for bid in ids:
+            self.db.execute(
+                "UPDATE card_bindings SET status='failed', error=?, attempted_at=datetime('now','localtime') WHERE id=?",
+                (f"[充值拒付] {reason}"[:200], bid),
+            )
+        return len(ids)
+
+    def get_declined_card_numbers(self):
+        """获取所有因 Top-up 拒付被标记失效的卡号（跨所有任务），补绑阶段据此跳过"""
+        rows = self.db.fetchall(
+            "SELECT card_data_json FROM card_bindings WHERE status='failed' AND error LIKE '[充值拒付]%' AND card_data_json IS NOT NULL"
+        )
+        numbers = set()
+        for r in rows:
+            try:
+                card = json.loads(r['card_data_json'])
+                if card.get('number'):
+                    numbers.add(card['number'])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return numbers
+
     def get_paginated_by_task(self, task_id, page=1, page_size=20, status='', keyword=''):
         conditions = ["task_id=?"]
         params = [task_id]

@@ -1,0 +1,1 @@
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "S10 数据订正与记账涉及 SQLite 写；遵循项目 DB 约定（WAL、模型层封装、分页查询）"}

@@ -25,6 +25,7 @@ from src.browser.driver import (
     fill_topup_and_confirm,
     handle_unpaid_invoices,
     read_credits_balance,
+    extract_decline_from_responses,
 )
 import src.services.captcha as captcha_solver
 
@@ -386,7 +387,7 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
 def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
-                     should_stop=None):
+                     should_stop=None, card_binding_model=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -400,6 +401,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         valid_card_model: ValidCardModel，支付成功后记录有效卡（source_type=payment）
         card_pool_model: CardPoolModel，支付成功后把底料卡状态标为 'paid'
         account_model: AccountModel，每笔发票支付成功后记录该账号最新的 Credits 余额
+        card_binding_model: CardBindingModel，Top-up 因卡本身被拒时把对应绑定卡标记失效
     返回:
         (bool, str, list, str, str): (是否成功, 错误信息, API 响应列表, 卡片后四位, 结局)
         结局(outcome): "topup"=实际执行了充值; "invoice_only"=未充值仅处理/检查账单;
@@ -507,7 +509,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             print(f"  已记失败: invoice {invoice_id} 卡 ****{str(num)[-4:]} 原因: {reason}{mark_txt}")
 
         def _record_final_balance():
-            """流程收尾：重新加载 credits 页面，读一次最终余额并落库（读不到不影响主流程）"""
+            """流程收尾：重新加载 credits 页面，读一次最终余额并落库（读不到不影响主流程）。
+            返回读到的余额（float）或 None。"""
             try:
                 driver.get(f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits")
                 time.sleep(5)
@@ -515,12 +518,58 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 balance = read_credits_balance(driver)
                 if balance is None:
                     print("  未读到最终 Credits 余额")
-                    return
+                    return None
                 print(f"  账号 {email} 最终 Credits 余额: ${balance:.2f}")
                 if account_model:
                     account_model.update_balance(email, balance)
+                return balance
             except Exception as e:
                 print(f"  读取最终余额失败: {e}")
+                return None
+
+        def _classify_topup(responses, baseline, post_topup):
+            """判定 Top-up 的**真实**结果，返回 (ok: bool, reason: str, card_fault: bool)。
+
+            权威源是 Stripe payment_intents/confirm 响应，而非 CF topup（200/success 仅表示
+            已创建支付意图）。confirm 未捕获时退化为余额兜底：topup 后余额较基线增长才算成功，
+            读不到余额则保守判失败（宁漏记成功不误记成功）。"""
+            stripe = None
+            for r in (responses or []):
+                u = r.get('url', '') or ''
+                if 'stripe.com' in u and 'confirm' in u:
+                    stripe = r
+                    break
+            if stripe is not None:
+                status = stripe.get('status', 0) or 0
+                data = stripe.get('data') if isinstance(stripe.get('data'), dict) else {}
+                has_error = bool(data.get('error'))
+                pi_status = data.get('status') if data.get('object') == 'payment_intent' else None
+                if int(status) >= 400 or has_error:
+                    # 从冻结的 responses 提取原因（不依赖 live net_responses，后者已被账单流程清空）
+                    reason, card_fault = extract_decline_from_responses(responses)
+                    return False, (reason or '支付被拒'), (card_fault if reason else True)
+                if pi_status in ('succeeded', 'processing', 'requires_capture'):
+                    return True, '', False
+                # 捕获到 confirm 但状态不明确（如 requires_action/3DS）→ 保守判失败
+                return False, f'支付状态未确认（{pi_status or status}）', False
+            # 未捕获到 Stripe confirm → 余额兜底
+            if baseline is not None and post_topup is not None:
+                if post_topup > baseline + 0.001:
+                    return True, '', False
+                return False, '充值后余额未增长（未捕获支付结果）', False
+            return False, '未捕获支付结果且余额未知', False
+
+        # 读基线余额（供 Top-up 后 confirm 未捕获时的余额兜底；读不到则兜底退化为保守判失败）
+        baseline_balance = None
+        try:
+            driver.get(f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits")
+            time.sleep(4)
+            dismiss_overdue_dialog(driver)
+            baseline_balance = read_credits_balance(driver)
+            if baseline_balance is not None:
+                print(f"  Top-up 前基线余额: ${baseline_balance:.2f}")
+        except Exception as e:
+            print(f"  读取基线余额失败: {str(e)[:80]}")
 
         print("正在跳转到 AI Credits 页面并点击充值...")
         success = navigate_to_ai_credits(driver, account_id)
@@ -571,34 +620,59 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         pay_success, responses, card_last4 = fill_topup_and_confirm(driver, amount=10)
         _report("topup_confirmed")
 
-        if pay_success:
-            print(f"账号 {email} 充值 $10 已提交")
+        if not pay_success:
+            print(f"账号 {email} 充值确认失败")
+            return False, "填写金额或确认支付失败", responses or [], card_last4, "failed"
 
-            if not skip_invoice:
-                # 有支付卡分组，等待页面更新后检查 Unpaid invoices
-                time.sleep(5)
-                print("正在返回 Credits 页面检查 Unpaid invoices...")
-                credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
-                driver.get(credits_url)
-                time.sleep(5)
-                check_and_handle_cf_challenge(driver)
-                dismiss_overdue_dialog(driver)
-                time.sleep(3)
+        print(f"账号 {email} 充值 $10 已提交")
 
-                invoice_results = handle_unpaid_invoices(
-                    driver, get_card=_get_card, on_paid=_on_invoice_paid,
-                    on_failed=_on_invoice_failed, account_id=account_id,
-                    should_stop=should_stop)
-                if invoice_results:
-                    print(f"Unpaid invoice 处理结果: {invoice_results}")
-                    time.sleep(10)
-            else:
-                print("未选择支付卡分组，跳过 Unpaid invoice 处理")
+        post_topup_balance = None
+        if not skip_invoice:
+            # 有支付卡分组，等待页面更新后检查 Unpaid invoices
+            time.sleep(5)
+            print("正在返回 Credits 页面检查 Unpaid invoices...")
+            credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+            driver.get(credits_url)
+            time.sleep(5)
+            check_and_handle_cf_challenge(driver)
+            dismiss_overdue_dialog(driver)
+            time.sleep(3)
+            # 处理任何账单之前先读一次余额——只反映 Top-up 效果，避免账单支付垫高余额混淆兜底判定
+            post_topup_balance = read_credits_balance(driver)
+
+            invoice_results = handle_unpaid_invoices(
+                driver, get_card=_get_card, on_paid=_on_invoice_paid,
+                on_failed=_on_invoice_failed, account_id=account_id,
+                should_stop=should_stop)
+            if invoice_results:
+                print(f"Unpaid invoice 处理结果: {invoice_results}")
+                time.sleep(10)
             _record_final_balance()
         else:
-            print(f"账号 {email} 充值确认失败")
+            print("未选择支付卡分组，跳过 Unpaid invoice 处理")
+            # 无账单支付，最终余额即 Top-up 后余额，可直接用于兜底
+            post_topup_balance = _record_final_balance()
 
-        return pay_success, "" if pay_success else "填写金额或确认支付失败", responses or [], card_last4, ("topup" if pay_success else "failed")
+        # === 判定 Top-up 真实结果：Stripe confirm 为权威，confirm 未捕获时用余额兜底 ===
+        topup_ok, reason, card_fault = _classify_topup(responses, baseline_balance, post_topup_balance)
+        if topup_ok:
+            return True, "", responses or [], card_last4, "topup"
+
+        # Top-up 未成功：若归因于卡本身（拒付/过期/需3DS），标记该账号对应绑定卡失效
+        if card_fault and card_binding_model and card_last4:
+            try:
+                for c in card_binding_model.get_by_email(email):
+                    num = c.get('card_number', '')
+                    if num and num.endswith(card_last4):
+                        n = card_binding_model.mark_declined_by_number(num, reason or 'Top-up 拒付')
+                        if n:
+                            print(f"  已标记绑定卡 ****{card_last4} 为失效（{reason}）")
+                        break
+            except Exception as e:
+                print(f"  标记拒付卡失败: {str(e)[:80]}")
+
+        print(f"账号 {email} Top-up 未成功: {reason}")
+        return False, reason, responses or [], card_last4, "failed"
 
     except Exception as e:
         print(f"充值过程异常: {e}")

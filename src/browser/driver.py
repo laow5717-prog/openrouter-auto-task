@@ -1794,6 +1794,36 @@ def _extract_payment_error(driver):
     return None, False
 
 
+def extract_decline_from_responses(responses):
+    """从**已捕获的响应列表**（元素形如 {url,status,data}）中提取支付拒付原因。
+
+    与 `_extract_payment_error` 的响应扫描部分同源，但作用于调用方冻结保存的 responses，
+    不依赖 live `driver.net_responses`——后者会被后续账单支付的 inject_network_interceptor
+    清空，导致 Top-up 后再去读拿到过期数据。
+
+    返回 (reason, card_fault)：reason 为中文说明（无则 None）；card_fault 表示是否归因于卡本身
+    （拒付/卡号/CVC/过期等，瞬时错误除外）——仅 card_fault 才应把卡标记为无效。
+    """
+    import json as _json
+    for r in (responses or []):
+        data = r.get('data')
+        txt = _json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data or '')
+        m = re.search(r'"decline_code"\s*:\s*"([^"]+)"', txt)
+        if m:
+            code = m.group(1)
+            return (_DECLINE_REASONS.get(code, f'拒付（{code}）'),
+                    code not in _TRANSIENT_DECLINE_CODES)
+        m = re.search(r'"code"\s*:\s*"([a-z_]+)"', txt)
+        if m and m.group(1) in _DECLINE_REASONS:
+            code = m.group(1)
+            return _DECLINE_REASONS[code], code not in _TRANSIENT_DECLINE_CODES
+        m = re.search(r'"message"\s*:\s*"([^"]+)"', txt)
+        if m and any(k in m.group(1).lower() for k in
+                     ['declin', 'insufficient', 'incorrect', 'invalid', 'expired', 'not support', 'fund']):
+            return m.group(1)[:120], True
+    return None, False
+
+
 def _has_3ds_challenge(driver):
     """检测是否出现 Stripe 3DS 银行验证挑战弹窗（无法自动完成）。"""
     try:
@@ -2221,6 +2251,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
     #    复用同一张卡重开支付页重试，最多 SCRIPT_RETRY_LIMIT 次，仍失败才放弃该发票、转下一张。
     SCRIPT_RETRY_LIMIT = 2
     MAX_ROUNDS = 500              # 死循环兜底（每轮至少消耗一张卡或一次脚本重试，正常远达不到）
+    INVOICE_DETECT_RETRIES = 3   # 首次未见账单时的重载重试上限（刚 Top-up 完账单可能尚未渲染/落库）
 
     done_ids = set()              # 已完结的发票：支付成功、或重试耗尽后永久放弃
     card_tries = {}               # invoice_id -> 该发票已消耗的卡数（日志用）
@@ -2258,14 +2289,31 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
 
         # 等待表格加载 + 清理可能弹出的欠费提示弹窗（会遮挡发票表格导致点击失败）
         time.sleep(3)
-        dismiss_overdue_dialog(driver)
+        had_overdue = dismiss_overdue_dialog(driver)
 
         # 查找 Unpaid 行
-        rows = driver.page.locator(
-            "xpath=//table//tr[.//span[text()='Unpaid']]"
-        ).all()
+        def _find_unpaid_rows():
+            return driver.page.locator(
+                "xpath=//table//tr[.//span[text()='Unpaid']]"
+            ).all()
+
+        rows = _find_unpaid_rows()
+        # 首次检测（尚未处理过任何发票）查到 0 行时：可能是刚 Top-up 完账单还没渲染/落库，
+        # 或页面异步表格未加载完——有限次整页重载重试再定论，不再"查一次就判无账单"。
+        # 欠费弹窗存在（had_overdue）却 0 行，几乎可确定账单尚未渲染，同样进入重试。
+        if not rows and not results and not done_ids:
+            for attempt in range(INVOICE_DETECT_RETRIES):
+                print(f"  首次未见 Unpaid 行"
+                      f"{'（检测到欠费弹窗，账单应存在）' if had_overdue else ''}"
+                      f"，重载重试 {attempt + 1}/{INVOICE_DETECT_RETRIES}")
+                _return_to_credits()
+                had_overdue = dismiss_overdue_dialog(driver)
+                time.sleep(2)
+                rows = _find_unpaid_rows()
+                if rows:
+                    break
         if not rows:
-            if round_num == 1:
+            if not results and not done_ids:
                 print("未发现 Unpaid invoice")
             break
 
