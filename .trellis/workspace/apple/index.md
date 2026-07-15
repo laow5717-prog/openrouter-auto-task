@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 18
+- **Total Sessions**: 19
 - **Last Active**: 2026-07-15
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~613 | Active |
+| `journal-1.md` | ~647 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 19 | 2026-07-15 | 充值 Top-up 拒付修复 + 账单支付选卡规则 + 每日启动/填卡修复 | `084536f`, `5c77031` | `main` |
 | 18 | 2026-07-15 | 每日流水线白屏排查：修正已绑卡数误读 bug | `29dd179` | `main` |
 | 17 | 2026-07-15 | 每日自动化一键流水线：编排+接口+前端面板 | `7579622` | `main` |
 | 16 | 2026-07-15 | 账单支付换卡重试 + 中途停止 + 关弹窗提速 | `70cc717`, `d532b0c`, `7a4d209` | `main` |

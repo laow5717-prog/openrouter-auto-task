@@ -611,3 +611,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 19: 充值 Top-up 拒付修复 + 账单支付选卡规则 + 每日启动/填卡修复
+
+**Date**: 2026-07-15
+**Task**: 充值 Top-up 拒付修复 + 账单支付选卡规则 + 每日启动/填卡修复
+**Branch**: `main`
+
+### Summary
+
+实跑发现并修复 Top-up 拒付被误记为充值成功（以 Stripe confirm 为权威+余额兜底），拒付绑定卡标失效并订正脏数据。新增账单支付选卡四规则：R1 一卡绑一账号(valid_cards.source_email)、R2 单卡24h≤2次冷却(recharge_logs实时统计)、R3 曾成功后3DS标临时冷却24h(新表card_payment_state,DB迁移v6)、R4 有效卡查看/导出(/api/valid-cards/export+前端导出按钮与状态列)。附带修复：账单填卡邮编30s死等改为存在才填、每日启动门放宽(有绑卡账号即可启动跳过补绑)、jsonify中文直出。已合并main并推送。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `084536f` | (see git log) |
+| `5c77031` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
