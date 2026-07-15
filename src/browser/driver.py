@@ -1533,6 +1533,82 @@ def read_credits_balance(driver, timeout_ms=30_000):
         return None
 
 
+def fetch_today_invoice_count(driver, account_id):
+    """读取指定 CF 账号「当日创建」的账单(invoice)数，以 invoice-history 接口为权威。
+
+    在已登录的 dash.cloudflare.com 页面上下文用 fetch 调 billing/invoice-history 接口
+    （同源带 cookie），统计 result.invoices[] 中 created(unix 秒) 落在**本地当日**
+    [今天0点, 明天0点) 的条数，paid + open 全部计入。接口分页，invoices 按 created 倒序，
+    翻到某页出现早于今日0点的记录即可停止翻页。
+
+    与项目其它「当日」口径（datetime('now','localtime')）一致，以运行机器本地时区为准。
+
+    参数:
+        driver: 浏览器驱动
+        account_id: Cloudflare 账号 ID
+    返回:
+        int:  当日账单数
+        None: 读取/解析失败（调用方应保守处理，勿据此放行超额生成）
+    """
+    # 本地当日边界（机器本地时区，DST 交由 mktime 的 isdst=-1 自决）
+    lt = time.localtime()
+    start_of_today = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    end_of_today = start_of_today + 86400
+
+    # fetch 需同源：确保当前处于 dash.cloudflare.com，否则会被跨源拦截
+    try:
+        cur = driver.current_url or ''
+    except Exception:
+        cur = ''
+    if 'dash.cloudflare.com' not in cur:
+        try:
+            driver.get(f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits")
+            time.sleep(4)
+        except Exception as e:
+            print(f"  读取当日账单数前导航失败: {str(e)[:80]}")
+
+    try:
+        result = driver.page.evaluate(
+            """async ({accountId, startTs, endTs}) => {
+                let total = 0;
+                for (let page = 1; page <= 20; page++) {
+                    const url = `https://dash.cloudflare.com/api/v4/accounts/${accountId}`
+                        + `/ai-gateway/billing/invoice-history?page=${page}&per_page=50`;
+                    const resp = await fetch(url, {
+                        credentials: 'include',
+                        headers: {'accept': 'application/json'},
+                    });
+                    if (!resp.ok) return {ok: false, status: resp.status};
+                    const body = await resp.json();
+                    if (!body || body.success !== true || !body.result) {
+                        return {ok: false, status: 'bad_body'};
+                    }
+                    const invoices = body.result.invoices || [];
+                    let reachedOld = false;
+                    for (const inv of invoices) {
+                        const c = inv.created;
+                        if (typeof c !== 'number') continue;
+                        if (c < startTs) { reachedOld = true; continue; }
+                        if (c >= startTs && c < endTs) total += 1;
+                    }
+                    const pg = body.result.pagination || {};
+                    if (reachedOld || !pg.has_more) break;
+                }
+                return {ok: true, count: total};
+            }""",
+            {"accountId": account_id, "startTs": start_of_today, "endTs": end_of_today},
+        )
+        if not isinstance(result, dict) or not result.get('ok'):
+            print(f"  读取当日账单数失败: {result}")
+            return None
+        n = int(result.get('count', 0))
+        print(f"  当日账单数（CF invoice-history）: {n}")
+        return n
+    except Exception as e:
+        print(f"  读取当日账单数异常: {str(e)[:100]}")
+        return None
+
+
 def navigate_to_ai_credits(driver, account_id):
     """
     导航到 AI Gateway Credits 页面并点击 Top-up credits 按钮
@@ -2195,7 +2271,7 @@ def _invoice_still_unpaid(driver, invoice_id):
 
 
 def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, account_id=None,
-                           should_stop=None):
+                           should_stop=None, max_invoices=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
     打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
@@ -2225,6 +2301,10 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
         account_id: Cloudflare 账号 ID，用于拼出 credits 页面 URL（返回时整页刷新）。
         should_stop: 无参 callable，返回 True 表示用户请求停止；每轮发票开头检查，
                      命中即中断循环（换卡重试可能持续很久，这是唯一的中途叫停入口）。
+        max_invoices: 一次调用最多**成功付掉**的 invoice 数上限。默认 None＝不限（付清全部，
+                      现状行为）。用于轮询式（round-robin）场景传 1：付掉 1 张即返回，
+                      随后由编排层切换下一个账号。只有成功付掉（on_paid 触发）才计数，
+                      重试耗尽放弃的坏账单不占额度；单张 invoice 内部换卡/脚本重试语义不变。
     返回:
         list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, balance?, error?}, ...]
               status: paid / opened / failed / skipped
@@ -2271,6 +2351,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
     script_tries = {}             # invoice_id -> 该发票的脚本侧重试次数
     sticky_cards = {}             # invoice_id -> 脚本侧失败后待复用的同一张卡
     round_num = 0
+    paid_count = 0                # 本次调用已成功付掉的 invoice 数（用于 max_invoices 限额）
 
     def _give_up(iid, reason, **extra):
         """放弃该发票：标记完结并记一条 failed，后续轮次不再选中它。"""
@@ -2520,6 +2601,10 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                         on_paid(inv, pending["card"], pending["responses"], pending["amount"], balance)
                     except Exception as _e:
                         print(f"  on_paid 回调异常: {_e}")
+                paid_count += 1
+                if max_invoices is not None and paid_count >= max_invoices:
+                    print(f"  已付掉 {paid_count} 张账单，达到本次上限 max_invoices={max_invoices}，返回")
+                    break
             else:
                 fail_reason = pending.get("error") or "支付未生效（账单仍为 Unpaid）"
                 # card_fault：失败是否归因于卡本身（拒付/过期/3DS）。脚本侧失败

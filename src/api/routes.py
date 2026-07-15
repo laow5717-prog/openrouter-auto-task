@@ -90,21 +90,6 @@ def download_card_template():
     return send_from_directory(directory, filename, as_attachment=True)
 
 
-@api.route('/api/card/report')
-def download_card_report():
-    state = get_app_state()
-    models = get_models()
-
-    if not state.current_card_task_id:
-        return jsonify({"error": "No report available"}), 404
-
-    records = models['card_binding'].get_all_by_task(state.current_card_task_id)
-    report_path = card_service.export_report(records)
-    directory = os.path.dirname(report_path)
-    filename = os.path.basename(report_path)
-    return send_from_directory(directory, filename, as_attachment=True)
-
-
 @api.route('/api/card/history')
 def get_card_history():
     models = get_models()

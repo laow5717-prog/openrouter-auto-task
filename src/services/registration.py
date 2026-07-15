@@ -5,7 +5,7 @@ Cloudflare 注册 & 绑卡核心业务逻辑
 import time
 import random
 
-from src.config import cfg
+from src.config import cfg, TOPUP_AMOUNT, INVOICE_DAILY_CAP
 from src.utils import generate_random_password, filter_expired_cards
 from src.services.email import create_temp_email, wait_for_verification_email
 from src.browser.driver import (
@@ -26,6 +26,7 @@ from src.browser.driver import (
     handle_unpaid_invoices,
     read_credits_balance,
     extract_decline_from_responses,
+    fetch_today_invoice_count,
 )
 import src.services.captcha as captcha_solver
 
@@ -387,7 +388,8 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
 def recharge_account(email, cf_password, recharge_log_model=None, monitor_callback=None,
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
-                     should_stop=None, card_binding_model=None, card_state_model=None):
+                     should_stop=None, card_binding_model=None, card_state_model=None,
+                     invoice_daily_cap=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -402,10 +404,19 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         card_pool_model: CardPoolModel，支付成功后把底料卡状态标为 'paid'
         account_model: AccountModel，每笔发票支付成功后记录该账号最新的 Credits 余额
         card_binding_model: CardBindingModel，Top-up 因卡本身被拒时把对应绑定卡标记失效
+        invoice_daily_cap: None＝现状全量模式（返回 5 元组）。传整数（如 30）＝单步(round-robin)
+                           模式：先读该账号当日账单数，未达上限则做 1 次 Top-up 生成账单 +
+                           至多付 1 张，随后返回，供编排层切换下一个账号。返回 6 元组。
     返回:
-        (bool, str, list, str, str): (是否成功, 错误信息, API 响应列表, 卡片后四位, 结局)
-        结局(outcome): "topup"=实际执行了充值; "invoice_only"=未充值仅处理/检查账单;
-                       "failed"=失败或异常。调用方据此记账：invoice_only 不得记为充值成功。
+        全量模式 (invoice_daily_cap is None)：
+            (bool, str, list, str, str): (是否成功, 错误信息, API 响应列表, 卡片后四位, 结局)
+            结局(outcome): "topup"=实际执行了充值; "invoice_only"=未充值仅处理/检查账单;
+                           "failed"=失败或异常。调用方据此记账：invoice_only 不得记为充值成功。
+        单步模式 (invoice_daily_cap 为整数)：
+            (bool, str, list, str, str, dict): 末位 info 含
+            {today_count, generated(bool), paid(int), topup_ok(bool)}；
+            outcome 取值："cap_reached"=当日已达上限未操作; "stepped"=做了 1 生成+至多 1 付;
+                          "failed"=失败或异常。
     """
     driver = None
 
@@ -420,6 +431,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         print(f"正在登录账号: {email}")
         account_id = login_cloudflare(driver, email, cf_password)
         if not account_id:
+            if invoice_daily_cap is not None:
+                return False, "登录失败，无法获取 account_id", [], '', "failed", {'today_count': None}
             return False, "登录失败，无法获取 account_id", [], '', "failed"
         _report("logged_in")
 
@@ -597,6 +610,106 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 return False, '充值后余额未增长（未捕获支付结果）', False
             return False, '未捕获支付结果且余额未知', False
 
+        credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+
+        # ============================================================
+        # 单步（round-robin）模式：读当日账单数 → 至多 1 次 Top-up 生成账单 → 至多付 1 张。
+        # 达当日上限则直接返回 cap_reached，供编排层标记该账号本次流水线内完成。
+        # 复用上面定义的选卡闸门 / _get_card / _on_invoice_* / _classify_topup 闭包。
+        # ============================================================
+        if invoice_daily_cap is not None:
+            today_count = fetch_today_invoice_count(driver, account_id)
+            if today_count is not None and today_count >= invoice_daily_cap:
+                print(f"账号 {email} 当日账单数 {today_count} 已达上限 {invoice_daily_cap}，跳过 Top-up")
+                return (True, "当日账单已达上限", [], '', "cap_reached",
+                        {'today_count': today_count, 'generated': False, 'paid': 0, 'topup_ok': False})
+
+            before_count = today_count if today_count is not None else 0
+
+            # 基线余额（供 confirm 未捕获时的余额兜底判定）
+            baseline_balance = None
+            try:
+                driver.get(credits_url)
+                time.sleep(4)
+                dismiss_overdue_dialog(driver)
+                baseline_balance = read_credits_balance(driver)
+            except Exception as e:
+                print(f"  读取基线余额失败: {str(e)[:80]}")
+
+            # 打开 Top-up 弹窗并提取卡四位
+            if not navigate_to_ai_credits(driver, account_id):
+                return (False, "导航到充值页面或点击 Top-up 按钮失败", [], '', "failed",
+                        {'today_count': before_count, 'generated': False, 'paid': 0, 'topup_ok': False})
+            step_card_last4 = extract_topup_card_last4(driver)
+            if not step_card_last4:
+                close_topup_dialog(driver)
+                return (False, "未获取到有效信用卡信息", [], '', "failed",
+                        {'today_count': before_count, 'generated': False, 'paid': 0, 'topup_ok': False})
+
+            # 1 次 Top-up 生成一张账单
+            print(f"账号 {email} 当日账单数 {before_count} < {invoice_daily_cap}，发起 1 次 Top-up 生成账单...")
+            pay_success, responses, step_card_last4 = fill_topup_and_confirm(driver, amount=TOPUP_AMOUNT)
+            _report("topup_confirmed")
+            if not pay_success:
+                return (False, "填写金额或确认支付失败", responses or [], step_card_last4, "failed",
+                        {'today_count': before_count, 'generated': False, 'paid': 0, 'topup_ok': False})
+
+            # 返回 credits 页，至多付掉 1 张 open invoice（复用记账回调 + 逐张换卡重试）
+            post_topup_balance = None
+            paid_n = 0
+            cards_exhausted = False
+            if not skip_invoice:
+                time.sleep(5)
+                driver.get(credits_url)
+                time.sleep(5)
+                check_and_handle_cf_challenge(driver)
+                dismiss_overdue_dialog(driver)
+                time.sleep(3)
+                post_topup_balance = read_credits_balance(driver)
+                invoice_results = handle_unpaid_invoices(
+                    driver, get_card=_get_card, on_paid=_on_invoice_paid,
+                    on_failed=_on_invoice_failed, account_id=account_id,
+                    should_stop=should_stop, max_invoices=1)
+                paid_n = sum(1 for r in (invoice_results or []) if r.get('status') == 'paid')
+                # 卡池耗尽：handle_unpaid_invoices 在无卡可用时回 status='skipped'。
+                # 据此让编排层停止对该账号继续生成无法支付的账单。
+                cards_exhausted = any(r.get('status') == 'skipped' for r in (invoice_results or []))
+                if invoice_results:
+                    print(f"单步账单处理结果: {invoice_results}")
+            else:
+                post_topup_balance = _record_final_balance()
+
+            # 结束再读一次当日账单数（权威），据此让编排层判断是否达上限 / 是否有进展
+            after_count = fetch_today_invoice_count(driver, account_id)
+            if after_count is None:
+                after_count = before_count + (1 if pay_success else 0)
+
+            topup_ok, reason, card_fault = _classify_topup(responses, baseline_balance, post_topup_balance)
+
+            # Top-up 因卡本身被拒 → 标记该账号对应绑定卡失效（同全量模式）
+            if not topup_ok and card_fault and card_binding_model and step_card_last4:
+                try:
+                    for c in card_binding_model.get_by_email(email):
+                        num = c.get('card_number', '')
+                        if num and num.endswith(step_card_last4):
+                            n = card_binding_model.mark_declined_by_number(num, reason or 'Top-up 拒付')
+                            if n:
+                                print(f"  已标记绑定卡 ****{step_card_last4} 为失效（{reason}）")
+                            break
+                except Exception as e:
+                    print(f"  标记拒付卡失败: {str(e)[:80]}")
+
+            info = {
+                'today_count': after_count,
+                'generated': after_count > before_count,
+                'paid': paid_n,
+                'topup_ok': topup_ok,
+                'cards_exhausted': cards_exhausted,
+            }
+            print(f"账号 {email} 单步完成：当日账单 {before_count}→{after_count}，付成 {paid_n} 张，"
+                  f"Top-up {'成功' if topup_ok else '未成功'}")
+            return True, reason, responses or [], step_card_last4, "stepped", info
+
         # 读基线余额（供 Top-up 后 confirm 未捕获时的余额兜底；读不到则兜底退化为保守判失败）
         baseline_balance = None
         try:
@@ -714,6 +827,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
 
     except Exception as e:
         print(f"充值过程异常: {e}")
+        if invoice_daily_cap is not None:
+            return False, str(e), [], '', "failed", {'today_count': None}
         return False, str(e), [], '', "failed"
 
     finally:
