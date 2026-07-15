@@ -750,9 +750,13 @@ def get_card_pool(group_id):
     cards, total = models['card_pool'].get_by_group(
         group_id, page=page, page_size=page_size, bucket=bucket)
 
-    # 标记有效卡
+    # 标记有效卡 + 选卡规则状态（供列表状态列展示 3DS临时/24h次数冷却）
     for card in cards:
-        card['is_valid'] = models['valid_card'].is_valid(card['card_number'])
+        num = card['card_number']
+        card['is_valid'] = models['valid_card'].is_valid(num)
+        card['tds_cooldown'] = models['card_state'].in_tds_cooldown(num)
+        card['rate_cooldown'] = models['recharge_log'].success_count_since(num, 24) >= 2
+        card['bound_email'] = models['valid_card'].get_bound_email(num)
 
     buckets = models['card_pool'].count_buckets(group_id)
     return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size,

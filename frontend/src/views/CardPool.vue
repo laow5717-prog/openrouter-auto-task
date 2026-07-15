@@ -122,6 +122,9 @@
               <span v-else-if="card.status === 'invalid'" class="status-tag fail">无效</span>
               <span v-else-if="card.is_valid" class="status-tag success">有效</span>
               <span v-else class="status-tag">待验证</span>
+              <!-- 选卡规则状态：告知用户为何该卡暂不被选用 -->
+              <span v-if="card.tds_cooldown" class="status-tag" style="background:#fef3c7;color:#92400e;margin-left:4px">3DS临时冷却</span>
+              <span v-if="card.rate_cooldown" class="status-tag" style="background:#fef3c7;color:#92400e;margin-left:4px">24h达2次冷却</span>
             </td>
             <td>
               <button class="mini-btn danger" @click="deleteCard(card.id)">删除</button>
