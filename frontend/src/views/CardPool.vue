@@ -33,6 +33,7 @@
       <div class="panel-title"><span>&#128451;</span> 卡片分组</div>
       <div style="display:flex;gap:8px">
         <button class="action-btn" @click="showCreateGroup">新建分组</button>
+        <button class="action-btn" @click="showMerge">归纳合并</button>
         <button class="action-btn" @click="showValidCards">查看有效卡</button>
         <button class="action-btn" @click="loadGroups">刷新</button>
       </div>
@@ -70,8 +71,17 @@
         <input type="file" ref="fileInput" accept=".xlsx,.xls" style="font-size:12px;max-width:200px">
         <button class="action-btn" @click="handleUpload">上传卡片</button>
         <a href="/api/card/template" class="action-btn" style="text-decoration:none">下载模版</a>
+        <button class="action-btn danger" @click="handleDeleteInvalid">删除无效卡</button>
         <button class="action-btn danger" @click="handleClearPool">清空</button>
       </div>
+    </div>
+
+    <!-- 状态筛选 + 桶数量 -->
+    <div style="display:flex;gap:8px;align-items:center;padding:10px 16px;flex-wrap:wrap">
+      <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === '' }" @click="setBucket('')">全部 {{ poolBuckets.total }}</button>
+      <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === 'valid' }" @click="setBucket('valid')">有效 {{ poolBuckets.valid }}</button>
+      <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === 'unverified' }" @click="setBucket('unverified')">未验证 {{ poolBuckets.unverified }}</button>
+      <button class="filter-btn" :class="{ 'filter-btn-primary': poolBucket === 'invalid' }" @click="setBucket('invalid')">无效 {{ poolBuckets.invalid }}</button>
     </div>
 
     <div v-if="uploadMsg" style="padding:8px 16px;font-size:12px" v-html="uploadMsg"></div>
@@ -146,6 +156,37 @@
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
       <button class="btn" style="width:auto;padding:8px 20px" @click="groupModal.visible = false">取消</button>
       <button class="btn btn-primary" style="width:auto;padding:8px 20px" @click="saveGroup">保存</button>
+    </div>
+  </Modal>
+
+  <!-- 归纳合并弹窗 -->
+  <Modal :visible="mergeModal.visible" title="归纳合并（移动非无效卡到新分组）" @close="mergeModal.visible = false">
+    <div class="form-group">
+      <label class="form-label">选择源分组（把这些分组里的有效+未验证卡移动到新分组，无效卡留在原组）</label>
+      <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px">
+        <div v-if="groups.length === 0" style="color:var(--text-sub);font-size:12px">暂无分组</div>
+        <label v-for="g in groups" :key="g.id" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer">
+          <input type="checkbox" :value="g.id" v-model="mergeModal.sourceIds">
+          <span>{{ g.name }}</span>
+          <span class="group-type-tag small" :class="g.type">{{ g.type === 'bind' ? '绑定卡' : '支付卡' }}</span>
+          <span style="color:var(--text-sub);font-size:12px">{{ g.card_count }} 张</span>
+        </label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">新分组名称</label>
+      <input v-model="mergeModal.name" class="ctrl-input" placeholder="如：7-15汇总可用卡">
+    </div>
+    <div class="form-group">
+      <label class="form-label">新分组类型</label>
+      <select v-model="mergeModal.type" class="ctrl-input">
+        <option value="bind">绑定卡</option>
+        <option value="payment">支付卡</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn" style="width:auto;padding:8px 20px" @click="mergeModal.visible = false">取消</button>
+      <button class="btn btn-primary" style="width:auto;padding:8px 20px" @click="doMerge">开始合并</button>
     </div>
   </Modal>
 
@@ -226,7 +267,7 @@ import { ref, reactive, onMounted } from 'vue'
 import {
   getCardGroups, createCardGroup, updateCardGroup, deleteCardGroup,
   getCardPool, uploadCardPool, deletePoolCard, clearCardPool,
-  getValidCards,
+  getValidCards, mergeCardPools, deleteInvalidCards,
 } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
@@ -243,6 +284,11 @@ const poolPageSize = ref(20)
 const poolLoading = ref(false)
 const uploadMsg = ref('')
 const fileInput = ref(null)
+const poolBucket = ref('')  // ''=全部 / valid / unverified / invalid
+const poolBuckets = reactive({ total: 0, invalid: 0, valid: 0, unverified: 0 })
+
+// 归纳合并弹窗
+const mergeModal = reactive({ visible: false, sourceIds: [], name: '', type: 'bind' })
 
 // Group modal
 const groupModal = reactive({ visible: false, editing: false, id: null, name: '', type: 'bind', description: '' })
@@ -270,6 +316,13 @@ async function loadGroups() {
 function selectGroup(g) {
   selectedGroup.value = g
   poolPage.value = 1
+  poolBucket.value = ''
+  loadPoolCards()
+}
+
+function setBucket(b) {
+  poolBucket.value = b
+  poolPage.value = 1
   loadPoolCards()
 }
 
@@ -277,10 +330,47 @@ async function loadPoolCards() {
   if (!selectedGroup.value) return
   poolLoading.value = true
   try {
-    const data = await getCardPool(selectedGroup.value.id, { page: poolPage.value, page_size: poolPageSize.value })
+    const params = { page: poolPage.value, page_size: poolPageSize.value }
+    if (poolBucket.value) params.bucket = poolBucket.value
+    const data = await getCardPool(selectedGroup.value.id, params)
     poolCards.value = data.data || []
     poolTotal.value = data.total || 0
+    if (data.buckets) Object.assign(poolBuckets, data.buckets)
   } catch (e) { console.error(e) } finally { poolLoading.value = false }
+}
+
+async function handleDeleteInvalid() {
+  if (!selectedGroup.value) return
+  if (!confirm(`确定删除分组「${selectedGroup.value.name}」内的所有无效卡（含拒付与过期）吗？此操作不可恢复。`)) return
+  try {
+    const r = await deleteInvalidCards(selectedGroup.value.id)
+    alert(`已删除 ${r.deleted} 张无效卡`)
+    poolPage.value = 1
+    await loadPoolCards()
+    await loadGroups()
+  } catch (e) { alert('删除失败: ' + e.message) }
+}
+
+function showMerge() {
+  mergeModal.sourceIds = []
+  mergeModal.name = ''
+  mergeModal.type = 'bind'
+  mergeModal.visible = true
+}
+
+async function doMerge() {
+  if (!mergeModal.sourceIds.length) { alert('请至少选择一个源分组'); return }
+  if (!mergeModal.name.trim()) { alert('请输入新分组名称'); return }
+  try {
+    const r = await mergeCardPools({
+      source_group_ids: mergeModal.sourceIds,
+      name: mergeModal.name.trim(),
+      type: mergeModal.type,
+    })
+    alert(`已合并：移入 ${r.moved} 张，去重 ${r.deduped} 张 → 新分组已创建`)
+    mergeModal.visible = false
+    await loadGroups()
+  } catch (e) { alert('合并失败: ' + e.message) }
 }
 
 function showCreateGroup() {

@@ -66,17 +66,108 @@ class CardPoolModel:
                 skipped += 1
         return added, skipped, conflicts
 
-    def get_by_group(self, group_id, page=1, page_size=20):
+    def _bucket_where(self, bucket):
+        """按状态桶返回 (where 片段, 参数列表)（不含 group 条件）。
+        无效=status∈unusable；有效=非无效且在 valid_cards；未验证=非无效且不在 valid_cards。"""
+        ph = ','.join('?' * len(CARD_STATUS_UNUSABLE))
+        if bucket == 'invalid':
+            return f"COALESCE(status,'') IN ({ph})", list(CARD_STATUS_UNUSABLE)
+        if bucket == 'valid':
+            return (f"COALESCE(status,'') NOT IN ({ph}) "
+                    "AND card_number IN (SELECT card_number FROM valid_cards)",
+                    list(CARD_STATUS_UNUSABLE))
+        if bucket == 'unverified':
+            return (f"COALESCE(status,'') NOT IN ({ph}) "
+                    "AND card_number NOT IN (SELECT card_number FROM valid_cards)",
+                    list(CARD_STATUS_UNUSABLE))
+        return "", []
+
+    def get_by_group(self, group_id, page=1, page_size=20, bucket=''):
         offset = (page - 1) * page_size
+        frag, fparams = self._bucket_where(bucket)
+        where = "WHERE group_id=?" + (f" AND {frag}" if frag else "")
+        params = [group_id] + fparams
         total_row = self.db.fetchone(
-            "SELECT COUNT(*) as cnt FROM card_pool WHERE group_id=?", (group_id,)
+            f"SELECT COUNT(*) as cnt FROM card_pool {where}", params
         )
         total = total_row['cnt'] if total_row else 0
         rows = self.db.fetchall(
-            "SELECT * FROM card_pool WHERE group_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (group_id, page_size, offset),
+            f"SELECT * FROM card_pool {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [page_size, offset],
         )
         return [dict(r) for r in rows], total
+
+    def count_buckets(self, group_id):
+        """返回分组内各桶数量 {total, invalid, valid, unverified}。统计前刷新过期状态。"""
+        self.refresh_expired_status(group_id)
+        ph = ','.join('?' * len(CARD_STATUS_UNUSABLE))
+        u = list(CARD_STATUS_UNUSABLE)
+        row = self.db.fetchone(
+            f"""SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN COALESCE(status,'') IN ({ph}) THEN 1 ELSE 0 END) AS invalid,
+                SUM(CASE WHEN COALESCE(status,'') NOT IN ({ph})
+                         AND card_number IN (SELECT card_number FROM valid_cards)
+                    THEN 1 ELSE 0 END) AS valid,
+                SUM(CASE WHEN COALESCE(status,'') NOT IN ({ph})
+                         AND card_number NOT IN (SELECT card_number FROM valid_cards)
+                    THEN 1 ELSE 0 END) AS unverified
+              FROM card_pool WHERE group_id=?""",
+            (*u, *u, *u, group_id),
+        )
+        if not row:
+            return {'total': 0, 'invalid': 0, 'valid': 0, 'unverified': 0}
+        return {
+            'total': row['total'] or 0,
+            'invalid': row['invalid'] or 0,
+            'valid': row['valid'] or 0,
+            'unverified': row['unverified'] or 0,
+        }
+
+    def delete_invalid_by_group(self, group_id):
+        """删除分组内所有无效卡（status∈unusable=expired/invalid）。删前刷新过期状态。返回删除数。"""
+        self.refresh_expired_status(group_id)
+        ph = ','.join('?' * len(CARD_STATUS_UNUSABLE))
+        cursor = self.db.execute(
+            f"DELETE FROM card_pool WHERE group_id=? AND COALESCE(status,'') IN ({ph})",
+            (group_id, *CARD_STATUS_UNUSABLE),
+        )
+        return cursor.rowcount
+
+    def move_non_invalid_to_group(self, source_group_ids, target_group_id):
+        """把源分组里所有"非无效"卡（有效+未验证）**移动**到目标分组，按卡号去重。
+        返回 {moved, deduped}：moved=移入的去重卡数，deduped=删除的重复行数。
+        卡原状态随卡带走（改 group_id）。同号只保留一行入目标组，其余同号非无效行删除，
+        避免 UNIQUE(card_number, group_id) 冲突。"""
+        if not source_group_ids:
+            return {'moved': 0, 'deduped': 0}
+        for gid in source_group_ids:
+            self.refresh_expired_status(gid)
+        ph_status = ','.join('?' * len(CARD_STATUS_UNUSABLE))
+        ph_groups = ','.join('?' * len(source_group_ids))
+        rows = self.db.fetchall(
+            f"""SELECT id, card_number FROM card_pool
+                WHERE group_id IN ({ph_groups})
+                  AND COALESCE(status,'') NOT IN ({ph_status})
+                ORDER BY id""",
+            (*source_group_ids, *CARD_STATUS_UNUSABLE),
+        )
+        existing = {r['card_number'] for r in self.db.fetchall(
+            "SELECT card_number FROM card_pool WHERE group_id=?", (target_group_id,))}
+        seen = set(existing)
+        moved = 0
+        deduped = 0
+        for r in rows:
+            num = r['card_number']
+            if num in seen:
+                self.db.execute("DELETE FROM card_pool WHERE id=?", (r['id'],))
+                deduped += 1
+            else:
+                self.db.execute(
+                    "UPDATE card_pool SET group_id=? WHERE id=?", (target_group_id, r['id']))
+                seen.add(num)
+                moved += 1
+        return {'moved': moved, 'deduped': deduped}
 
     def get_all_by_group(self, group_id):
         """获取分组内所有卡片（用于任务执行）"""

@@ -743,16 +743,55 @@ def get_card_pool(group_id):
     models = get_models()
     page = int(request.args.get('page', 1))
     page_size = int(request.args.get('page_size', 20))
+    bucket = request.args.get('bucket', '')  # ''=全部 / valid / unverified / invalid
 
     # 先按当前日期刷新过期状态，列表里直接能看到哪些卡已过期
     models['card_pool'].refresh_expired_status(group_id)
-    cards, total = models['card_pool'].get_by_group(group_id, page=page, page_size=page_size)
+    cards, total = models['card_pool'].get_by_group(
+        group_id, page=page, page_size=page_size, bucket=bucket)
 
     # 标记有效卡
     for card in cards:
         card['is_valid'] = models['valid_card'].is_valid(card['card_number'])
 
-    return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size})
+    buckets = models['card_pool'].count_buckets(group_id)
+    return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size,
+                    "bucket": bucket, "buckets": buckets})
+
+
+@api.route('/api/card-pool/merge', methods=['POST'])
+def merge_card_pools():
+    """把多个源分组里的"非无效"卡（有效+未验证）移动合并到一个新分组。"""
+    models = get_models()
+    data = request.json or {}
+    source_ids = data.get('source_group_ids') or []
+    name = (data.get('name') or '').strip()
+    group_type = data.get('type') or 'bind'
+    if not source_ids:
+        return jsonify({"error": "未选择源分组"}), 400
+    if not name:
+        return jsonify({"error": "未填写新分组名称"}), 400
+    if group_type not in ('bind', 'payment'):
+        return jsonify({"error": "分组类型无效"}), 400
+    # 源分组存在性校验
+    for gid in source_ids:
+        if not models['card_group'].get_by_id(gid):
+            return jsonify({"error": f"源分组 {gid} 不存在"}), 404
+
+    new_id = models['card_group'].create(name, group_type=group_type)
+    result = models['card_pool'].move_non_invalid_to_group(source_ids, new_id)
+    return jsonify({"status": "ok", "group_id": new_id,
+                    "moved": result['moved'], "deduped": result['deduped']})
+
+
+@api.route('/api/card-pool/<int:group_id>/delete-invalid', methods=['POST'])
+def delete_invalid_cards(group_id):
+    """删除某分组内所有无效卡（invalid + expired）。"""
+    models = get_models()
+    if not models['card_group'].get_by_id(group_id):
+        return jsonify({"error": "分组不存在"}), 404
+    deleted = models['card_pool'].delete_invalid_by_group(group_id)
+    return jsonify({"status": "ok", "deleted": deleted})
 
 
 @api.route('/api/card-pool/<int:group_id>/upload', methods=['POST'])
