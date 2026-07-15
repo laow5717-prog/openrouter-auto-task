@@ -578,3 +578,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 18: 每日流水线白屏排查：修正已绑卡数误读 bug
+
+**Date**: 2026-07-15
+**Task**: 每日流水线白屏排查：修正已绑卡数误读 bug
+**Branch**: `main`
+
+### Summary
+
+用户实测每日流水线，反馈登录后浏览器白屏。用已登录持久化 profile 直接驱动 dashboard 截图验证：Cloudflare SPA 完整渲染，白屏只是导航后的短暂加载态，非浏览器问题。但复现流水线真实导航路径(login→navigate_to_billing→get_bound_card_count)时查出真 bug：账号实绑1张卡却被读成3张。根因 get_bound_card_count 旧方法2统计所有含 '••••' 文本的元素，而单卡掩码号 '•••• •••• •••• 4673' 渲染为4段、前3段均为 ••••，1张卡被数成3张，导致 need=max_bindable-current 虚高、真实1张卡的账号被判已满跳过，永远补不上第2张。改用 '掩码段+末四位数字' /[•·*]{2,}\s*\d{4}/ 模式计数(每卡恰好匹配一次)，优先 Billing method 区域内统计、找不到退回整页。真实账号验证：修复前3、修复后1。注册新号从0卡起步不受影响。commit 29dd179，后端已重启加载新代码。E2E(补绑→注册→充值完整通过)仍待用户实跑。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `29dd179` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
