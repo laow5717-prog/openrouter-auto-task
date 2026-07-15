@@ -58,6 +58,8 @@ def build():
         '--add-data', f'config.example.yaml{sep}.',
         # 隐式导入
         '--collect-submodules', 'src',
+        # Patchright: 运行时引擎，需带上其 node driver 资源（约 130MB）
+        '--collect-all', 'patchright',
         '--hidden-import', 'undetected_chromedriver',
         '--hidden-import', 'selenium.webdriver',
         '--hidden-import', 'selenium.webdriver.chrome',
