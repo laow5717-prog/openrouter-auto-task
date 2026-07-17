@@ -844,3 +844,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 26: topup 提交后强制进账单页 + can-no-longer-be-paid 永久跳过
+
+**Date**: 2026-07-17
+**Task**: topup 提交后强制进账单页 + can-no-longer-be-paid 永久跳过
+**Branch**: `main`
+
+### Summary
+
+1) recharge_account 删除全量/单步两处 if not pay_success 早返回，topup 提交后无论成败都进 handle_unpaid_invoices 账单支付流程。2) 诊断某账号 16 张发票全被判无法支付：浏览器实测确认 Stripe 页面真实显示「不能再用 Stripe 支付该账单」（非误判、非过期，是账号重度风控/发票被 Cloudflare 作废）。3) 将 can-no-longer-be-paid 从 24h 冷却改为 permanent=True 永久跳过，避免每日重开支付页白耗 240s。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `19c2a76` | (see git log) |
+| `b4c1001` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
