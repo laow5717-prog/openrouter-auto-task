@@ -107,6 +107,8 @@ class BrowserSession:
         self._cdp_session = None            # 惰性创建的 CDPSession（缓存）
         self._closed = False
         self.account_banned = False         # 登录时检测到账号被 Cloudflare 封禁则置 True
+        self.credit_balance = None          # 被动监听 credit-balance 接口捕获的最新余额（美元）
+        self.credit_balance_ts = None       # 上次捕获余额的时间戳（time.time()）
 
     # ---- 事件监听（在 create_driver 中挂载，均在业务线程回调） ----
     def _on_console(self, msg):
@@ -124,6 +126,10 @@ class BrowserSession:
             url = response.url or ''
         except Exception:
             return
+        # 被动捕获 AI Gateway 余额接口：导航到 credits 页时页面会自行请求该接口，
+        # 无论当前是否在拦截其它模式，都抓一次最新余额缓存到 session（供落库用）。
+        if _CREDIT_BALANCE_URL_MARK in url:
+            self._capture_credit_balance(response)
         if not self._net_patterns or not _match_net_url(url, self._net_patterns):
             return
         # 读响应体（sync 回调内允许；失败不影响主流程）
@@ -139,6 +145,27 @@ class BrowserSession:
         except Exception:
             status = 0
         self.net_responses.append({'url': url, 'status': status, 'data': data, 'ts': time.time()})
+
+    def _capture_credit_balance(self, response):
+        """解析 credit-balance 接口响应并缓存最新余额（美元）到 session。
+        响应结构：{success: true, result: {balance: <分>}}，接口以「分」计
+        （4000 == $40.00），换算成美元存入 self.credit_balance；解析失败静默忽略。"""
+        try:
+            if response.status != 200:
+                return
+            data = response.json()
+        except Exception:
+            return
+        if not isinstance(data, dict) or data.get('success') is not True:
+            return
+        result = data.get('result')
+        if not isinstance(result, dict):
+            return
+        bal = result.get('balance')
+        if not isinstance(bal, (int, float)) or isinstance(bal, bool):
+            return
+        self.credit_balance = bal / 100.0
+        self.credit_balance_ts = time.time()
 
     # ---- 业务线程内部工具（禁止跨线程） ----
     def capture_frame(self):
@@ -194,6 +221,10 @@ class BrowserSession:
                 print(f"  🧹 已清理临时 profile: ...{os.path.basename(self._temp_profile)}")
             except Exception:
                 pass
+
+
+# credit-balance 接口 URL 标记（credits 页加载时页面会自行请求该接口）。
+_CREDIT_BALANCE_URL_MARK = 'ai-gateway/billing/credit-balance'
 
 
 def _match_net_url(url, patterns):
@@ -1503,6 +1534,42 @@ def _extract_account_id(driver):
     return None
 
 
+def reset_credit_balance(driver):
+    """清空被动监听缓存的余额。在导航到 credits 页「之前」调用，
+    确保随后 wait_for_credit_balance 拿到的是本次页面新请求的余额，而非上次残留。"""
+    try:
+        driver.credit_balance = None
+        driver.credit_balance_ts = None
+    except Exception:
+        pass
+
+
+def wait_for_credit_balance(driver, timeout_ms=15_000, poll_ms=500):
+    """等待被动监听捕获 credit-balance 接口的最新余额（美元）。
+
+    credits 页加载后页面会自动请求该接口，其响应由 create_driver 挂载的
+    page.on("response") 监听器捕获并缓存到 driver.credit_balance。sync Playwright
+    的 response 事件只在调用 Playwright API 时派发，故这里用 page.wait_for_timeout
+    （而非 time.sleep）轮询驱动事件循环，直到余额就绪或超时。
+
+    典型用法：reset_credit_balance(driver) → driver.get(credits_url)
+              → wait_for_credit_balance(driver)。
+
+    返回:
+        float | None: 余额（美元），超时仍未捕获返回 None。
+    """
+    waited = 0
+    while waited < timeout_ms:
+        if driver.credit_balance is not None:
+            return driver.credit_balance
+        try:
+            driver.page.wait_for_timeout(poll_ms)
+        except Exception:
+            break
+        waited += poll_ms
+    return driver.credit_balance
+
+
 def read_credits_balance(driver, timeout_ms=30_000):
     """
     读取账号 AI Credits 余额（美元）。
@@ -2433,18 +2500,29 @@ def _invoice_still_unpaid(driver, invoice_id):
     time.sleep(1)
     try:
         rows = driver.page.locator("xpath=//table//tr[td]").all()
+        seen_ids = []
         for row in rows:
             try:
                 iid = _invoice_row_id(row)
+                if iid:
+                    seen_ids.append(iid)
                 if iid == invoice_id:
                     txt = (row.inner_text(timeout=SHORT_TIMEOUT_MS) or '')
                     # 该行明确显示 Paid 且不含 Unpaid → 已支付；否则仍未支付
-                    return not ('Paid' in txt and 'Unpaid' not in txt)
+                    still_unpaid = not ('Paid' in txt and 'Unpaid' not in txt)
+                    # 诊断日志：暴露判定依据的原始行文本，便于排查「真实已付却判成未付」
+                    one_line = ' | '.join(s.strip() for s in txt.split('\n') if s.strip())
+                    print(f"  [判定] {invoice_id} 行文本: {one_line[:160]}"
+                          f" → {'仍未支付' if still_unpaid else '已支付(Paid)'}")
+                    return still_unpaid
             except Exception:
                 continue
-    except Exception:
-        pass
-    return True   # 表格已加载但找不到该 invoice 行 → 保守视为未支付（避免误记成功）
+        # 表格已加载但找不到该 invoice 行 → 保守视为未支付（避免误记成功）
+        print(f"  [判定] {invoice_id} 未在账单表格中找到该发票行"
+              f"（表内发票: {seen_ids[:8]}）→ 保守视为仍未支付")
+    except Exception as _e:
+        print(f"  [判定] {invoice_id} 读取账单表格异常: {str(_e)[:80]} → 保守视为仍未支付")
+    return True
 
 
 def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, account_id=None,
@@ -2832,14 +2910,18 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             definite_fail = pending.get("fill_status") == "failed"
             paid_confirmed = False
             if definite_fail:
+                print(f"  {inv} 提交结果明确失败（fill_status=failed），确认一次账单状态即判定")
                 dismiss_overdue_dialog(driver)
                 paid_confirmed = not _invoice_still_unpaid(driver, inv)
             else:
+                print(f"  {inv} 提交完成，开始轮询账单状态确认是否已变 Paid（最多 10 轮）...")
                 for _rnd in range(10):        # 最多约 10 轮（含刷新与等待，覆盖网络不佳）
                     dismiss_overdue_dialog(driver)
                     if not _invoice_still_unpaid(driver, inv):
                         paid_confirmed = True
+                        print(f"  {inv} 第 {_rnd + 1} 轮确认已变 Paid")
                         break
+                    print(f"  {inv} 第 {_rnd + 1}/10 轮仍未见 Paid，6s 后刷新重查")
                     time.sleep(6)
                     _return_to_invoices()
 

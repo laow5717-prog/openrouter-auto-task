@@ -25,6 +25,8 @@ from src.browser.driver import (
     fill_topup_and_confirm,
     handle_unpaid_invoices,
     read_credits_balance,
+    reset_credit_balance,
+    wait_for_credit_balance,
     extract_decline_from_responses,
     fetch_today_invoice_count,
 )
@@ -506,24 +508,38 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             """每笔发票支付成功后：更新选卡状态 + 记账（recharge_log + valid_cards + card_pool）
             balance: 支付后从 credits 页面读到的账户余额（美元，读取失败为 None）"""
             num = card.get('number', '')
+            print(f"  [记账] 进入 on_paid: invoice {invoice_id} 卡 ****{str(num)[-4:]} "
+                  f"金额 ${amt} 余额 {balance}")
             _sel['last'] = num
             _paid_numbers.add(num)
+            # 各步独立兜异常：任一步失败不应中断其余记账（否则卡号/成功标记会漏记）
             if recharge_log_model:
-                lid = recharge_log_model.create(email, card_display=num, amount=amt or 0)
-                recharge_log_model.mark_success(lid, api_response={
-                    'invoice': invoice_id, 'responses': responses, 'balance': balance})
+                try:
+                    lid = recharge_log_model.create(email, card_display=num, amount=amt or 0)
+                    recharge_log_model.mark_success(lid, api_response={
+                        'invoice': invoice_id, 'responses': responses, 'balance': balance})
+                    print(f"  [记账] recharge_log 已写入并标记成功 (id={lid})")
+                except Exception as _e:
+                    import traceback
+                    print(f"  [记账] recharge_log 写入失败: {_e}\n{traceback.format_exc()}")
             if account_model and balance is not None:
                 try:
                     account_model.update_balance(email, balance)
                 except Exception as _e:
                     print(f"  记录余额失败: {_e}")
             if valid_card_model:
-                valid_card_model.record(card, source_type='payment', source_email=email)
+                try:
+                    valid_card_model.record(card, source_type='payment', source_email=email)
+                    print(f"  [记账] valid_card 已记录 ****{str(num)[-4:]}")
+                except Exception as _e:
+                    import traceback
+                    print(f"  [记账] valid_card 记录失败: {_e}\n{traceback.format_exc()}")
             if card_pool_model:
                 try:
                     card_pool_model.mark_status_by_number(num, 'paid')
-                except Exception:
-                    pass
+                    print(f"  [记账] card_pool 已标记 ****{str(num)[-4:]} = paid")
+                except Exception as _e:
+                    print(f"  [记账] card_pool 标记 paid 失败: {_e}")
             bal_txt = f"，余额 ${balance:.2f}" if balance is not None else ""
             print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}"
                   f"（该账号累计 {len(_paid_numbers)} 张成功卡）{bal_txt}")
@@ -587,24 +603,80 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             except Exception as e:
                 print(f"  标记账单无法支付失败: {str(e)[:80]}")
 
+        def _balance_on_credits_page(timeout_ms=8000):
+            """当前页应已处于 credits 页：优先取被动监听（page.on("response")）捕获的最新
+            credit-balance 余额，未捕获再主动 fetch 兜底。返回 float | None。
+            注意：调用方须在导航到 credits 页「之前」先 reset_credit_balance(driver)，
+            以免拿到上次页面残留的余额。"""
+            b = wait_for_credit_balance(driver, timeout_ms=timeout_ms)  # 被动监听优先
+            if b is None:
+                b = read_credits_balance(driver)                        # 主动 fetch 兜底
+            return b
+
+        def _persist_balance(balance, label):
+            """把余额落库（读不到或无 model 时静默跳过），返回原值便于链式使用。"""
+            if balance is not None and account_model:
+                try:
+                    account_model.update_balance(email, balance)
+                    print(f"  账号 {email} {label} Credits 余额已更新: ${balance:.2f}")
+                except Exception as e:
+                    print(f"  更新余额失败: {str(e)[:80]}")
+            return balance
+
         def _record_final_balance():
             """流程收尾：重新加载 credits 页面，读一次最终余额并落库（读不到不影响主流程）。
-            返回读到的余额（float）或 None。"""
+            余额优先走「被动监听」——credits 页加载时页面自行请求 credit-balance 接口，
+            直接抓其响应；被动未捕获再退化为主动 fetch 兜底。返回读到的余额（float）或 None。"""
             try:
+                reset_credit_balance(driver)
                 driver.get(f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits")
-                time.sleep(5)
                 dismiss_overdue_dialog(driver)
-                balance = read_credits_balance(driver)
+                balance = _balance_on_credits_page()
                 if balance is None:
                     print("  未读到最终 Credits 余额")
                     return None
-                print(f"  账号 {email} 最终 Credits 余额: ${balance:.2f}")
-                if account_model:
-                    account_model.update_balance(email, balance)
-                return balance
+                return _persist_balance(balance, "最终")
             except Exception as e:
                 print(f"  读取最终余额失败: {e}")
                 return None
+
+        def _topup_confirm_requires_action(responses):
+            """topup 的 Stripe confirm 是否返回 requires_action（3DS）。
+            用于决定是否给余额一个「无感 3DS 后台结算」的等待窗口。"""
+            for r in (responses or []):
+                u = r.get('url', '') or ''
+                if 'stripe.com' in u and 'confirm' in u:
+                    data = r.get('data') if isinstance(r.get('data'), dict) else {}
+                    if data.get('object') == 'payment_intent':
+                        return data.get('status') == 'requires_action'
+            return False
+
+        def _settle_topup_balance(baseline, responses, initial):
+            """confirm=requires_action 时，无感 3DS 会在后台结算、余额随后才增长——
+            在**卡池卡介入之前**给余额一个短暂结算窗口，让 requires_action 的 topup 能凭
+            余额增长被正确判为成功（归属仍干净：此刻尚未用卡池卡付任何账单）。
+            余额走 credit-balance 接口（非 DOM），重复读实时且廉价。
+            返回结算窗口内读到的最佳（最高）余额；非 requires_action 或已增长则原样返回。"""
+            if initial is not None and baseline is not None and initial > baseline + 0.001:
+                return initial            # 已增长，无需等待
+            if not _topup_confirm_requires_action(responses):
+                return initial            # 非无感 3DS，不额外等待（真实拒付等由 confirm 判）
+            if baseline is None:
+                return initial
+            best = initial if initial is not None else baseline
+            for i in range(6):            # 最多 ~30s（6 × 5s），等无感 3DS 后台结算
+                time.sleep(5)
+                try:
+                    b = read_credits_balance(driver)
+                except Exception:
+                    b = None
+                if b is not None:
+                    best = max(best, b)
+                    if b > baseline + 0.001:
+                        print(f"  Top-up 无感 3DS 结算窗口第 {i + 1} 次：余额已增长至 ${b:.2f}（基线 ${baseline:.2f}）")
+                        return b
+            print(f"  Top-up 无感 3DS 结算窗口结束：余额仍未增长（最佳 ${best:.2f}，基线 ${baseline:.2f}）")
+            return best
 
         def _classify_topup(responses, baseline, post_topup):
             """判定 Top-up 的**真实**结果，返回 (ok: bool, reason: str, card_fault: bool)。
@@ -629,7 +701,21 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     return False, (reason or '支付被拒'), (card_fault if reason else True)
                 if pi_status in ('succeeded', 'processing', 'requires_capture'):
                     return True, '', False
-                # 捕获到 confirm 但状态不明确（如 requires_action/3DS）→ 保守判失败
+                # requires_action：可能是 3DS2 fingerprint 无感验证（会在后台自动完成扣款、
+                # 账单随即变 Paid），也可能是需用户交互的真实 3DS（无法自动完成）。二者无法从
+                # confirm 响应本身区分，故不再一律判失败——交由余额兜底权威判定：余额较基线增长
+                # 即已扣款成功（无感 3DS 已完成），否则才判失败。误判失败会漏记成功卡、且把已扣款
+                # 账单当欠费重复处理。
+                if pi_status == 'requires_action':
+                    if baseline is not None and post_topup is not None:
+                        if post_topup > baseline + 0.001:
+                            print(f"  Top-up confirm=requires_action，但余额已增长"
+                                  f"（${baseline:.2f}→${post_topup:.2f}）→ 判定 3DS 无感验证已完成、扣款成功")
+                            return True, '', False
+                        return False, '需 3DS 验证且余额未增长（无感验证未完成）', False
+                    # 读不到余额 → 无法确认，保守判失败（宁漏记成功不误记成功）
+                    return False, '需 3DS 验证且余额未知（无法确认）', False
+                # 捕获到 confirm 但状态不明确（其它中间态）→ 保守判失败
                 return False, f'支付状态未确认（{pi_status or status}）', False
             # 未捕获到 Stripe confirm → 余额兜底
             if baseline is not None and post_topup is not None:
@@ -654,13 +740,16 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
 
             before_count = today_count if today_count is not None else 0
 
-            # 基线余额（供 confirm 未捕获时的余额兜底判定）
+            # 基线余额（供 confirm 未捕获时的余额兜底判定）；同时把落地 credits 页读到的
+            # 当前余额刷新入库（即便后续 Top-up 失败/跳过，DB 也已反映最新余额）
             baseline_balance = None
             try:
+                reset_credit_balance(driver)
                 driver.get(credits_url)
                 time.sleep(4)
                 dismiss_overdue_dialog(driver)
-                baseline_balance = read_credits_balance(driver)
+                baseline_balance = _balance_on_credits_page()
+                _persist_balance(baseline_balance, "基线")
             except Exception as e:
                 print(f"  读取基线余额失败: {str(e)[:80]}")
 
@@ -688,12 +777,16 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             cards_exhausted = False
             if not skip_invoice:
                 time.sleep(5)
+                reset_credit_balance(driver)
                 driver.get(credits_url)
                 time.sleep(5)
                 check_and_handle_cf_challenge(driver)
                 dismiss_overdue_dialog(driver)
                 time.sleep(3)
-                post_topup_balance = read_credits_balance(driver)
+                post_topup_balance = _balance_on_credits_page()
+                # requires_action（无感 3DS）后台结算窗口，仍在卡池卡介入之前（见 _settle_topup_balance）
+                post_topup_balance = _settle_topup_balance(baseline_balance, responses, post_topup_balance)
+                _persist_balance(post_topup_balance, "Top-up 后")
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
                     on_failed=_on_invoice_failed, account_id=account_id,
@@ -739,15 +832,18 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                   f"Top-up {'成功' if topup_ok else '未成功'}")
             return True, reason, responses or [], step_card_last4, "stepped", info
 
-        # 读基线余额（供 Top-up 后 confirm 未捕获时的余额兜底；读不到则兜底退化为保守判失败）
+        # 读基线余额（供 Top-up 后 confirm 未捕获时的余额兜底；读不到则兜底退化为保守判失败）；
+        # 同时把落地 credits 页读到的当前余额刷新入库
         baseline_balance = None
         try:
+            reset_credit_balance(driver)
             driver.get(f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits")
             time.sleep(4)
             dismiss_overdue_dialog(driver)
-            baseline_balance = read_credits_balance(driver)
+            baseline_balance = _balance_on_credits_page()
             if baseline_balance is not None:
                 print(f"  Top-up 前基线余额: ${baseline_balance:.2f}")
+            _persist_balance(baseline_balance, "基线")
         except Exception as e:
             print(f"  读取基线余额失败: {str(e)[:80]}")
 
@@ -813,13 +909,18 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             time.sleep(5)
             print("正在返回 Credits 页面读取余额，随后转账单页处理 Unpaid invoices...")
             credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
+            reset_credit_balance(driver)
             driver.get(credits_url)
             time.sleep(5)
             check_and_handle_cf_challenge(driver)
             dismiss_overdue_dialog(driver)
             time.sleep(3)
             # 处理任何账单之前先读一次余额——只反映 Top-up 效果，避免账单支付垫高余额混淆兜底判定
-            post_topup_balance = read_credits_balance(driver)
+            post_topup_balance = _balance_on_credits_page()
+            # confirm=requires_action（无感 3DS）时，扣款可能在此刻后才结算——给余额一个短暂窗口，
+            # 仍在卡池卡介入之前，保证 requires_action 的 topup 能凭余额增长被正确判为成功
+            post_topup_balance = _settle_topup_balance(baseline_balance, responses, post_topup_balance)
+            _persist_balance(post_topup_balance, "Top-up 后")
 
             invoice_results = handle_unpaid_invoices(
                 driver, get_card=_get_card, on_paid=_on_invoice_paid,
