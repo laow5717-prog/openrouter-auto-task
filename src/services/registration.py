@@ -767,9 +767,12 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             print(f"账号 {email} 当日账单数 {before_count} < {invoice_daily_cap}，发起 1 次 Top-up 生成账单...")
             pay_success, responses, step_card_last4 = fill_topup_and_confirm(driver, amount=TOPUP_AMOUNT)
             _report("topup_confirmed")
+            responses = responses or []
             if not pay_success:
-                return (False, "填写金额或确认支付失败", responses or [], step_card_last4, "failed",
-                        {'today_count': before_count, 'generated': False, 'paid': 0, 'topup_ok': False})
+                # 提交步骤异常：不再直接返回，继续走下方账单处理 + 收尾。
+                # generated/paid/topup_ok 由实际结果（after_count 差值 /
+                # handle_unpaid_invoices / _classify_topup）如实反映。
+                print(f"账号 {email} 单步 Top-up 提交异常，仍按要求继续账单支付流程")
 
             # 返回 credits 页，至多付掉 1 张 open invoice（复用记账回调 + 逐张换卡重试）
             post_topup_balance = None
@@ -896,12 +899,15 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         print("正在填写充值金额并确认支付...")
         pay_success, responses, card_last4 = fill_topup_and_confirm(driver, amount=10)
         _report("topup_confirmed")
+        responses = responses or []
 
         if not pay_success:
-            print(f"账号 {email} 充值确认失败")
-            return False, "填写金额或确认支付失败", responses or [], card_last4, "failed"
-
-        print(f"账号 {email} 充值 $10 已提交")
+            # 提交步骤异常：不再直接返回。只要选了支付卡分组，仍继续进账单支付流程
+            # （用户要求：提交后无论成败都去账单页）。skip_invoice=True 时无账单可处理，
+            # 下方分支会跳过，最终由 _classify_topup 判失败收尾。
+            print(f"账号 {email} 充值提交异常，仍按要求继续账单支付流程")
+        else:
+            print(f"账号 {email} 充值 $10 已提交")
 
         post_topup_balance = None
         if not skip_invoice:
