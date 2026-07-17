@@ -779,3 +779,34 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 24: 账单支付成功判定改接口判据（调研，待接口URL）
+
+**Date**: 2026-07-17
+**Task**: 账单支付成功判定改接口判据（调研，待接口URL）
+**Branch**: `main`
+
+### Summary
+
+定位到支付成功判定当前走 driver.py 的 _invoice_still_unpaid() 解析账单表格 DOM（该行含 Paid 且不含 Unpaid 即成功），接入点在 handle_unpaid_invoices 支付后轮询处（driver.py:2841-2860）。计划：新增 fetch_invoice_payment_status(driver, account_id, invoice_id) 走用户新提的账单交易接口，按 invoice_id 命中且 status==CLOSED 且 amount_remaining==0 判成功，作为 DOM 判定之上的权威判据、接口读不到再退回 DOM 兜底。阻塞点：等用户提供该交易接口的完整 URL 及响应体外层结构（数组所在字段）。用户已确认走提供URL方案。本会话纯调研无代码改动；工作树里 M src/browser/driver.py、M src/services/registration.py 为会话前既有未提交改动，非本次产物，未提交。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
