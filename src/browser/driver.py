@@ -1505,29 +1505,48 @@ def _extract_account_id(driver):
 
 def read_credits_balance(driver, timeout_ms=30_000):
     """
-    读取 AI Credits 页面 Credits 卡片里的余额（形如 "$0.00"）。
+    读取账号 AI Credits 余额（美元）。
 
-    卡片结构：标题 <p><span>Credits</span></p> 与余额 <p class="... text-3xl">$0.00</p>
-    同在一个卡片 div 内。这里按"标题为 Credits 的卡片内第一个 $ 金额"定位，避免
-    误读页面上其它金额（如账单表格里的发票金额）。
+    在已登录的 dash.cloudflare.com 页面上下文用 fetch 调
+    ai-gateway/billing/credit-balance 接口（同源带 cookie），以接口返回的
+    result.balance 为权威。接口值为"分"（4000 == $40.00），这里换算成美元返回，
+    与旧 DOM 读法的口径一致，下游落库/比较逻辑无需变化。
+
+    需当前页面已处于 dash.cloudflare.com（同源）且 URL 含 account_id
+    （调用方均在导航到 credits 页后调用，天然满足）。
 
     返回:
         float | None: 余额（美元），读取失败返回 None
     """
+    account_id = _extract_account_id(driver)
+    if not account_id:
+        print("  读取 Credits 余额失败: 当前 URL 无 account_id")
+        return None
     try:
-        # .last 取文档序最后一个匹配（即嵌套最深的那层卡片 div），范围最小
-        card = driver.page.locator(
-            "xpath=//div[.//p[normalize-space(.)='Credits']]"
-            "[.//p[contains(@class,'text-3xl')]]"
-        ).last
-        amount = card.locator("xpath=.//p[contains(@class,'text-3xl')]").first
-        if not _wait_visible(amount, timeout=timeout_ms):
+        result = driver.page.evaluate(
+            """async ({accountId, timeoutMs}) => {
+                const url = `https://dash.cloudflare.com/api/v4/accounts/${accountId}`
+                    + `/ai-gateway/billing/credit-balance`;
+                const resp = await fetch(url, {
+                    credentials: 'include',
+                    headers: {'accept': 'application/json'},
+                    signal: AbortSignal.timeout(timeoutMs),
+                });
+                if (!resp.ok) return {ok: false, status: resp.status};
+                const body = await resp.json();
+                if (!body || body.success !== true || !body.result
+                    || typeof body.result.balance !== 'number') {
+                    return {ok: false, status: 'bad_body'};
+                }
+                return {ok: true, balance: body.result.balance};
+            }""",
+            {"accountId": account_id, "timeoutMs": timeout_ms})
+        if not result or not result.get('ok'):
+            status = (result or {}).get('status')
+            print(f"  读取 Credits 余额失败: credit-balance 接口异常（{status}）")
             return None
-        txt = (amount.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
-        m = re.search(r'\$\s*([\d,]+(?:\.\d+)?)', txt)
-        if not m:
-            return None
-        return float(m.group(1).replace(',', ''))
+        # 接口以"分"计（4000 == $40.00），换算为美元
+        return result['balance'] / 100.0
     except Exception as e:
         print(f"  读取 Credits 余额失败: {str(e)[:80]}")
         return None
