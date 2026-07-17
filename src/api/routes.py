@@ -398,11 +398,23 @@ def open_account_browser():
             else:
                 state.add_log(f"{email} 打开浏览器登录失败")
 
-            # 等待用户手动关闭浏览器
+            # 等待用户手动关闭浏览器；期间被动监听 credit-balance 接口：
+            # 用户手动进入 AI Gateway credits 页时，页面会自请求该接口，响应经
+            # page.on("response") 捕获进 driver.credit_balance；这里轮询该值，
+            # 一旦变化即落库刷新余额（driver.title 调用会驱动 Playwright 事件派发）。
             import time
+            last_persisted = None
             while True:
                 try:
                     _ = driver.title
+                    bal = getattr(driver, 'credit_balance', None)
+                    if bal is not None and bal != last_persisted:
+                        try:
+                            models['account'].update_balance(email, bal)
+                            last_persisted = bal
+                            state.add_log(f"{email} 检测到 credits 页，余额已更新: ${bal:.2f}")
+                        except Exception as _e:
+                            state.add_log(f"{email} 余额落库失败: {str(_e)[:80]}")
                     time.sleep(2)
                 except Exception:
                     break
