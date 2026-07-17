@@ -1998,6 +1998,25 @@ def _click_confirm_payment(driver, invoice_id=''):
     return clicked
 
 
+# Stripe 账单失效提示的核心短语。完整句是 "This invoice can no longer be paid
+# on Stripe. Please contact Cloudflare..."，随文案/版本微调，故只匹配稳定子串防漏判。
+_INVOICE_UNPAYABLE_HINT = "can no longer be paid"
+
+
+def _is_invoice_unpayable(driver):
+    """支付页是否出现「此账单已无法在 Stripe 支付」的失效提示（主文档层，非 iframe）。
+
+    出现它代表账单在 Stripe 侧已彻底失效（需联系 Cloudflare 另行处理），此时整个
+    支付表单被隐藏（display:none）、Pay 按钮虽在 DOM 却永不可见——换卡或重试都
+    毫无意义，应直接跳过该发票转下一张。
+    """
+    try:
+        hint = driver.page.get_by_text(_INVOICE_UNPAYABLE_HINT)
+        return hint.count() > 0 and hint.first.is_visible()
+    except Exception:
+        return False
+
+
 def _reveal_payment_form_if_saved_card(driver, invoice_id=''):
     """
     支付页若直接停在"确认付款"（已保存支付方式）态、卡表单被隐藏，
@@ -2029,6 +2048,30 @@ def _reveal_payment_form_if_saved_card(driver, invoice_id=''):
     return False
 
 
+def _stripe_payment_frame(driver):
+    """定位 Stripe Payment Element 的「卡输入」iframe，返回 frame_locator。
+
+    支付页存在两种组件结构：
+      - 旧结构：#payment-element 下只有一个 iframe（卡输入表单）。
+      - 新结构：#payment-element 下渲染多个 iframe——除卡输入帧外，还有 ACH 银行搜索
+        结果帧（title="Bank search results"，aria-hidden、height 4px），页面上方另有
+        #express-checkout-element 钱包快捷支付区 + "Or" 分隔。此时
+        frame_locator("div#payment-element iframe") 会同时匹配到多个 frame，Playwright
+        strict 模式下任何交互都会抛 "resolved to N elements"，导致点 Card / 填卡失败。
+
+    这里优先用稳定的 title 精确锁定卡输入帧（title="Secure payment input frame"），
+    命中不了再退回容器内第一个 iframe（.first 兼容旧的单帧结构，也顺带规避 strict）。
+    """
+    page = driver.page
+    titled_sel = "div#payment-element iframe[title='Secure payment input frame']"
+    try:
+        if page.locator(titled_sel).count() > 0:
+            return page.frame_locator(titled_sel).first
+    except Exception:
+        pass
+    return page.frame_locator("div#payment-element iframe").first
+
+
 def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_stop=None):
     """
     在 Stripe 支付页面的 iframe 内填写信用卡信息并点击 Pay
@@ -2041,8 +2084,8 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_sto
         dict: {status, error?}
     """
     try:
-        # 定位 Stripe Payment Element iframe（frame_locator 无状态，无需手工切帧）
-        stripe_frame = driver.page.frame_locator("div#payment-element iframe")
+        # 定位 Stripe Payment Element 卡输入 iframe（兼容新旧两种组件结构，见 _stripe_payment_frame）
+        stripe_frame = _stripe_payment_frame(driver)
 
         # 等待 Card 表单渲染完成（accordion 展开后字段需要一点时间挂载）；
         # 用 wait_for_timeout 同时驱动 Playwright 事件循环
@@ -2122,6 +2165,28 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_sto
                     print(f"  {invoice_id} 未见邮编字段（等待 15s），跳过 ZIP 填写")
             except Exception as e:
                 print(f"  {invoice_id} ZIP 填写失败(继续): {str(e)[:60]}")
+
+        # 取消 "Save my information for faster checkout"（Stripe Link opt-in，默认勾选）——
+        # 不把支付信息保存到 Link，避免跨账号关联留存。该 checkbox 未必总出现（取决于邮箱是否
+        # 关联 Link 等），存在且已勾选才点、缺失/超时跳过（不致命）。input 常被自定义样式覆盖，
+        # 优先点 label 触发 toggle。
+        try:
+            optin = stripe_frame.locator("input#payment-linkOptInInput")
+            if optin.count() > 0 and optin.is_checked(timeout=SHORT_TIMEOUT_MS):
+                label = stripe_frame.locator("label[for='payment-linkOptInInput']")
+                target = label.first if label.count() > 0 else optin.first
+                target.click(timeout=SHORT_TIMEOUT_MS)
+                time.sleep(0.3)
+                # 校验是否真的取消；若仍勾选，退回直接点 input 兜底
+                try:
+                    if optin.is_checked(timeout=SHORT_TIMEOUT_MS):
+                        optin.first.click(timeout=SHORT_TIMEOUT_MS, force=True)
+                        time.sleep(0.3)
+                except Exception:
+                    pass
+                print(f"  {invoice_id} 已取消「保存支付信息」勾选")
+        except Exception as e:
+            print(f"  {invoice_id} 取消保存信息勾选失败(继续): {str(e)[:60]}")
 
         driver.capture_frame()
         time.sleep(1)
@@ -2271,7 +2336,8 @@ def _invoice_still_unpaid(driver, invoice_id):
 
 
 def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, account_id=None,
-                           should_stop=None, max_invoices=None):
+                           should_stop=None, max_invoices=None,
+                           skip_invoice_check=None, on_unpayable=None):
     """
     检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
     打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
@@ -2305,6 +2371,13 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                       现状行为）。用于轮询式（round-robin）场景传 1：付掉 1 张即返回，
                       随后由编排层切换下一个账号。只有成功付掉（on_paid 触发）才计数，
                       重试耗尽放弃的坏账单不占额度；单张 invoice 内部换卡/脚本重试语义不变。
+        skip_invoice_check: 无参 callable(invoice_id) -> bool，选发票时对每张待选发票调用；
+                      返回 True 表示该发票处于「无法支付」冷却期（24h 内已判定失效）——
+                      本轮直接跳过、不下载不开支付页（status='unpayable_cooldown'），
+                      转去处理下一张账单。由调用方基于 invoice_payment_state 落库判定。
+        on_unpayable: callable(invoice_id, pay_url, amount)，支付页出现「此账单已无法在
+                      Stripe 支付」失效提示时调用；调用方据此持久化 24h 冷却，
+                      使后续充值不再重复请求该发票。
     返回:
         list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, balance?, error?}, ...]
               status: paid / opened / failed / skipped
@@ -2347,6 +2420,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
     INVOICE_DETECT_RETRIES = 3   # 首次未见账单时的重载重试上限（刚 Top-up 完账单可能尚未渲染/落库）
 
     done_ids = set()              # 已完结的发票：支付成功、或重试耗尽后永久放弃
+    cooldown_recorded = set()     # 已因「无法支付」冷却跳过并记过一条结果的发票（避免重复记录）
     card_tries = {}               # invoice_id -> 该发票已消耗的卡数（日志用）
     script_tries = {}             # invoice_id -> 该发票的脚本侧重试次数
     sticky_cards = {}             # invoice_id -> 脚本侧失败后待复用的同一张卡
@@ -2420,11 +2494,22 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             try:
                 link = row.locator("xpath=.//a[@role='button']").first
                 iid = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
-                if iid and iid not in done_ids:
-                    invoice_id = iid
-                    invoice_link = link
-                    invoice_row = row
-                    break
+                if not iid or iid in done_ids:
+                    continue
+                # 「无法支付」冷却：24h 内已判定该账单在 Stripe 侧失效——本轮直接跳过、
+                # 不下载不开支付页，转去处理下一张账单（每张只记一条结果）。
+                if skip_invoice_check and skip_invoice_check(iid):
+                    if iid not in cooldown_recorded:
+                        cooldown_recorded.add(iid)
+                        print(f"  {iid} 24h 内已判定无法在 Stripe 支付，冷却中，跳过该发票")
+                        results.append({"invoice": iid, "status": "unpayable_cooldown",
+                                        "error": "账单 24h 内已判定无法在 Stripe 支付（冷却跳过）"})
+                    done_ids.add(iid)
+                    continue
+                invoice_id = iid
+                invoice_link = link
+                invoice_row = row
+                break
             except Exception:
                 continue
 
@@ -2494,11 +2579,42 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             driver.get(pay_url)
             print(f"  正在等待 {invoice_id} 支付页面加载...")
 
-            # 等待 Stripe 支付页面加载完成（Pay 按钮出现）
+            # 等待支付页就绪：Pay 按钮可见（正常）或出现失效提示（账单已无法在 Stripe 支付）。
+            # 二者竞态——失效账单的支付表单是 display:none、Pay 按钮永不可见，若只等按钮会白等
+            # 满超时再当超时重试，故并行检测失效提示以便秒级识别、直接跳过。
+            # 新结构（钱包区 + accordion）Stripe 资源加载慢，就绪可达数分钟，故给足 240s。
             pay_btn = driver.page.locator(
                 "button[data-testid='hosted-payment-submit-button']"
             ).first
-            if not _wait_visible(pay_btn, timeout=120_000):
+            page_ready = False
+            unpayable = False
+            deadline = time.time() + 240
+            while time.time() < deadline:
+                if _is_invoice_unpayable(driver):
+                    unpayable = True
+                    break
+                if pay_btn.is_visible():
+                    page_ready = True
+                    break
+                time.sleep(1)
+
+            if unpayable:
+                # 账单本身在 Stripe 侧已作废——换卡/脚本重试都无意义，标记完结直接跳过。
+                # 此刻尚未调用 get_card()，故不消耗卡池额度。
+                print(f"  {invoice_id} 账单已无法在 Stripe 支付（需联系 Cloudflare），跳过该发票")
+                # 持久化 24h 冷却，使后续充值不再重复请求该发票（读不到 model 也不影响本轮）。
+                if on_unpayable is not None:
+                    try:
+                        on_unpayable(invoice_id, pay_url, amount)
+                    except Exception as _e:
+                        print(f"  记录账单无法支付冷却失败: {str(_e)[:80]}")
+                done_ids.add(invoice_id)
+                results.append({"invoice": invoice_id, "status": "unpayable",
+                                "error": "账单已无法在 Stripe 支付（需联系 Cloudflare）",
+                                "pay_url": pay_url, "amount": amount})
+                _return_to_credits()
+                continue
+            if not page_ready:
                 print(f"  {invoice_id} 支付页面加载超时")
                 _script_fail(invoice_id, "支付页面加载超时", pay_url=pay_url)
                 _return_to_credits()
@@ -2508,14 +2624,46 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             # 页面可能直接停在"确认付款"（已保存支付方式）态、卡表单被隐藏 → 先切回新支付方式
             _reveal_payment_form_if_saved_card(driver, invoice_id)
 
-            # 切入 Stripe iframe 点击 Card 支付选项（frame_locator 无状态）
+            # 切入 Stripe iframe 展开 Card 信用卡表单（frame_locator 无状态）。
+            # 新结构下 #payment-element 有多个 iframe，_stripe_payment_frame 精确取卡输入帧。
+            #
+            # 关键：新结构的 Stripe iframe（钱包区 + accordion 折叠）加载很慢，从支付页
+            # 就绪到 Card 折叠项 / 卡表单可交互可能要数分钟——故不用固定短超时，而在一个
+            # 较长窗口内轮询，等「卡表单已直接展开（卡号输入框可见）」或「Card 折叠项可点」
+            # 二者之一先就绪：前者直接进填卡、后者点开它。期间响应停止请求可中途叫停。
+            CARD_READY_TIMEOUT = 300   # 秒，等 Stripe 卡表单/选项就绪的上限（慢加载可达数分钟）
             try:
-                stripe_frame = driver.page.frame_locator("div#payment-element iframe")
+                stripe_frame = _stripe_payment_frame(driver)
+                number_input = stripe_frame.locator("input#payment-numberInput")
                 card_btn = stripe_frame.locator("div.p-AccordionButton[data-value='card']")
-                _wait_visible(card_btn, timeout=30_000)
-                _safe_click(card_btn, session=driver, desc='Card 支付选项')
-                time.sleep(2)
-                print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
+                deadline_card = time.time() + CARD_READY_TIMEOUT
+                state = None   # 'expanded' | 'clicked'
+                while time.time() < deadline_card:
+                    if should_stop and should_stop():
+                        raise InterruptedError("用户请求停止")
+                    try:
+                        if number_input.is_visible():   # 卡表单已展开（无需点 Card）
+                            state = 'expanded'
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        if card_btn.is_visible():        # Card 折叠项就绪 → 点开展开表单
+                            _safe_click(card_btn, session=driver, desc='Card 支付选项')
+                            time.sleep(2)
+                            state = 'clicked'
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                if state == 'expanded':
+                    print(f"  {invoice_id} 卡表单已展开，跳过点击 Card")
+                elif state == 'clicked':
+                    print(f"  {invoice_id} 已展开 Card 信用卡支付表单")
+                else:
+                    raise RuntimeError(f"等待 Card 表单/选项就绪超时（{CARD_READY_TIMEOUT}s）")
+            except InterruptedError:
+                raise
             except Exception as e:
                 print(f"  {invoice_id} 点击 Card 选项失败: {e}")
                 _script_fail(invoice_id, f"点击 Card 选项失败: {e}", pay_url=pay_url)

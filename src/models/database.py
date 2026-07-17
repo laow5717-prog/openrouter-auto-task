@@ -127,6 +127,18 @@ CREATE TABLE IF NOT EXISTS card_payment_state (
 );
 """
 
+# 账单支付：「账单已无法在 Stripe 支付」的 24h 冷却状态（详见 InvoicePaymentStateModel）
+_SCHEMA_V7 = """
+CREATE TABLE IF NOT EXISTS invoice_payment_state (
+    invoice_id      TEXT PRIMARY KEY,
+    email           TEXT DEFAULT '',
+    unpayable_until TEXT,
+    reason          TEXT DEFAULT '',
+    pay_url         TEXT DEFAULT '',
+    updated_at      TEXT DEFAULT (datetime('now','localtime'))
+);
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -134,6 +146,7 @@ _MIGRATIONS = {
     4: _SCHEMA_V4,
     5: _SCHEMA_V5,
     6: _SCHEMA_V6,
+    7: _SCHEMA_V7,
 }
 
 

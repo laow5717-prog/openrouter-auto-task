@@ -389,7 +389,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
                      should_stop=None, card_binding_model=None, card_state_model=None,
-                     invoice_daily_cap=None):
+                     invoice_daily_cap=None, invoice_state_model=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -404,6 +404,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         card_pool_model: CardPoolModel，支付成功后把底料卡状态标为 'paid'
         account_model: AccountModel，每笔发票支付成功后记录该账号最新的 Credits 余额
         card_binding_model: CardBindingModel，Top-up 因卡本身被拒时把对应绑定卡标记失效
+        invoice_state_model: InvoicePaymentStateModel，账单支付页出现「此账单已无法在 Stripe
+                             支付」时标记该发票 24h 冷却；后续充值在冷却期内跳过该发票、转付新账单
         invoice_daily_cap: None＝现状全量模式（返回 5 元组）。传整数（如 30）＝单步(round-robin)
                            模式：先读该账号当日账单数，未达上限则做 1 次 Top-up 生成账单 +
                            至多付 1 张，随后返回，供编排层切换下一个账号。返回 6 元组。
@@ -559,6 +561,27 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             mark_txt = "，已标记为无效卡" if card_fault else "，卡状态不变（脚本侧失败）"
             print(f"  已记失败: invoice {invoice_id} 卡 ****{str(num)[-4:]} 原因: {reason}{mark_txt}")
 
+        def _skip_invoice_cooldown(invoice_id):
+            """该发票是否在「无法支付」24h 冷却期内 → 选发票时跳过它，转去支付新账单。"""
+            if not invoice_state_model:
+                return False
+            try:
+                return invoice_state_model.in_cooldown(invoice_id)
+            except Exception:
+                return False
+
+        def _on_invoice_unpayable(invoice_id, pay_url, amt):
+            """支付页出现「此账单已无法在 Stripe 支付」→ 标 24h 冷却，后续充值不再重复请求。"""
+            if not invoice_state_model:
+                return
+            try:
+                invoice_state_model.mark_unpayable(
+                    invoice_id, email=email, hours=24,
+                    reason='Stripe: invoice can no longer be paid', pay_url=pay_url or '')
+                print(f"  已标记 invoice {invoice_id} 无法支付，24h 内跳过该发票")
+            except Exception as e:
+                print(f"  标记账单无法支付失败: {str(e)[:80]}")
+
         def _record_final_balance():
             """流程收尾：重新加载 credits 页面，读一次最终余额并落库（读不到不影响主流程）。
             返回读到的余额（float）或 None。"""
@@ -669,7 +692,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
                     on_failed=_on_invoice_failed, account_id=account_id,
-                    should_stop=should_stop, max_invoices=1)
+                    should_stop=should_stop, max_invoices=1,
+                    skip_invoice_check=_skip_invoice_cooldown, on_unpayable=_on_invoice_unpayable)
                 paid_n = sum(1 for r in (invoice_results or []) if r.get('status') == 'paid')
                 # 卡池耗尽：handle_unpaid_invoices 在无卡可用时回 status='skipped'。
                 # 据此让编排层停止对该账号继续生成无法支付的账单。
@@ -756,7 +780,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
                     on_failed=_on_invoice_failed, account_id=account_id,
-                    should_stop=should_stop)
+                    should_stop=should_stop,
+                    skip_invoice_check=_skip_invoice_cooldown, on_unpayable=_on_invoice_unpayable)
                 if invoice_results:
                     print(f"Unpaid invoice 处理结果: {invoice_results}")
                     time.sleep(10)
@@ -794,7 +819,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             invoice_results = handle_unpaid_invoices(
                 driver, get_card=_get_card, on_paid=_on_invoice_paid,
                 on_failed=_on_invoice_failed, account_id=account_id,
-                should_stop=should_stop)
+                should_stop=should_stop,
+                skip_invoice_check=_skip_invoice_cooldown, on_unpayable=_on_invoice_unpayable)
             if invoice_results:
                 print(f"Unpaid invoice 处理结果: {invoice_results}")
                 time.sleep(10)

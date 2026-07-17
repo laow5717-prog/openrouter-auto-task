@@ -22,6 +22,7 @@ from src.models.card_group import CardGroupModel
 from src.models.card_pool import CardPoolModel
 from src.models.valid_card import ValidCardModel
 from src.models.card_payment_state import CardPaymentStateModel
+from src.models.invoice_payment_state import InvoicePaymentStateModel
 from src.services import registration, card as card_service
 from src.api.routes import api
 
@@ -354,6 +355,7 @@ class AppState:
                 should_stop=lambda: self.stop_requested,
                 card_binding_model=models['card_binding'],
                 card_state_model=models['card_state'],
+                invoice_state_model=models['invoice_state'],
                 invoice_daily_cap=(invoice_daily_cap if single_step else None),
             )
 
@@ -839,6 +841,7 @@ def create_app(db_path=None):
         'card_pool': CardPoolModel(db),
         'valid_card': ValidCardModel(db),
         'card_state': CardPaymentStateModel(db),
+        'invoice_state': InvoicePaymentStateModel(db),
     }
 
     # 创建应用状态
