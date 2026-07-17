@@ -570,15 +570,20 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             except Exception:
                 return False
 
-        def _on_invoice_unpayable(invoice_id, pay_url, amt):
-            """支付页出现「此账单已无法在 Stripe 支付」→ 标 24h 冷却，后续充值不再重复请求。"""
+        def _on_invoice_unpayable(invoice_id, pay_url, amt, permanent=False, reason=''):
+            """支付页出现「此账单已无法在 Stripe 支付」→ 标 24h 冷却，后续充值不再重复请求。
+            permanent=True（如支付页跳转 Stripe 登录页，订单已彻底无效）→ 标 10 年，
+            等同永久跳过、以后不再对该发票发起支付。"""
             if not invoice_state_model:
                 return
             try:
+                hours = 24 * 365 * 10 if permanent else 24
                 invoice_state_model.mark_unpayable(
-                    invoice_id, email=email, hours=24,
-                    reason='Stripe: invoice can no longer be paid', pay_url=pay_url or '')
-                print(f"  已标记 invoice {invoice_id} 无法支付，24h 内跳过该发票")
+                    invoice_id, email=email, hours=hours,
+                    reason=(reason or 'Stripe: invoice can no longer be paid'),
+                    pay_url=pay_url or '')
+                scope_txt = "永久" if permanent else "24h 内"
+                print(f"  已标记 invoice {invoice_id} 无法支付，{scope_txt}跳过该发票")
             except Exception as e:
                 print(f"  标记账单无法支付失败: {str(e)[:80]}")
 

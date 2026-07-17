@@ -1,12 +1,12 @@
 """
 账单（invoice）支付状态模型
 
-承载「账单已无法在 Stripe 支付」的 24h 冷却：当支付页出现
-"This invoice can no longer be paid on Stripe..." 时，该账单在 Stripe 侧已失效
-（需联系 Cloudflare 另行处理），换卡/重试都无意义。据此标一个到期时间（默认 24h），
-冷却期内的后续充值直接跳过该发票、转去支付新账单，避免每次都白白重下 PDF、重开支付页。
-
-到期自动恢复（now >= unpayable_until 即视为可再试），以防 Cloudflare 之后重新签发同号账单。
+承载「账单已无法在 Stripe 支付」的冷却/永久标记：
+- 支付页出现 "This invoice can no longer be paid on Stripe..." → 标 24h 冷却，
+  冷却期内的后续充值直接跳过该发票、转去支付新账单，避免每次都白白重开支付页；
+  到期自动恢复（now >= unpayable_until 即视为可再试），以防 Cloudflare 之后重新签发同号账单。
+- 支付页被重定向到 Stripe Dashboard 登录页（订单已彻底无效）→ 标 10 年（hours 传大值），
+  等同永久跳过、以后不再对该发票发起支付。
 """
 
 

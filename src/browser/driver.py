@@ -2487,9 +2487,10 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                       返回 True 表示该发票处于「无法支付」冷却期（24h 内已判定失效）——
                       本轮直接跳过、不下载不开支付页（status='unpayable_cooldown'），
                       转去处理下一张账单。由调用方基于 invoice_payment_state 落库判定。
-        on_unpayable: callable(invoice_id, pay_url, amount)，支付页出现「此账单已无法在
-                      Stripe 支付」失效提示时调用；调用方据此持久化 24h 冷却，
-                      使后续充值不再重复请求该发票。
+        on_unpayable: callable(invoice_id, pay_url, amount, permanent=False, reason='')，
+                      支付页出现「此账单已无法在 Stripe 支付」失效提示时调用（24h 冷却）；
+                      若支付页被重定向到 Stripe Dashboard 登录页（订单已彻底无效），
+                      以 permanent=True 调用，调用方应永久标记、以后不再对该发票发起支付。
     返回:
         list: 处理结果列表 [{invoice, status, pay_url, card?, amount?, balance?, error?}, ...]
               status: paid / opened / failed / skipped
@@ -2613,14 +2614,14 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 iid = _invoice_row_id(row)
                 if not iid or iid in done_ids:
                     continue
-                # 「无法支付」冷却：24h 内已判定该账单在 Stripe 侧失效——本轮直接跳过、
+                # 「无法支付」冷却/永久标记：已判定该账单在 Stripe 侧失效——本轮直接跳过、
                 # 不开支付页，转去处理下一张账单（每张只记一条结果）。
                 if skip_invoice_check and skip_invoice_check(iid):
                     if iid not in cooldown_recorded:
                         cooldown_recorded.add(iid)
-                        print(f"  {iid} 24h 内已判定无法在 Stripe 支付，冷却中，跳过该发票")
+                        print(f"  {iid} 已判定无法在 Stripe 支付（冷却/永久标记中），跳过该发票")
                         results.append({"invoice": iid, "status": "unpayable_cooldown",
-                                        "error": "账单 24h 内已判定无法在 Stripe 支付（冷却跳过）"})
+                                        "error": "账单已判定无法在 Stripe 支付（冷却/永久跳过）"})
                     done_ids.add(iid)
                     continue
                 invoice_id = iid
@@ -2666,17 +2667,23 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
 
             print(f"  正在等待 {invoice_id} 支付页面加载...")
 
-            # 等待支付页就绪：Pay 按钮可见（正常）或出现失效提示（账单已无法在 Stripe 支付）。
-            # 二者竞态——失效账单的支付表单是 display:none、Pay 按钮永不可见，若只等按钮会白等
-            # 满超时再当超时重试，故并行检测失效提示以便秒级识别、直接跳过。
+            # 等待支付页就绪：Pay 按钮可见（正常）、出现失效提示（账单已无法在 Stripe 支付）、
+            # 或被重定向到 Stripe Dashboard 登录页（dashboard.stripe.com/login——支付链接已
+            # 彻底作废，订单无效）。三者竞态——后两种情况 Pay 按钮永不可见，若只等按钮会白等
+            # 满超时再当超时重试，故并行检测以便秒级识别、直接跳过。
             # 新结构（钱包区 + accordion）Stripe 资源加载慢，就绪可达数分钟，故给足 240s。
             pay_btn = driver.page.locator(
                 "button[data-testid='hosted-payment-submit-button']"
             ).first
             page_ready = False
             unpayable = False
+            login_redirect = False
             deadline = time.time() + 240
             while time.time() < deadline:
+                cur_url = driver.current_url or ''
+                if 'dashboard.stripe.com/login' in cur_url:
+                    login_redirect = True
+                    break
                 if _is_invoice_unpayable(driver):
                     unpayable = True
                     break
@@ -2685,6 +2692,23 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                     break
                 time.sleep(1)
 
+            if login_redirect:
+                # 支付页被重定向到 Stripe Dashboard 登录页——该账单的支付链接已彻底作废
+                # （订单无效，非到期可恢复的冷却），永久标记、以后不再对它发起支付。
+                # 此刻尚未调用 get_card()，故不消耗卡池额度。
+                print(f"  {invoice_id} 支付页跳转到 Stripe 登录页，订单已无效，永久跳过该发票")
+                if on_unpayable is not None:
+                    try:
+                        on_unpayable(invoice_id, pay_url, amount, permanent=True,
+                                     reason='支付页跳转 Stripe 登录页（订单无效）')
+                    except Exception as _e:
+                        print(f"  记录账单永久无效失败: {str(_e)[:80]}")
+                done_ids.add(invoice_id)
+                results.append({"invoice": invoice_id, "status": "unpayable",
+                                "error": "支付页跳转 Stripe 登录页（订单无效，永久跳过）",
+                                "pay_url": pay_url, "amount": amount})
+                _return_to_invoices()
+                continue
             if unpayable:
                 # 账单本身在 Stripe 侧已作废——换卡/脚本重试都无意义，标记完结直接跳过。
                 # 此刻尚未调用 get_card()，故不消耗卡池额度。
