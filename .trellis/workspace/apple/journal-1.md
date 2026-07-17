@@ -714,3 +714,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 22: 余额判定改用 credit-balance 接口 + 账单冷却功能落盘
+
+**Date**: 2026-07-17
+**Task**: 余额判定改用 credit-balance 接口 + 账单冷却功能落盘
+**Branch**: `main`
+
+### Summary
+
+1) read_credits_balance 从 DOM 解析改为同源 fetch 调 ai-gateway/billing/credit-balance 接口，result.balance 为权威（单位分，/100 换算美元），调用点与下游口径不变；2) 提交此前工作区遗留的账单不可支付 24h 冷却功能（invoice_payment_state 表 schema v7 + Model + 支付流程接线）
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ba49eae` | (see git log) |
+| `8ab215e` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
