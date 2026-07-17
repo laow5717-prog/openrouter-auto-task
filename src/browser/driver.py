@@ -2316,28 +2316,31 @@ def _find_pay_now_button(row):
     return None
 
 
+# 发票编号形态（如 IN-71825612）。注意行内唯一的 <a> 是 Pay now 链接，
+# Number 列是纯文本单元格——不能用「找链接」的方式取编号。
+_INVOICE_NO_RE = re.compile(r'^[A-Z]{1,4}-?\d{4,}$')
+
+
 def _invoice_row_id(row):
     """从 billing/invoices 表格行提取 invoice 编号。
 
-    优先取行内第一个非 Pay now 的链接文本（invoice 编号通常是查看/下载链接），
-    兜底取第一个非空单元格文本。取不到返回 ''。
+    表格列结构为 Date / Type / Number / Amount / Status / (Pay now) / (actions)，
+    优先扫单元格找形如 IN-71825612 的编号文本，兜底取第 3 列（Number 列）。
+    取不到返回 ''。
     """
-    try:
-        links = row.locator("a").all()
-        for link in links[:4]:
-            t = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
-            if t and not _PAY_NOW_RE.search(t):
-                return t
-    except Exception:
-        pass
+    texts = []
     try:
         cells = row.locator("td").all()
-        for cell in cells[:3]:
+        for cell in cells[:6]:
             t = (cell.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
-            if t and not _PAY_NOW_RE.search(t):
+            texts.append(t)
+            if t and _INVOICE_NO_RE.match(t.split('\n')[0].strip()):
                 return t.split('\n')[0].strip()
     except Exception:
         pass
+    # 兜底：按列位取 Number 列（第 3 列）
+    if len(texts) >= 3 and texts[2]:
+        return texts[2].split('\n')[0].strip()
     return ''
 
 
