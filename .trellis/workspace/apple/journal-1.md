@@ -748,3 +748,34 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 23: 重启前后台服务
+
+**Date**: 2026-07-17
+**Task**: 重启前后台服务
+**Branch**: `main`
+
+### Summary
+
+停止旧 server.py 进程（PID 61386），重新后台启动（PID 29949），端口 5000 验证 HTTP 200。前端为 static/ 构建产物由 Flask 托管，无需单独重启。无代码改动。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

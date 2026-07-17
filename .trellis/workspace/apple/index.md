@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 22
+- **Total Sessions**: 23
 - **Last Active**: 2026-07-17
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~750 | Active |
+| `journal-1.md` | ~781 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 23 | 2026-07-17 | 重启前后台服务 | - | `main` |
 | 22 | 2026-07-17 | 余额判定改用 credit-balance 接口 + 账单冷却功能落盘 | `ba49eae`, `8ab215e` | `main` |
 | 21 | 2026-07-16 | 每日流水线轮询式 top-up 补生成账单至30条/账号/天 | `b868e45` | `main` |
 | 20 | 2026-07-15 | 卡池分组管理 + 有效卡导出/池内状态展示 + 3DS误标订正 | `826e365`, `e7c3723`, `f25eb2f`, `b80896d` | `main` |
