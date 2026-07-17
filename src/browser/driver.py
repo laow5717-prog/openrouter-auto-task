@@ -2790,13 +2790,15 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             if unpayable:
                 # 账单本身在 Stripe 侧已作废——换卡/脚本重试都无意义，标记完结直接跳过。
                 # 此刻尚未调用 get_card()，故不消耗卡池额度。
-                print(f"  {invoice_id} 账单已无法在 Stripe 支付（需联系 Cloudflare），跳过该发票")
-                # 持久化 24h 冷却，使后续充值不再重复请求该发票（读不到 model 也不影响本轮）。
+                print(f"  {invoice_id} 账单已无法在 Stripe 支付（需联系 Cloudflare），永久跳过该发票")
+                # 「can no longer be paid」是 Stripe/Cloudflare 对该发票的终态：作废发票不会复活，
+                # 故永久标记（permanent=True），避免 24h 冷却到期后每天重开该页白耗 240s 再重标。
                 if on_unpayable is not None:
                     try:
-                        on_unpayable(invoice_id, pay_url, amount)
+                        on_unpayable(invoice_id, pay_url, amount, permanent=True,
+                                     reason='账单已无法在 Stripe 支付（需联系 Cloudflare）')
                     except Exception as _e:
-                        print(f"  记录账单无法支付冷却失败: {str(_e)[:80]}")
+                        print(f"  记录账单永久无法支付失败: {str(_e)[:80]}")
                 done_ids.add(invoice_id)
                 results.append({"invoice": invoice_id, "status": "unpayable",
                                 "error": "账单已无法在 Stripe 支付（需联系 Cloudflare）",
