@@ -1779,25 +1779,6 @@ def fill_topup_and_confirm(driver, amount=10):
         return False, None, card_last4
 
 
-def _extract_pdf_pay_url(pdf_path):
-    """从 invoice PDF 中提取 Pay online 链接"""
-    try:
-        from PyPDF2 import PdfReader
-        reader = PdfReader(pdf_path)
-        for page in reader.pages:
-            if '/Annots' in page:
-                annots = page['/Annots']
-                for annot in annots:
-                    obj = annot.get_object()
-                    if obj.get('/A') and obj['/A'].get('/URI'):
-                        uri = obj['/A']['/URI']
-                        if 'pay' in uri.lower() or 'invoice' in uri.lower() or 'stripe' in uri.lower():
-                            return uri
-    except Exception as e:
-        print(f"解析 PDF 失败: {e}")
-    return None
-
-
 _COUNTRY_NAME_TO_CODE = {
     'united states': 'US', 'united states of america': 'US', 'usa': 'US', 'us': 'US',
     'united kingdom': 'GB', 'uk': 'GB', 'great britain': 'GB',
@@ -2321,28 +2302,137 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_sto
         return {"status": "failed", "error": f"Stripe 支付填写失败: {e}", "card_fault": False}
 
 
+_PAY_NOW_RE = re.compile(r'pay\s*now', re.I)
+
+
+def _find_pay_now_button(row):
+    """在 billing/invoices 表格行内定位 Pay now 按钮/链接；不存在返回 None。"""
+    try:
+        ctl = row.locator("button, a").filter(has_text=_PAY_NOW_RE)
+        if ctl.count() > 0:
+            return ctl.first
+    except Exception:
+        pass
+    return None
+
+
+def _invoice_row_id(row):
+    """从 billing/invoices 表格行提取 invoice 编号。
+
+    优先取行内第一个非 Pay now 的链接文本（invoice 编号通常是查看/下载链接），
+    兜底取第一个非空单元格文本。取不到返回 ''。
+    """
+    try:
+        links = row.locator("a").all()
+        for link in links[:4]:
+            t = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+            if t and not _PAY_NOW_RE.search(t):
+                return t
+    except Exception:
+        pass
+    try:
+        cells = row.locator("td").all()
+        for cell in cells[:3]:
+            t = (cell.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+            if t and not _PAY_NOW_RE.search(t):
+                return t.split('\n')[0].strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _open_invoice_pay_page(driver, pay_btn, invoice_id=''):
+    """点击 billing/invoices 页的 Pay now，让**主 Page** 落到 Stripe 支付页。
+
+    Pay now 可能是三种形态，逐一兜住；但无论哪种，最终都用主 Page 导航到支付 URL——
+    网络监听（net_responses）、截图缓存、Stripe iframe 定位全部绑定在主 Page 上，
+    绝不能把支付流程切到弹出的新标签页里执行。
+      1) 带 href 的链接 → 直接取 URL 主页导航（不真点，避免多开标签页）；
+      2) 点击后新开标签页 → 捕获弹出页拿 URL、关掉它、主页重新导航；
+      3) 点击后同页跳转 → 直接沿用当前 URL。
+    返回支付页 URL；失败返回 None。
+    """
+    # 形态 1：链接自带 href
+    try:
+        href = pay_btn.get_attribute('href', timeout=SHORT_TIMEOUT_MS)
+    except Exception:
+        href = None
+    if href and href.startswith('http'):
+        print(f"  {invoice_id} Pay now 为直链，直接导航: {href[:100]}")
+        driver.get(href)
+        return href
+
+    before_url = driver.current_url or ''
+    before_pages = len(driver.context.pages)
+    try:
+        pay_btn.scroll_into_view_if_needed(timeout=SHORT_TIMEOUT_MS)
+    except Exception:
+        pass
+    # 依次尝试：普通点击 → JS 直接 click（绕过坐标 actionability）→ force
+    clicked = False
+    for _method in ('normal', 'js', 'force'):
+        try:
+            if _method == 'js':
+                pay_btn.evaluate("el => el.click()")
+            else:
+                pay_btn.click(timeout=CLICK_TIMEOUT_MS, force=(_method == 'force'))
+            clicked = True
+            break
+        except Exception as e:
+            print(f"  {invoice_id} Pay now 点击失败(方式={_method}): {str(e)[:90]}")
+    if not clicked:
+        return None
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        # 形态 2：新开标签页——取到 URL 后立即关闭弹出页，由主 Page 重新导航
+        try:
+            pages = driver.context.pages
+            if len(pages) > before_pages:
+                popup = pages[-1]
+                url = popup.url or ''
+                if url and url != 'about:blank':
+                    try:
+                        popup.close()
+                    except Exception:
+                        pass
+                    print(f"  {invoice_id} Pay now 弹出新标签页，主页面接管: {url[:100]}")
+                    driver.get(url)
+                    return url
+        except Exception:
+            pass
+        # 形态 3：同页跳转（离开 billing 页即认）
+        try:
+            cur = driver.current_url or ''
+            if cur != before_url and 'billing/invoices' not in cur:
+                print(f"  {invoice_id} Pay now 同页跳转: {cur[:100]}")
+                return cur
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+
 def _invoice_still_unpaid(driver, invoice_id):
-    """在 credits 页面判断某 invoice 是否仍未支付（权威判据）。
-    发票表格同时显示 Paid/Unpaid 行；支付成功后该行状态会变为 Paid。
+    """在 billing/invoices 页面判断某 invoice 是否仍未支付（权威判据）。
+    账单表格同时显示 Paid/Unpaid 行；支付成功后该行状态会变为 Paid。
     返回 True=仍未支付；False=已支付（该行显示 Paid）。
 
     重要：必须先等表格加载再判断——否则表格未加载时找不到行会被误判为"已消失=已支付"
     （假阳性会导致把未成功的支付误记为成功）。找不到行 / 表格未加载时一律保守返回 True。
     """
-    # 等发票表格加载：出现至少一行带 invoice 链接的行
+    # 等账单表格加载：出现至少一行数据行
     try:
-        driver.page.locator(
-            "xpath=//table//tr[.//a[@role='button']]"
-        ).first.wait_for(state="visible", timeout=20_000)
+        driver.page.locator("xpath=//table//tr[td]").first.wait_for(
+            state="visible", timeout=20_000)
     except Exception:
         return True   # 表格没加载出来，无法确认已支付 → 保守视为仍未支付
     time.sleep(1)
     try:
-        rows = driver.page.locator("xpath=//table//tr[.//a[@role='button']]").all()
+        rows = driver.page.locator("xpath=//table//tr[td]").all()
         for row in rows:
             try:
-                iid = (row.locator("xpath=.//a[@role='button']").first
-                       .inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+                iid = _invoice_row_id(row)
                 if iid == invoice_id:
                     txt = (row.inner_text(timeout=SHORT_TIMEOUT_MS) or '')
                     # 该行明确显示 Paid 且不含 Unpaid → 已支付；否则仍未支付
@@ -2358,16 +2448,16 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                            should_stop=None, max_invoices=None,
                            skip_invoice_check=None, on_unpayable=None):
     """
-    检查 Credits 页面的 Unpaid invoice，逐个下载 PDF、提取支付链接、
-    打开 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回 credits 页面再查找，
+    访问账号的 billing/invoices 账单页，查找 Unpaid invoice，逐个点击行内 Pay now
+    按钮进入 Stripe 支付页面并支付。每处理完一个 invoice 后重新导航回账单页再查找，
     不关闭浏览器、持续支付下一个账单，直到无账单 / get_card 返回 None。
 
     失败重试语义（重要）：一张发票支付失败时，重试的是「同一张发票」而不是跳到下一张——
     账单要逐张结清，跳过只会把欠费留在账号上。
       - 卡被拒 / 卡号错 / 已过期 / 需要 3DS（card_fault=True）→ 换下一张卡重试同一发票，
         直到付掉或卡池耗尽（get_card 返回 None → 整体停止，剩余发票同样无卡可付）；
-      - 页面超时 / PDF 下载失败 / 元素定位失败（card_fault=False）→ 卡是好的，复用同一张卡
-        重开支付页重试，最多 2 次；仍失败才放弃该发票并转下一张。
+      - 页面超时 / Pay now 打开支付页失败 / 元素定位失败（card_fault=False）→ 卡是好的，
+        复用同一张卡重开支付页重试，最多 2 次；仍失败才放弃该发票并转下一张。
 
     参数:
         driver: 浏览器驱动
@@ -2383,7 +2473,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                    由调用方记录失败原因。card_fault=True 表示失败归因于卡本身
                    （拒付 / 卡号错 / 已过期 / 需要 3DS），调用方应把该卡标记为无效；
                    False 表示脚本侧失败（页面超时、元素定位失败、结果未确认），不应动卡状态。
-        account_id: Cloudflare 账号 ID，用于拼出 credits 页面 URL（返回时整页刷新）。
+        account_id: Cloudflare 账号 ID，用于拼出 billing/invoices 账单页 URL（返回时整页刷新）。
         should_stop: 无参 callable，返回 True 表示用户请求停止；每轮发票开头检查，
                      命中即中断循环（换卡重试可能持续很久，这是唯一的中途叫停入口）。
         max_invoices: 一次调用最多**成功付掉**的 invoice 数上限。默认 None＝不限（付清全部，
@@ -2402,29 +2492,29 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
               status: paid / opened / failed / skipped
     """
     results = []
-    download_dir = getattr(driver, '_download_dir', None)
-    if not download_dir:
-        print("未配置下载目录，跳过 Unpaid invoice 处理")
+
+    # billing/invoices 账单页 URL：每轮支付完用整页导航返回并重新加载（不用 go_back——
+    # SPA 回退会复用旧的前端状态，账单表格都可能是支付前的陈旧数据）
+    invoices_url = None
+    if account_id:
+        invoices_url = f"https://dash.cloudflare.com/{account_id}/billing/invoices"
+    elif 'billing/invoices' in (driver.current_url or ''):
+        invoices_url = driver.current_url
+    if not invoices_url:
+        print("未提供 account_id 且当前不在账单页，跳过 Unpaid invoice 处理")
         return results
 
-    # credits 页面 URL：每轮支付完用整页导航返回并重新加载（不用 go_back——SPA 回退
-    # 会复用旧的前端状态，账单表格/余额都可能是支付前的陈旧数据）
-    credits_url = None
-    if account_id:
-        credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
-    elif 'credits' in (driver.current_url or ''):
-        credits_url = driver.current_url
-
-    def _return_to_credits():
-        """整页导航回 credits 并强制刷新，确保拿到支付后的最新账单状态与余额。"""
+    def _return_to_invoices():
+        """整页导航回 billing/invoices 账单页并强制刷新，确保拿到支付后的最新账单状态。"""
         try:
-            if credits_url:
-                driver.get(credits_url)          # goto 同 URL 即整页重新加载
-            else:
-                driver.page.reload(wait_until="domcontentloaded")
+            driver.get(invoices_url)             # goto 同 URL 即整页重新加载
         except Exception as e:
-            print(f"  返回 Credits 页面异常: {str(e)[:80]}")
+            print(f"  返回账单页面异常: {str(e)[:80]}")
         time.sleep(3)
+
+    # 调用方通常停在 credits 页——先导航到账单页再开始找 Unpaid 行
+    print(f"正在打开账单页面: {invoices_url}")
+    _return_to_invoices()
 
     # === 失败重试策略 ===
     # 一张发票支付失败时，换下一张卡重试「同一张发票」，而不是跳到下一张发票——
@@ -2472,17 +2562,23 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             print("  收到停止请求，中断账单支付流程")
             break
         round_num += 1
-        pending = None   # 本轮是否尝试了支付（用于返回 credits 后权威判定成功与否）
+        pending = None   # 本轮是否尝试了支付（用于返回账单页后权威判定成功与否）
 
-        # 等待表格加载 + 清理可能弹出的欠费提示弹窗（会遮挡发票表格导致点击失败）
+        # 等待表格加载 + 清理可能弹出的欠费提示弹窗（会遮挡账单表格导致点击失败）
         time.sleep(3)
         had_overdue = dismiss_overdue_dialog(driver)
 
-        # 查找 Unpaid 行
+        # 查找可支付的 Unpaid 行：以行内存在 Pay now 按钮为准
+        # （能点 Pay now 的才是待支付账单，比状态文案更直接可靠）
         def _find_unpaid_rows():
-            return driver.page.locator(
-                "xpath=//table//tr[.//span[text()='Unpaid']]"
-            ).all()
+            found = []
+            try:
+                for row in driver.page.locator("xpath=//table//tr[td]").all():
+                    if _find_pay_now_button(row) is not None:
+                        found.append(row)
+            except Exception:
+                pass
+            return found
 
         rows = _find_unpaid_rows()
         # 首次检测（尚未处理过任何发票）查到 0 行时：可能是刚 Top-up 完账单还没渲染/落库，
@@ -2490,10 +2586,10 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
         # 欠费弹窗存在（had_overdue）却 0 行，几乎可确定账单尚未渲染，同样进入重试。
         if not rows and not results and not done_ids:
             for attempt in range(INVOICE_DETECT_RETRIES):
-                print(f"  首次未见 Unpaid 行"
+                print(f"  首次未见可支付的 Unpaid 行"
                       f"{'（检测到欠费弹窗，账单应存在）' if had_overdue else ''}"
                       f"，重载重试 {attempt + 1}/{INVOICE_DETECT_RETRIES}")
-                _return_to_credits()
+                _return_to_invoices()
                 had_overdue = dismiss_overdue_dialog(driver)
                 time.sleep(2)
                 rows = _find_unpaid_rows()
@@ -2507,16 +2603,15 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
         # 找到第一张尚未完结的 invoice。失败过的发票不会进 done_ids，因此仍会被再次选中
         # ——这正是"换卡重试同一张发票"的落点。
         invoice_id = None
-        invoice_link = None
+        pay_now_btn = None
         invoice_row = None
         for row in rows:
             try:
-                link = row.locator("xpath=.//a[@role='button']").first
-                iid = (link.inner_text(timeout=SHORT_TIMEOUT_MS) or '').strip()
+                iid = _invoice_row_id(row)
                 if not iid or iid in done_ids:
                     continue
                 # 「无法支付」冷却：24h 内已判定该账单在 Stripe 侧失效——本轮直接跳过、
-                # 不下载不开支付页，转去处理下一张账单（每张只记一条结果）。
+                # 不开支付页，转去处理下一张账单（每张只记一条结果）。
                 if skip_invoice_check and skip_invoice_check(iid):
                     if iid not in cooldown_recorded:
                         cooldown_recorded.add(iid)
@@ -2526,7 +2621,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                     done_ids.add(iid)
                     continue
                 invoice_id = iid
-                invoice_link = link
+                pay_now_btn = _find_pay_now_button(row)
                 invoice_row = row
                 break
             except Exception:
@@ -2553,49 +2648,19 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             pass
 
         try:
-            # 点击下载并通过 Playwright 下载事件保存 PDF 到下载目录
-            safe_iid = re.sub(r'[^\w.\-]', '_', invoice_id)
-            pdf_path = os.path.join(download_dir, f"invoice_{safe_iid}.pdf")
-            # 下载链接常在视口外/被遮挡导致 click actionability 超时：先滚动进视口并等可见，
-            # 再点击；普通点击失败则用 force 兜底（绕过 actionability 检查）。
-            try:
-                invoice_link.scroll_into_view_if_needed(timeout=SHORT_TIMEOUT_MS)
-            except Exception:
-                pass
-            _wait_visible(invoice_link, timeout=SHORT_TIMEOUT_MS)
-            # 下载按钮是无 href 的 <a role=button>，由 React onClick 触发下载。
-            # 依次尝试：普通点击 → JS 直接 click（绕过坐标 actionability，直接触发 onClick）→ force。
-            downloaded = False
-            for _method in ('normal', 'js', 'force'):
-                try:
-                    with driver.page.expect_download(timeout=30_000) as download_info:
-                        if _method == 'js':
-                            invoice_link.evaluate("el => el.click()")
-                        else:
-                            invoice_link.click(timeout=CLICK_TIMEOUT_MS, force=(_method == 'force'))
-                    download_info.value.save_as(pdf_path)
-                    print(f"  PDF 已下载: {os.path.basename(pdf_path)} (方式={_method})")
-                    downloaded = True
-                    break
-                except Exception as e:
-                    print(f"  {invoice_id} PDF 下载失败(方式={_method}): {str(e)[:90]}")
-            if not downloaded:
-                _script_fail(invoice_id, "PDF 下载超时")
-                _return_to_credits()
+            # 点击行内 Pay now 按钮进入 Stripe 支付页（可能是直链 / 新标签页 / 同页跳转，
+            # _open_invoice_pay_page 统一兜住并保证主 Page 落到支付页）
+            if pay_now_btn is None:
+                _script_fail(invoice_id, "未找到 Pay now 按钮")
+                _return_to_invoices()
                 continue
-
-            # 从 PDF 提取支付链接
-            pay_url = _extract_pdf_pay_url(pdf_path)
+            pay_url = _open_invoice_pay_page(driver, pay_now_btn, invoice_id)
             if not pay_url:
-                print(f"  {invoice_id} 未找到 Pay online 链接")
-                _script_fail(invoice_id, "未找到支付链接")
-                _return_to_credits()
+                print(f"  {invoice_id} Pay now 未能打开支付页面")
+                _script_fail(invoice_id, "Pay now 未能打开支付页面")
+                _return_to_invoices()
                 continue
 
-            print(f"  找到支付链接: {pay_url}")
-
-            # 在浏览器中打开支付链接
-            driver.get(pay_url)
             print(f"  正在等待 {invoice_id} 支付页面加载...")
 
             # 等待支付页就绪：Pay 按钮可见（正常）或出现失效提示（账单已无法在 Stripe 支付）。
@@ -2631,12 +2696,12 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                 results.append({"invoice": invoice_id, "status": "unpayable",
                                 "error": "账单已无法在 Stripe 支付（需联系 Cloudflare）",
                                 "pay_url": pay_url, "amount": amount})
-                _return_to_credits()
+                _return_to_invoices()
                 continue
             if not page_ready:
                 print(f"  {invoice_id} 支付页面加载超时")
                 _script_fail(invoice_id, "支付页面加载超时", pay_url=pay_url)
-                _return_to_credits()
+                _return_to_invoices()
                 continue
             print(f"  {invoice_id} 支付页面已加载完成")
 
@@ -2686,7 +2751,7 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             except Exception as e:
                 print(f"  {invoice_id} 点击 Card 选项失败: {e}")
                 _script_fail(invoice_id, f"点击 Card 选项失败: {e}", pay_url=pay_url)
-                _return_to_credits()
+                _return_to_invoices()
                 continue
 
             # 有卡提供器则填卡并提交（是否真成功在返回 credits 后按"账单是否仍 Unpaid"判定）
@@ -2727,9 +2792,9 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
             print(f"  处理 {invoice_id} 异常: {e}")
             _script_fail(invoice_id, str(e))
 
-        # 处理完一个 invoice 后，回到 credits 页面重新查找
-        print(f"  返回 Credits 页面查找剩余 Unpaid invoices...")
-        _return_to_credits()
+        # 处理完一个 invoice 后，回到 billing/invoices 账单页重新查找
+        print(f"  返回账单页面查找剩余 Unpaid invoices...")
+        _return_to_invoices()
 
         # 权威判定：以 Cloudflare 发票表状态为准（不解析 Stripe 响应）。
         # 支付是耗时操作、且 Cloudflare 更新账单状态有延迟，故轮询等待：
@@ -2749,10 +2814,10 @@ def handle_unpaid_invoices(driver, get_card=None, on_paid=None, on_failed=None, 
                         paid_confirmed = True
                         break
                     time.sleep(6)
-                    _return_to_credits()
+                    _return_to_invoices()
 
             if paid_confirmed:
-                # 页面已是刷新后的 credits 页 → 此刻的 Credits 卡片即支付后的最新余额
+                # 页面已是刷新后的账单页（URL 含 account_id）→ 可直接经接口读最新余额
                 done_ids.add(inv)
                 sticky_cards.pop(inv, None)
                 balance = read_credits_balance(driver)
