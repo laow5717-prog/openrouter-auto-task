@@ -880,7 +880,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 close_topup_dialog(driver)
                 time.sleep(2)
 
-                # 处理 Unpaid invoices（函数内部会导航到 billing/invoices 账单页）
+                # 直接在当前 credits 页面处理 Unpaid invoices
                 invoice_results = handle_unpaid_invoices(
                     driver, get_card=_get_card, on_paid=_on_invoice_paid,
                     on_failed=_on_invoice_failed, account_id=account_id,
@@ -913,7 +913,7 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         if not skip_invoice:
             # 有支付卡分组，等待页面更新后检查 Unpaid invoices
             time.sleep(5)
-            print("正在返回 Credits 页面读取余额，随后转账单页处理 Unpaid invoices...")
+            print("正在返回 Credits 页面读取余额，随后处理 Unpaid invoices...")
             credits_url = f"https://dash.cloudflare.com/{account_id}/ai/ai-gateway/credits"
             reset_credit_balance(driver)
             driver.get(credits_url)
