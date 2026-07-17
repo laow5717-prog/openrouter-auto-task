@@ -810,3 +810,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 25: 被动监听 credit-balance 接口自动更新账户余额
+
+**Date**: 2026-07-17
+**Task**: 被动监听 credit-balance 接口自动更新账户余额
+**Branch**: `main`
+
+### Summary
+
+在已挂载的 page.on("response") 监听器里被动捕获 AI Gateway credit-balance 接口响应（解析 result.balance，分→美元）缓存到 BrowserSession.credit_balance，无需额外 fetch。driver.py 新增 _capture_credit_balance 解析 + reset_credit_balance/wait_for_credit_balance 两个 helper（用 page.wait_for_timeout 驱动 sync Playwright 事件派发）。registration.recharge_account 所有 credits 页读余额点统一改为 reset→被动优先→主动 fetch 兜底，并在 baseline/post_topup/收尾 三处落库。routes.py「打开浏览器查看账号」入口的等待循环补上轮询 driver.credit_balance 落库，覆盖用户手动进 credits 页的场景。均已重启后端待实测验证。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b3be806` | (see git log) |
+| `ad41b69` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

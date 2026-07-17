@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 24
+- **Total Sessions**: 25
 - **Last Active**: 2026-07-17
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~812 | Active |
+| `journal-1.md` | ~846 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 25 | 2026-07-17 | 被动监听 credit-balance 接口自动更新账户余额 | `b3be806`, `ad41b69` | `main` |
 | 24 | 2026-07-17 | 账单支付成功判定改接口判据（调研，待接口URL） | - | `main` |
 | 23 | 2026-07-17 | 重启前后台服务 | - | `main` |
 | 22 | 2026-07-17 | 余额判定改用 credit-balance 接口 + 账单冷却功能落盘 | `ba49eae`, `8ab215e` | `main` |
