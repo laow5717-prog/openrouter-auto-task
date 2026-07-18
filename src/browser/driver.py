@@ -2317,6 +2317,20 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_sto
             if _has_3ds_challenge(driver):
                 is_3ds = True
                 break
+            # 1.5) 支付成功组件（最可靠）：Stripe 支付成功后渲染
+            #      data-testid="invoice-summary-post-payment"（"Invoice paid"文案 +
+            #      金额 invoice-amount-post-payment + 收据下载按钮）。DOM 命中即真实
+            #      成功，优先于网络响应/页面文案判定。
+            try:
+                if driver.page.locator(
+                    "[data-testid='invoice-summary-post-payment'], "
+                    "[data-testid='invoice-amount-post-payment'], "
+                    "[data-testid='download-invoice-receipt-pdf-button']"
+                ).count() > 0:
+                    print(f"  {invoice_id} 检测到支付成功组件（Invoice paid）")
+                    return {"status": "paid", "responses": list(driver.net_responses)}
+            except Exception:
+                pass
             # 2) 成功信号（快速返回）
             blob = " ".join(
                 (_json.dumps(r.get('data'), ensure_ascii=False)
@@ -2337,7 +2351,7 @@ def _fill_stripe_payment_and_submit(driver, card_info, invoice_id='', should_sto
             except Exception:
                 body = ''
             if any(k in body for k in ['payment received', 'payment complete', 'thanks for your payment',
-                                       'you paid', 'receipt from', 'paid on']):
+                                       'you paid', 'receipt from', 'paid on', 'invoice paid']):
                 return {"status": "paid", "responses": list(driver.net_responses)}
 
         collected = list(driver.net_responses)
