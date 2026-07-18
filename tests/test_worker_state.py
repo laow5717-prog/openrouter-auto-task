@@ -123,18 +123,41 @@ def test_log_buffer_evicts_but_seq_keeps_growing():
 
 
 def test_force_stop_touches_every_worker():
+    """停止必须作用于所有 worker，不只是主 worker。"""
     st = _state()
     workers = st.ensure_workers(3)
     for w in workers:
-        w.set_active_driver(object())
-        w._screenshot_stop.clear()
+        w.set_active_driver(_FakeDriver())
+        w.start_screenshot_loop(_FakeDriver())
 
     st.force_stop()
 
     assert st.stop_requested
     for w in workers:
         assert w._active_driver is None
-        assert w._screenshot_stop.is_set()
+        assert w._screenshot_driver is None
+        # 截图线程收到停止信号后应自行退出
+        if w._screenshot_thread is not None:
+            w._screenshot_thread.join(timeout=2)
+            assert not w._screenshot_thread.is_alive()
+
+
+def test_restarting_screenshot_loop_retires_the_old_thread():
+    """换 driver 时旧截图线程必须退出，否则会持有已关闭的 driver 反复抛异常。"""
+    w = WorkerState('W9')
+    w.start_screenshot_loop(_FakeDriver())
+    first = w._screenshot_thread
+
+    w.start_screenshot_loop(_FakeDriver())
+    second = w._screenshot_thread
+
+    assert second is not first
+    first.join(timeout=2)
+    assert not first.is_alive(), "旧截图线程没有退出"
+
+    w.stop_screenshot_loop()
+    second.join(timeout=2)
+    assert not second.is_alive()
 
 
 def test_frames_are_per_worker():

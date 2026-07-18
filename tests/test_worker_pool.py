@@ -194,3 +194,56 @@ def test_worker_released_after_run():
         assert w.busy is False
         assert w._active_driver is None
         assert w.current_action == "空闲"
+
+
+# ==================== 回归：code-review 发现的问题 ====================
+
+
+def test_active_workers_shrinks_when_concurrency_reduced():
+    """把 max_workers 调回 1（文档中的应急回滚）后，对外只应看到 W1。
+
+    workers 字典只增不减（保留日志），但 active_workers 必须按当前并发度截断，
+    否则前端 isParallel(workers.length > 1) 恒为真，回滚后仍渲染并行分栏。"""
+    st = AppState(db=None, models={})
+    WorkerPool(st, 4)
+    assert [w.worker_id for w in st.active_workers()] == ['W1', 'W2', 'W3', 'W4']
+
+    WorkerPool(st, 1)
+    assert [w.worker_id for w in st.active_workers()] == ['W1']
+    assert st.parallel_mode is False
+    # 旧 worker 的日志仍在内存里，只是不再展示
+    assert 'W4' in st.workers
+
+
+def test_stop_breaks_out_of_map_immediately():
+    """用户停止后 map 不应继续取下一项。"""
+    st, pool = _pool(1)
+    seen = []
+
+    def work(w, item):
+        seen.append(item)
+        if item == 2:
+            raise InterruptedError('user stop')
+        return item
+
+    pool.map(range(20), work)
+    assert seen == [0, 1, 2], f"停止后仍继续取件: {seen}"
+    assert st.stop_requested is True
+
+
+def test_stop_breaks_out_of_run_until_empty():
+    st, pool = _pool(1)
+    items = list(range(20))
+    seen = []
+
+    def produce():
+        return items.pop(0) if items else None
+
+    def work(w, item):
+        seen.append(item)
+        if item == 1:
+            raise InterruptedError('user stop')
+        return item
+
+    pool.run_until_empty(produce, work)
+    assert seen == [0, 1], f"停止后仍继续取件: {seen}"

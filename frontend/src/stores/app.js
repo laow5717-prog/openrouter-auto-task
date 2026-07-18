@@ -19,8 +19,15 @@ export const useAppStore = defineStore('app', () => {
   let pollTimer = null
 
   function syncWorkers(list) {
+    const incoming = list || []
     const known = new Map(workers.value.map((w) => [w.id, w]))
-    workers.value = (list || []).map((info) => {
+    // 只在 worker 集合真的变了时才换数组引用。轮询每秒一次，无脑重建会让
+    // v-for 与依赖 workers 的 watch 每秒全量重算，日志上千行时 UI 明显卡顿。
+    const sameSet =
+      workers.value.length === incoming.length &&
+      incoming.every((info, i) => workers.value[i].id === info.id)
+
+    const next = incoming.map((info) => {
       const existing = known.get(info.id)
       if (existing) {
         existing.currentAction = info.current_action
@@ -37,6 +44,8 @@ export const useAppStore = defineStore('app', () => {
         logIndex: 0,
       }
     })
+
+    if (!sameSet) workers.value = next
   }
 
   async function pollWorkerLogs() {

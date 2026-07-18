@@ -172,10 +172,12 @@ class WorkerState:
         self._active_driver = None
         self._active_driver_lock = threading.Lock()
 
-        # 持续截图线程
+        # 持续截图线程。每次 start 都换新线程 + 新停止事件，故 _screenshot_stop
+        # 初始为 None；_screenshot_lock 保护这三个字段的整体切换。
         self._screenshot_driver = None
         self._screenshot_thread = None
-        self._screenshot_stop = threading.Event()
+        self._screenshot_stop = None
+        self._screenshot_lock = threading.Lock()
 
     # ---------- 日志 ----------
 
@@ -223,30 +225,43 @@ class WorkerState:
     # ---------- 持续截图 ----------
 
     def start_screenshot_loop(self, driver):
-        self._screenshot_driver = driver
-        self._screenshot_stop.clear()
-        if self._screenshot_thread and self._screenshot_thread.is_alive():
-            return
+        """（重新）开始对 driver 持续截图。
 
-        def _loop():
-            # 注意：本线程不继承 worker 绑定，也不需要——它只截图不打日志。
-            # 若将来在此处加日志，必须先 bind_current_worker(self)。
-            while not self._screenshot_stop.is_set():
-                try:
-                    d = self._screenshot_driver
-                    if d:
-                        self.update_frame(d.get_screenshot_as_png())
-                except Exception:
-                    pass
-                self._screenshot_stop.wait(0.3)
+        每次都起一条新线程，并让旧线程自然退出：复用旧线程需要"先换 driver 再
+        clear 停止事件"这种顺序上的巧合才正确，一旦顺序被调整，就会出现截图线程
+        持有已关闭的 driver 反复抛异常（被 except 吞掉），画面永久卡在最后一帧。
+        新线程自带停止事件，与旧线程完全隔离，不依赖任何时序。"""
+        with self._screenshot_lock:
+            self._stop_screenshot_thread_locked()
 
-        self._screenshot_thread = threading.Thread(
-            target=_loop, daemon=True, name=f'screenshot-{self.worker_id}')
-        self._screenshot_thread.start()
+            stop_event = threading.Event()
+            self._screenshot_stop = stop_event
+            self._screenshot_driver = driver
+
+            def _loop():
+                # 注意：本线程不继承 worker 绑定，也不需要——它只截图不打日志。
+                # 若将来在此处加日志，必须先 bind_current_worker(self)。
+                while not stop_event.is_set():
+                    try:
+                        self.update_frame(driver.get_screenshot_as_png())
+                    except Exception:
+                        pass
+                    stop_event.wait(0.3)
+
+            self._screenshot_thread = threading.Thread(
+                target=_loop, daemon=True, name=f'screenshot-{self.worker_id}')
+            self._screenshot_thread.start()
 
     def stop_screenshot_loop(self):
-        self._screenshot_stop.set()
+        with self._screenshot_lock:
+            self._stop_screenshot_thread_locked()
+
+    def _stop_screenshot_thread_locked(self):
+        """停掉当前截图线程。调用方须持有 _screenshot_lock。"""
+        if self._screenshot_stop is not None:
+            self._screenshot_stop.set()
         self._screenshot_driver = None
+        self._screenshot_thread = None
 
     # ---------- 供 registration.* 回调 ----------
 
@@ -261,6 +276,8 @@ class WorkerState:
                 app_state.dispatch_print("收到停止请求，正在中断...")
                 raise InterruptedError("User requested stop")
             self.set_active_driver(driver)
+            # 仅在 driver 换了（或尚未启动）时重起截图线程；monitor 每步都被调用，
+            # 不加这个判断会每步都重建线程。
             if self._screenshot_driver is not driver:
                 self.start_screenshot_loop(driver)
         return _monitor
@@ -398,7 +415,10 @@ class WorkerPool:
                         return
                     i = next_index[0]
                     next_index[0] += 1
-                results[i] = self._safe_call(worker, fn, items[i])
+                r = self._safe_call(worker, fn, items[i])
+                if r is self._STOP:
+                    return
+                results[i] = r
 
         self._dispatch(consume)
         return results
@@ -418,6 +438,8 @@ class WorkerPool:
                 if item is None:
                     return
                 r = self._safe_call(worker, fn, item)
+                if r is self._STOP:
+                    return
                 with results_lock:
                     results.append(r)
 
@@ -443,17 +465,22 @@ class WorkerPool:
         for t in threads:
             t.join()
 
+    # _safe_call 用它表示"用户已停止，别再取下一项了"，与"这项返回了 None"区分开
+    _STOP = object()
+
     def _safe_call(self, worker, fn, item):
         """执行单项工作，异常不外溢。
 
-        InterruptedError 是用户停止，转成全局 stop_requested 让其它 worker 也收敛；
+        InterruptedError 是用户停止，转成全局 stop_requested 让其它 worker 也收敛，
+        并返回 _STOP 让调用方立刻跳出取件循环——只置标志是不够的，consume 会继续
+        取下一项，把剩余账号一个个走完早退分支，拖长停止响应。
         其它异常只记日志——单个账号出错不应终止整批。"""
         try:
             return fn(worker, item)
         except InterruptedError:
             self.app_state.stop_requested = True
             self.app_state.dispatch_print("已中断")
-            return None
+            return self._STOP
         except Exception as e:
             self.app_state.dispatch_print(f"处理出错: {e}")
             return None

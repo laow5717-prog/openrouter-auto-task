@@ -39,7 +39,7 @@ batch:
 
 # 每日流水线并发配置
 concurrency:
-  max_workers: 1              # 同时驱动的浏览器数，1-4。默认 1=串行（与改造前一致）
+  max_workers: 2              # 同时驱动的浏览器数，1-4。设为 1 即退回串行（应急止血用）
                               # 每个实例是有头 Chrome，约占 300-500MB 内存
   claim_timeout_minutes: 20   # 卡被领取后多久无进展视为 worker 失联，自动回收为 pending
 

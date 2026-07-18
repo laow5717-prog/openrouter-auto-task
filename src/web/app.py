@@ -63,7 +63,10 @@ class AppState:
         self.open_browsers = set()
 
         # worker 运行时。W1 是主 worker，恒存在。
+        # workers 只增不减（旧 worker 的日志留着供回看）；对外展示以
+        # active_worker_count 为准，见 active_workers()。
         self.workers = {self.PRIMARY_WORKER_ID: WorkerState(self.PRIMARY_WORKER_ID)}
+        self.active_worker_count = 1
         self._workers_lock = threading.Lock()
 
         # 是否处于并行模式（由 WorkerPool 依 max_workers 设置）。仅影响聚合日志
@@ -83,12 +86,14 @@ class AppState:
     def ensure_workers(self, count):
         """确保存在 count 个 worker（W1..Wn），返回有序列表。
 
-        只增不减：已存在的 worker 复用，保留其日志供回看。"""
+        字典只增不减（已存在的 worker 复用，保留其日志供回看），但
+        active_worker_count 会跟着降，使对外展示的 worker 数正确反映本次并发度。"""
         with self._workers_lock:
             for i in range(1, count + 1):
                 wid = f'W{i}'
                 if wid not in self.workers:
                     self.workers[wid] = WorkerState(wid)
+            self.active_worker_count = count
             return [self.workers[f'W{i}'] for i in range(1, count + 1)]
 
     def get_worker(self, worker_id=None):
@@ -98,11 +103,15 @@ class AppState:
         return self.workers.get(worker_id, self.primary_worker)
 
     def active_workers(self, count=None):
-        """当前对外展示的 worker 列表。count 为 None 时展示全部已创建的。"""
-        ids = sorted(self.workers, key=lambda w: int(w[1:]))
-        if count is not None:
-            ids = ids[:count]
-        return [self.workers[i] for i in ids]
+        """当前**生效**的 worker 列表（W1..W{active_worker_count}）。
+
+        必须按 active_worker_count 截断，而不是返回 workers 字典的全部内容：
+        workers 只增不减（保留旧 worker 的日志供回看），若直接暴露全部，用户把
+        max_workers 从 4 调回 1 做应急回滚后，前端仍会看到 4 个 worker 而渲染
+        并行分栏布局，回滚等于失效。"""
+        limit = count if count is not None else self.active_worker_count
+        return [self.workers[f'W{i}'] for i in range(1, limit + 1)
+                if f'W{i}' in self.workers]
 
     # ---------- 聚合日志 ----------
 
@@ -348,8 +357,11 @@ class AppState:
                 # 没绑掉的卡退回 pending，交给下一个账号
                 card_binding_model.release_unused(task_id, worker.worker_id)
 
-            # 间隔等待（每个 worker 独立计时，保留原有的反封控节奏）
-            if not self.stop_requested:
+            # 间隔等待（每个 worker 独立计时，保留原有的反封控节奏）。
+            # 必须先确认卡池还有剩余：否则本 worker 在卡池耗尽后仍会空等一轮，
+            # 并发时每个 worker 各等一次，纯属浪费。
+            remaining = card_binding_model.get_pending(task_id)
+            if remaining and not self.stop_requested:
                 wait_time = random.randint(cfg.batch.interval_min, cfg.batch.interval_max)
                 self._hooked_print(f"等待 {wait_time} 秒后注册下一个账号...")
                 for _ in range(wait_time):
@@ -554,8 +566,11 @@ class AppState:
         totals_lock = threading.Lock()
 
         def _bump(name, delta=1):
+            """自增并返回自增后的值——调用方要打印计数时必须用返回值，
+            事后再读会拿到别的 worker 又推高的数字。"""
             with totals_lock:
                 counters[name] = counters.get(name, 0) + delta
+                return counters[name]
 
         counters = {}
 
@@ -637,7 +652,6 @@ class AppState:
                         self._hooked_print(f"{email} 正被占用，跳过")
                         return
 
-                    claimed = []
                     try:
                         # 领定额而非全量：并发下必须先占位，否则两个 worker 会绑同一批卡
                         claimed = card_binding_model.claim_batch(
@@ -666,10 +680,12 @@ class AppState:
                                 counters['bind_fail_streak'] = 0
                             self._hooked_print(f"{email} 补绑了 {bound_count} 张卡")
                         elif not login_ok:
-                            _bump('bind_fail_streak')
+                            # 取 _bump 返回的自增后值，而非事后再读——并发下事后读会
+                            # 拿到别的 worker 又推高的数字，日志里出现跳号
+                            streak = _bump('bind_fail_streak')
                             self._hooked_print(
                                 f"{email} 登录失败"
-                                f"（{counters['bind_fail_streak']}/{max_consecutive_failures}），"
+                                f"（{streak}/{max_consecutive_failures}），"
                                 f"卡退回卡池待下个账号")
                         else:
                             self._hooked_print(f"{email} 无需补绑或账单页异常")
@@ -680,25 +696,27 @@ class AppState:
                         _bump('bind_fail_streak')
                         self._hooked_print(f"补绑 {email} 出错: {e}")
                     finally:
-                        # 未用掉的卡退回 pending，供后续账号消费
-                        if claimed:
-                            card_binding_model.release_unused(task_id, worker.worker_id)
+                        # 未用掉的卡退回 pending，供后续账号消费。
+                        # 无条件调用：claim_batch 是「先 UPDATE 占位、再 SELECT 回读」，
+                        # 若回读阶段抛异常，卡已占位但局部变量为空，加条件判断反而会漏放。
+                        card_binding_model.release_unused(task_id, worker.worker_id)
                         self.account_registry.release(email)
 
-                if pool.is_serial:
-                    pool.map(candidates, _bind_one)
-                else:
+                if not pool.is_serial:
                     self.current_action = f"阶段1a 并发补绑（{len(candidates)} 个账号 / {pool.max_workers} worker）"
-                    pool.map(candidates, _bind_one)
+                pool.map(candidates, _bind_one)
                 bind_success_total += counters.get('bind_success', 0)
                 if counters.get('bind_fail_streak', 0) >= max_consecutive_failures:
                     self._hooked_print(f"补绑连续失败达到 {max_consecutive_failures} 次，已结束补绑阶段")
 
             # ===== 阶段1b：注册新号消耗剩余卡 =====
             if task_id and not self.stop_requested:
-                remaining = card_binding_model.get_pending(task_id)
+                # 按「未完成」口径（pending + processing）判断，与 get_summary 一致。
+                # 若只看 pending，阶段1a 万一有卡泄漏在 processing，这里会误判为
+                # 卡池已空而整个跳过注册阶段，那批卡要等 20 分钟回收时早已收尾。
+                remaining = card_binding_model.get_summary(task_id)['pending']
                 if remaining:
-                    self._hooked_print(f"\n{'=' * 50}\n阶段1b：注册新号（剩余 {len(remaining)} 张卡）\n{'=' * 50}")
+                    self._hooked_print(f"\n{'=' * 50}\n阶段1b：注册新号（剩余 {remaining} 张卡）\n{'=' * 50}")
                     self._register_bind_loop(task_id, cf_password, max_bindable_cards,
                                              captcha_api_key, pool=pool)
                 else:
