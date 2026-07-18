@@ -16,9 +16,11 @@ release/
 data/cloudflare_auto.db
 data/cloudflare_auto.db-shm
 data/cloudflare_auto.db-wal
+data/cloudflare_auto.db.bak-*
 data/profiles/
 data/uploads/
 registered_accounts.txt.migrated
 *.xlsx
 *.iml
 =*
+*.log
