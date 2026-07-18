@@ -26,7 +26,7 @@ from src.models.invoice_payment_state import InvoicePaymentStateModel
 from src.services import registration, card as card_service
 from src.api.routes import api
 from src.web.worker import (
-    WorkerState, WorkerPool, AccountRegistry, PaymentCardRegistry,
+    WorkerState, WorkerPool, AccountRegistry, PaymentCardRegistry, ClaimReaper,
     get_current_worker,
 )
 
@@ -1018,10 +1018,25 @@ def create_app(db_path=None):
     # 创建应用状态
     state = AppState(db, models)
 
+    # 进程重启意味着所有 worker 都已消失，其领取的卡必须无条件释放，
+    # 否则会永远停在 processing 把卡池慢慢吃空。
+    try:
+        reset = models['card_binding'].reset_all_processing()
+        if reset:
+            state.add_log(f"[启动] 重置了 {reset} 张上次运行残留的已领取卡")
+    except Exception as e:
+        state.add_log(f"[启动] 重置残留卡失败: {e}")
+
+    # 回收失联 worker 领取的卡（运行中的超时兜底）
+    reaper = ClaimReaper(models['card_binding'], state,
+                         cfg.concurrency.claim_timeout_minutes)
+    reaper.start()
+
     # 注入到 Flask app config
     app.config['DB'] = db
     app.config['MODELS'] = models
     app.config['APP_STATE'] = state
+    app.config['REAPER'] = reaper
 
     # 注册蓝图
     app.register_blueprint(api)

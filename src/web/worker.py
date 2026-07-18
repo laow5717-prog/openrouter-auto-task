@@ -271,6 +271,58 @@ class WorkerState:
         self.current_action = "空闲"
 
 
+class ClaimReaper:
+    """回收失联 worker 领取的卡。
+
+    worker 崩溃或卡死时，它领取的卡会永远停在 processing，卡池被慢慢吃空。
+    本线程周期性把超时的记录退回 pending。
+
+    已知限制：无法区分"worker 已死"与"worker 很慢"。若某账号处理耗时超过阈值
+    而 worker 仍活着，其卡会被回收并可能被另一 worker 重复尝试——不会写坏数据
+    （mark_success 按 binding_id 更新），最坏是浪费一次绑卡机会。彻底杜绝需要
+    worker 心跳续期，本期未做。阈值默认 20 分钟，应显著大于单账号正常耗时。
+    """
+
+    INTERVAL_SECONDS = 60
+
+    def __init__(self, card_binding_model, app_state, timeout_minutes):
+        self.card_binding_model = card_binding_model
+        self.app_state = app_state
+        self.timeout_minutes = timeout_minutes
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name='claim-reaper')
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def reap_once(self):
+        """执行一次回收，返回回收行数。异常不外溢——回收失败不该拖垮服务。"""
+        try:
+            n = self.card_binding_model.reap_stale(self.timeout_minutes)
+            if n:
+                self.app_state.add_log(
+                    f"[回收] {n} 张卡领取超过 {self.timeout_minutes} 分钟无进展"
+                    f"（worker 疑似失联），已重置为 pending")
+            return n
+        except Exception as e:
+            self.app_state.add_log(f"[回收] 执行失败: {e}")
+            return 0
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._stop.wait(self.INTERVAL_SECONDS)
+            if self._stop.is_set():
+                break
+            self.reap_once()
+
+
 MIN_WORKERS = 1
 MAX_WORKERS = 4        # 有头 Chrome 每实例约 300-500MB，再高内存与风控都吃不消
 
