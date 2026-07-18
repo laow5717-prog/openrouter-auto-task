@@ -34,6 +34,11 @@ def get_models():
 
 @api.route('/api/status')
 def get_status():
+    """全局状态 + 各 worker 概览。
+
+    向后兼容：顶层字段全部保留原语义，workers 数组是新增的旁挂字段。
+    串行运行时 workers 只有 W1，顶层 current_action 即 W1 的动作。
+    """
     state = get_app_state()
     models = get_models()
 
@@ -46,6 +51,35 @@ def get_status():
         "fail": state.fail_count,
         "total_inventory": total_inventory,
         "logs": state.get_logs(int(request.args.get('log_index', 0))),
+        "parallel_mode": state.parallel_mode,
+        "workers": [
+            {
+                "id": w.worker_id,
+                "current_action": w.current_action,
+                "busy": w.busy,
+                "log_seq": w.log_seq,
+            }
+            for w in state.active_workers()
+        ],
+    })
+
+
+@api.route('/api/workers/<worker_id>/logs')
+def get_worker_logs(worker_id):
+    """按 worker 增量拉取日志。
+
+    index 传上次返回的 next_index；worker 不存在时回落到主 worker，
+    保证前端在 worker 数变化时不会拿到 404。
+    """
+    state = get_app_state()
+    worker = state.get_worker(worker_id)
+    logs, next_index = worker.get_logs(int(request.args.get('index', 0)))
+    return jsonify({
+        "worker_id": worker.worker_id,
+        "logs": logs,
+        "next_index": next_index,
+        "current_action": worker.current_action,
+        "busy": worker.busy,
     })
 
 

@@ -35,6 +35,7 @@
         <option value="success">成功</option>
         <option value="failed">失败</option>
         <option value="pending">待处理</option>
+        <option value="processing">处理中</option>
       </select>
       <div class="filter-sep"></div>
       <input type="date" v-model="filters.date_from" class="filter-date" title="开始日期">
@@ -115,7 +116,12 @@ const summary = reactive({ total: 0, success: 0, failed: 0, pending: 0 })
 const filters = reactive({ keyword: '', status: '', date_from: '', date_to: '' })
 
 function statusClass(s) { return s === 'success' ? 'success' : s === 'failed' ? 'fail' : '' }
-function statusText(s) { return s === 'success' ? '成功' : s === 'failed' ? '失败' : '待处理' }
+function statusText(s) {
+  if (s === 'success') return '成功'
+  if (s === 'failed') return '失败'
+  if (s === 'processing') return '处理中'   // 已被某个 worker 领取，尚未结算
+  return '待处理'
+}
 
 async function loadData() {
   loading.value = true

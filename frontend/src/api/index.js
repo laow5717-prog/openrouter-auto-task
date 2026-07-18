@@ -41,6 +41,8 @@ async function postBlob(url, body = {}) {
 
 // Status
 export const getStatus = (logIndex = 0) => get('/api/status', { log_index: logIndex })
+export const getWorkerLogs = (workerId, index = 0) =>
+  get(`/api/workers/${workerId}/logs`, { index })
 
 // Task control
 export const startTask = (data) => post('/api/start', data)

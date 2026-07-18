@@ -22,9 +22,15 @@
     <div class="panel">
       <div class="panel-header">
         <div class="panel-title"><span>&#128250;</span> 实时画面</div>
-        <span class="status-pill" :class="store.isRunning ? 'success' : 'neutral'">
-          {{ store.isRunning ? 'LIVE' : 'OFFLINE' }}
-        </span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <!-- 并发时画面只能显示一个 worker，显式让用户选，避免以为只跑了一个 -->
+          <select v-if="store.workers.length > 1" v-model="selectedWorker" class="worker-select">
+            <option v-for="w in store.workers" :key="w.id" :value="w.id">{{ w.id }}</option>
+          </select>
+          <span class="status-pill" :class="store.isRunning ? 'success' : 'neutral'">
+            {{ store.isRunning ? 'LIVE' : 'OFFLINE' }}
+          </span>
+        </div>
       </div>
       <div class="monitor-body">
         <img v-if="store.isRunning" class="monitor-img" :src="videoFeedUrl" alt="Monitor">
@@ -46,12 +52,16 @@
 </template>
 
 <script setup>
-import { ref, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { useAppStore } from '../stores/app'
 
 const store = useAppStore()
 const logContainer = ref(null)
-const videoFeedUrl = '/video_feed'
+const selectedWorker = ref('W1')
+// 单 worker 时不带参数，与改造前的 URL 完全一致
+const videoFeedUrl = computed(() =>
+  store.workers.length > 1 ? `/video_feed?worker=${selectedWorker.value}` : '/video_feed'
+)
 
 watch(() => store.logs.length, () => {
   nextTick(() => {
@@ -98,4 +108,13 @@ watch(() => store.logs.length, () => {
   padding: 2px 0;
 }
 .log-placeholder { color: #666; text-align: center; margin-top: 20px; }
+
+.worker-select {
+  padding: 2px 6px;
+  font-size: 11px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #374151;
+}
 </style>

@@ -66,8 +66,9 @@
     </div>
   </div>
 
-  <!-- 实时监控 -->
-  <div class="split-view">
+  <!-- 实时监控：单 worker 时为原来的「画面 + 日志」双栏；
+       多 worker 时每个 worker 一栏，各自画面与日志上下排列 -->
+  <div v-if="!isParallel" class="split-view">
     <div class="panel">
       <div class="panel-header">
         <div class="panel-title"><Icon name="monitor" size="18" /> 实时画面</div>
@@ -92,10 +93,32 @@
       </div>
     </div>
   </div>
+
+  <div v-else class="worker-grid" :style="{ gridTemplateColumns: `repeat(${appStore.workers.length}, minmax(0, 1fr))` }">
+    <div v-for="w in appStore.workers" :key="w.id" class="panel worker-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <Icon name="monitor" size="16" /> {{ w.id }}
+        </div>
+        <span class="status-pill" :class="w.busy ? 'success' : 'neutral'">
+          {{ w.busy ? 'LIVE' : 'IDLE' }}
+        </span>
+      </div>
+      <div class="worker-action" :title="w.currentAction">{{ w.currentAction }}</div>
+      <div class="monitor-body worker-monitor">
+        <img v-if="w.busy" class="monitor-img" :src="`/video_feed?worker=${w.id}`" :alt="w.id">
+        <div v-else style="color:#666;font-size:12px">等待信号...</div>
+      </div>
+      <div class="log-body worker-log">
+        <div v-if="w.logs.length === 0" class="log-placeholder">> 准备就绪...</div>
+        <div v-for="(log, i) in w.logs" :key="i" class="log-entry">{{ log }}</div>
+      </div>
+    </div>
+  </div>
 </template>
 
 <script setup>
-import { ref, watch, nextTick, onMounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
 import { getCardGroups, startDailyPipeline, stopTask } from '../api'
@@ -109,11 +132,26 @@ const paymentGroups = ref([])
 const logContainer = ref(null)
 const videoFeedUrl = '/video_feed'
 
+// 只有真正多开 worker 时才切分栏布局，串行时保持原有的双栏视觉
+const isParallel = computed(() => appStore.workers.length > 1)
+
 watch(() => appStore.logs.length, () => {
   nextTick(() => {
     if (logContainer.value) logContainer.value.scrollTop = logContainer.value.scrollHeight
   })
 })
+
+// 分栏模式下各 worker 日志区各自滚到底
+watch(
+  () => appStore.workers.map((w) => w.logs.length).join(','),
+  () => {
+    nextTick(() => {
+      document.querySelectorAll('.worker-log').forEach((el) => {
+        el.scrollTop = el.scrollHeight
+      })
+    })
+  }
+)
 
 async function loadGroups() {
   try {
@@ -239,4 +277,36 @@ onMounted(loadGroups)
   padding: 2px 0;
 }
 .log-placeholder { color: #666; text-align: center; margin-top: 20px; }
+
+/* 并发分栏：列数由 worker 数驱动（内联 style），每栏内部画面在上、日志在下 */
+.worker-grid {
+  display: grid;
+  gap: 16px;
+  height: 460px;
+}
+.worker-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;          /* 允许栏位收窄，避免长日志把网格撑破 */
+}
+.worker-action {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: #555;
+  background: #f9fafb;
+  border-bottom: 1px solid #e5e7eb;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.worker-monitor {
+  flex: 0 0 45%;
+  min-height: 0;
+}
+.worker-log {
+  flex: 1;
+  min-height: 0;
+  font-size: 11px;
+  padding: 10px;
+}
 </style>
