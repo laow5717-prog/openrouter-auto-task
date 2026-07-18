@@ -66,6 +66,10 @@ class AppState:
         self.workers = {self.PRIMARY_WORKER_ID: WorkerState(self.PRIMARY_WORKER_ID)}
         self._workers_lock = threading.Lock()
 
+        # 是否处于并行模式（由 WorkerPool 依 max_workers 设置）。仅影响聚合日志
+        # 是否带 [Wn] 前缀，使串行输出与改造前逐字一致。
+        self.parallel_mode = False
+
         # 并发排他：账号（Chrome profile 单实例约束）与支付卡（选卡闸门时间差）
         self.account_registry = AccountRegistry(self)
         self.payment_registry = PaymentCardRegistry()
@@ -166,7 +170,8 @@ class AppState:
         w = get_current_worker()
         if w is not None:
             w.add_log(msg)
-            self.add_log(f"[{w.worker_id}] {msg}")
+            # 串行时不加前缀：聚合流与改造前逐字一致（parallel_mode 由 WorkerPool 设置）
+            self.add_log(f"[{w.worker_id}] {msg}" if self.parallel_mode else msg)
         else:
             self.add_log(msg)
         import builtins

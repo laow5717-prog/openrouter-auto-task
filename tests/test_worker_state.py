@@ -43,6 +43,7 @@ def test_logs_are_isolated_between_workers():
 
 def test_aggregate_stream_tags_worker_id():
     st = _state()
+    st.parallel_mode = True          # 前缀仅在并行时添加
     w1, w2 = st.ensure_workers(2)
     barrier = threading.Barrier(3)
 

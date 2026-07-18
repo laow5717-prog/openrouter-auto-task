@@ -269,3 +269,139 @@ class WorkerState:
         """一轮工作开始前清理上轮残留（帧/action），日志保留供回看。"""
         self.update_frame(None)
         self.current_action = "空闲"
+
+
+MIN_WORKERS = 1
+MAX_WORKERS = 4        # 有头 Chrome 每实例约 300-500MB，再高内存与风控都吃不消
+
+
+def clamp_workers(n, log=None):
+    """把配置的并发度夹到 [1, 4]，越界时说明原因。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = MIN_WORKERS
+    clamped = max(MIN_WORKERS, min(MAX_WORKERS, n))
+    if clamped != n and log:
+        log(f"并发度 {n} 超出允许范围 {MIN_WORKERS}-{MAX_WORKERS}，已调整为 {clamped}")
+    return clamped
+
+
+class WorkerPool:
+    """把工作分发给多个 worker 线程执行。
+
+    max_workers=1 时走**同线程直接调用**分支，不创建任何线程——串行等价性由
+    结构保证，而不是靠"线程池恰好只有一个线程"这种偶然。
+    """
+
+    def __init__(self, app_state, max_workers):
+        self.app_state = app_state
+        self.max_workers = clamp_workers(max_workers, log=app_state.add_log)
+        self.workers = app_state.ensure_workers(self.max_workers)
+        # 串行时聚合日志不加 [Wn] 前缀，保持与改造前逐字一致；
+        # 并行时必须加，否则聚合流里分不清哪条来自哪个浏览器。
+        app_state.parallel_mode = not self.is_serial
+
+    @property
+    def is_serial(self):
+        return self.max_workers == 1
+
+    def _run_in_worker(self, worker, fn, *args):
+        """worker 线程体：绑定上下文 → 执行 → 收尾。
+
+        绑定必须在这里做：contextvars 不跨线程继承，漏掉的话该 worker 的日志
+        会落到聚合流而不是它自己的分栏。
+
+        用 token 复位而非直接 set(None)：串行分支跑在协调线程上，若不复位，
+        绑定会泄漏到后续阶段，让阶段之间的日志被错记到 W1 名下。"""
+        token = _current_worker.set(worker)
+        worker.busy = True
+        try:
+            return fn(worker, *args)
+        finally:
+            worker.busy = False
+            worker.current_action = "空闲"
+            worker.stop_screenshot_loop()
+            worker.clear_active_driver()
+            _current_worker.reset(token)
+
+    def map(self, items, fn):
+        """把 items 分发给 worker 并发执行，**全部完成后**返回结果列表（barrier）。
+
+        结果与 items 顺序一一对应；某项抛异常时该位置为 None，不影响其它项
+        （异常已在 worker 内被吞掉并记日志——一个账号失败不该拖垮整批）。
+        """
+        items = list(items)
+        if not items:
+            return []
+
+        results = [None] * len(items)
+        next_index = [0]
+        index_lock = threading.Lock()
+
+        def consume(worker):
+            while True:
+                with index_lock:
+                    if next_index[0] >= len(items):
+                        return
+                    i = next_index[0]
+                    next_index[0] += 1
+                results[i] = self._safe_call(worker, fn, items[i])
+
+        self._dispatch(consume)
+        return results
+
+    def run_until_empty(self, produce, fn):
+        """无界模式：worker 反复调 produce() 领取下一份工作，返回 None 则退出。
+
+        用于事先不知道总量的场景（如"注册新号直到卡池耗尽"）。produce 必须是
+        线程安全的——通常它就是一次原子的 claim_batch。
+        """
+        results = []
+        results_lock = threading.Lock()
+
+        def consume(worker):
+            while True:
+                item = produce()
+                if item is None:
+                    return
+                r = self._safe_call(worker, fn, item)
+                with results_lock:
+                    results.append(r)
+
+        self._dispatch(consume)
+        return results
+
+    def _dispatch(self, consume):
+        """把 consume(worker) 跑在每个 worker 上，等全部结束。
+
+        串行时直接同线程调用，不创建线程——这是 max_workers=1 与改造前等价的
+        结构性保证。"""
+        if self.is_serial:
+            self._run_in_worker(self.workers[0], consume)
+            return
+
+        threads = [
+            threading.Thread(target=self._run_in_worker, args=(w, consume),
+                             daemon=True, name=f'pool-{w.worker_id}')
+            for w in self.workers
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    def _safe_call(self, worker, fn, item):
+        """执行单项工作，异常不外溢。
+
+        InterruptedError 是用户停止，转成全局 stop_requested 让其它 worker 也收敛；
+        其它异常只记日志——单个账号出错不应终止整批。"""
+        try:
+            return fn(worker, item)
+        except InterruptedError:
+            self.app_state.stop_requested = True
+            self.app_state.dispatch_print("已中断")
+            return None
+        except Exception as e:
+            self.app_state.dispatch_print(f"处理出错: {e}")
+            return None
