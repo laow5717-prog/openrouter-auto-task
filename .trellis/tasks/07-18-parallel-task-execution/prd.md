@@ -68,17 +68,36 @@
 
 ## Acceptance Criteria
 
-- [ ] AC1 `config.yaml` 设 `max_workers: 2` 启动流水线，实际同时出现 2 个 Chrome 窗口，各自处理**不同**账号。
-- [ ] AC2 并发跑完一轮后，`card_bindings` 中不存在任何一张卡被两个不同 email 绑定成功的记录。
-- [ ] AC3 `max_workers=1` 跑完整流水线，结果与改造前一致（账号数、绑卡数、充值数）。
-- [ ] AC4 人为 kill 掉一个 worker 持有的 Chrome 进程，其领取的卡在 `claim_timeout_minutes` 后自动回到 `pending`，并被后续 worker 正常消费。
-- [ ] AC5 服务重启后，残留 `processing` 记录全部回到 `pending`，日志中有回收记录。
-- [ ] AC6 并发运行时，前端分栏展示 2 个 worker，两栏日志内容互不混杂，两栏截图分别对应各自浏览器。
-- [ ] AC7 并发运行中点击停止，两个浏览器都在检查点安全退出并关闭，无残留 Chrome 进程，无卡死。
-- [ ] AC8 尝试让两个 worker 领取同一 email 时被排他机制拒绝（单元测试或日志验证）。
-- [ ] AC9 阶段 2 并发运行时，单个账号在同一轮次内只被推进一次（不出现同账号同轮生成多张账单）。
+图例：**[自动]** 已由测试覆盖 · **[待实跑]** 需真实浏览器，只能由用户验证
+
+已通过：
+
+- [x] AC2 **[自动]** 无一张卡被两个 email 绑定成功。
+      → `test_daily_pipeline.py::test_pipeline_completes_in_parallel` 断言 `dupes == 0`
+- [x] AC3 **[自动/部分]** 串行与并行最终账面一致（成功数/失败数/账号数）。
+      → `test_serial_and_parallel_produce_same_ledger`。**仅覆盖账面**，真实浏览器行为仍靠 AC1 佐证
+- [x] AC5 **[自动]** 重启后残留 `processing` 全部回到 `pending` 且有日志。
+      → `test_reaper.py::test_startup_resets_leftover_processing`
+- [x] AC8 **[自动]** 同一 email 的并发领取被拒。
+      → `test_registry.py`；已做变异验证：删掉排他逻辑后该文件 4 项断言变红
+- [x] AC9 **[结构保证]** 阶段 2 单账号一轮内只推进一次。
+      → `pool.map` 的 barrier 语义 + 每轮账号列表无重复；调度语义由 `test_map_is_a_barrier` 覆盖
+
+待用户实跑（自动化测试全部打桩了浏览器，以下无法在测试中体现）：
+
+- [ ] AC1 **[待实跑]** `max_workers: 2` 时确实出现 2 个 Chrome 窗口，各自处理不同账号。
+- [ ] AC4 **[待实跑]** kill 掉一个 worker 的 Chrome 后，其卡在 20 分钟后回到 `pending` 并被消费。
+      回收逻辑本身已由 `test_reaper.py` 覆盖；待验的是"Chrome 被 kill 后 worker 确实会失联"这一前提。
+- [ ] AC6 **[待实跑]** 前端两栏日志互不混杂、截图分别对应各自浏览器。
+      日志隔离已由 `test_api_workers.py` 覆盖；待验的是真实截图流与视觉呈现。
+- [ ] AC7 **[待实跑]** 并发中点停止，两个浏览器都安全退出关闭，无残留 Chrome 进程，无卡死。
 
 ## Open Questions
 
-- OQ1 `claim_timeout_minutes` 默认 20 分钟是否符合真实单账号处理耗时？需实跑一轮统计 P95 后确认。
-- OQ2 并发是否会因同 IP 请求密度上升触发 Cloudflare 风控？需 `max_workers=2` 实跑观察，必要时在 R6 基础上加全局节流。
+两个都**仍未解决**，且都只能靠实跑回答：
+
+- OQ1 `claim_timeout_minutes` 默认 20 分钟是否匹配真实单账号耗时？需跑一轮统计 P95。
+      定小了会误伤慢 worker（见 design §5 已知限制），定大了失联恢复变慢。
+- OQ2 并发是否会因同 IP 请求密度上升触发 Cloudflare 风控？
+      **这是本次改造最大的未知数**——所有测试都打桩掉了浏览器，风控行为无从体现。
+      若触发，缓解顺序：降 `max_workers` 到 1 → 加大 `batch.interval_*` → 在 R6 基础上加全局节流。

@@ -30,10 +30,33 @@
 | task_id | INTEGER | Groups cards by task batch |
 | card_display | TEXT | Last 4 digits |
 | card_data_json | TEXT | Full card info as JSON |
-| status | TEXT | pending, success, failed |
+| status | TEXT | pending, **processing**, success, failed |
 | bound_to_email | TEXT | Which account it's bound to |
 | error | TEXT | Error message if failed |
 | attempted_at | TEXT | datetime string |
+| worker_id | TEXT | Which worker claimed it (parallel execution) |
+| claimed_at | TEXT | When it was claimed; used for stale-claim reaping |
+
+#### `card_bindings` status machine
+
+```
+pending --claim_batch--> processing --> success | failed
+   ^                          |
+   +--release_unused / reap_stale
+```
+
+**Counting rule**: `pending` in `get_summary()` / `get_global_summary()` means
+*not finished* — it counts `pending + processing`. A separate `processing` field
+carries the detail. Anything asking "are there cards left to do?" must use this
+combined figure, never `WHERE status='pending'` alone: cards held by a live
+worker are still outstanding work.
+
+**Claiming must be atomic.** Never `SELECT` then `UPDATE` — two workers will
+select the same rows. Use `CardBindingModel.claim_batch()`, which does the
+select-and-mark in one statement. This is safe because `Database` shares a
+single connection behind one `threading.Lock`, so each `execute()` is
+serialized. **If that ever changes** (connection pool, multi-process), rewrite
+`claim_batch` with an explicit `BEGIN IMMEDIATE` transaction.
 
 ## Query Patterns
 

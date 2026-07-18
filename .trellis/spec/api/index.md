@@ -31,7 +31,8 @@ All paginated endpoints follow the same pattern:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/status` | Task status, logs |
+| GET | `/api/status` | Task status, aggregate logs, per-worker overview |
+| GET | `/api/workers/<id>/logs` | Incremental per-worker logs (`?index=`) |
 | POST | `/api/start` | Start batch registration |
 | POST | `/api/stop` | Stop running task |
 | GET | `/api/card/template` | Download card Excel template |
@@ -52,6 +53,33 @@ All paginated endpoints follow the same pattern:
 All automation endpoints (`/api/start`, `/api/card/start*`, `/api/accounts/recharge`,
 `/api/daily/start`) share one global lock and one worker-thread lifecycle. Follow it exactly
 or the app deadlocks the next task.
+
+The `is_running` lock still admits **one task at a time**. Parallelism happens
+*inside* the daily pipeline, across browser workers — it does not let two
+endpoints run concurrently. See
+[concurrency-guidelines.md](../backend/concurrency-guidelines.md).
+
+### Status payload and backward compatibility
+
+`/api/status` keeps every legacy top-level field (`is_running`,
+`current_action`, `success`, `fail`, `total_inventory`, `logs`). Parallel
+execution is exposed as **additive** fields only:
+
+```json
+{
+  "parallel_mode": true,
+  "workers": [{"id": "W1", "current_action": "…", "busy": true, "log_seq": 142}]
+}
+```
+
+- `logs` stays the aggregate stream. In parallel mode each line is prefixed
+  `[Wn]`; in serial mode it is byte-identical to before.
+- `workers` is truncated to the **current** concurrency, not every worker ever
+  created — otherwise dropping `max_workers` back to 1 still looks parallel.
+- `/api/workers/<id>/logs` falls back to the primary worker for unknown ids
+  instead of 404ing; the frontend may request an id that just disappeared.
+- `/video_feed` without `?worker=` serves the primary worker, so the old URL
+  keeps working.
 
 ### Signatures
 
