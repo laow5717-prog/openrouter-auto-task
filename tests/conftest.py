@@ -14,6 +14,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models.database import Database          # noqa: E402
 from src.models.card_binding import CardBindingModel  # noqa: E402
 from src.models.task import TaskModel             # noqa: E402
+from src.web.worker import _current_worker        # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_worker_binding():
+    """清除主线程上残留的 worker 绑定。
+
+    contextvars 不跨线程继承，但**同一线程内会持续存在**。测试在主线程直接调
+    bind_current_worker 时，绑定会泄漏到后续用例，让"未绑定线程"的断言误红。
+    生产环境不受影响——主线程是协调线程，从不绑定 worker。
+    """
+    yield
+    _current_worker.set(None)
 
 
 @pytest.fixture

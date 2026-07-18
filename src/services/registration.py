@@ -391,7 +391,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
                      should_stop=None, card_binding_model=None, card_state_model=None,
-                     invoice_daily_cap=None, invoice_state_model=None):
+                     invoice_daily_cap=None, invoice_state_model=None,
+                     payment_registry=None):
     """
     登录已有 Cloudflare 账号并充值 AI Credits $10
 
@@ -402,6 +403,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         monitor_callback: 监控回调 (driver, step_name)
         skip_invoice: 是否跳过 Unpaid invoice 在线支付（未选择支付卡分组时为 True）
         payment_cards: 支付卡数据列表（用于在线支付填写信用卡信息）
+        payment_registry: PaymentCardRegistry，并行执行时用于在多个 worker 之间
+                  排他占用支付卡。为 None（串行路径）时选卡行为与从前逐行一致。
         valid_card_model: ValidCardModel，支付成功后记录有效卡（source_type=payment）
         card_pool_model: CardPoolModel，支付成功后把底料卡状态标为 'paid'
         account_model: AccountModel，每笔发票支付成功后记录该账号最新的 Credits 余额
@@ -423,6 +426,9 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                           "failed"=失败或异常。
     """
     driver = None
+    # 本账号在 payment_registry 中占住的卡号，供 finally 统一释放。
+    # 定义在 try 之前：任何早期异常也必须能走到释放逻辑。
+    _claimed_numbers = set()
 
     def _report(step_name):
         if monitor_callback and driver:
@@ -483,13 +489,31 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         _new_cards = [c for c in _all_cards if c.get('number') not in _paid_numbers]
         _sel = {'new_idx': 0, 'reuse_idx': 0, 'last': None}
 
+        def _claim(card):
+            """并发下占住这张卡；payment_registry 为 None（串行路径）时直接放行。
+
+            上面的资格闸门（_eligible）全部从 DB 实时派生，且 _eligible_cards 是
+            进入本函数时的一次性快照。并发时两个 worker 会同时把同一张卡判为合格，
+            各自拿去给不同账号支付，等 DB 记录写下时"一卡绑一账号"已被违反。
+            payment_registry 补的就是"判定合格"到"写入结果"之间的时间差窗口。
+            占用在本账号处理结束时统一释放（见函数末尾 finally）。"""
+            if card is None or payment_registry is None:
+                return card
+            num = card.get('number', '')
+            if payment_registry.try_acquire(num, email):
+                _claimed_numbers.add(num)
+                return card
+            return None                    # 被其它 worker 占用 → 视作不可用，继续找下一张
+
         def _get_card():
             # 1) 未满 20 且有新卡 → 用新卡（成功后成为一张新的 distinct 卡）
             while len(_paid_numbers) < CARD_CAP and _sel['new_idx'] < len(_new_cards):
                 c = _new_cards[_sel['new_idx']]
                 _sel['new_idx'] += 1
                 if c.get('number') not in _invalid_numbers:
-                    return c
+                    got = _claim(c)
+                    if got is not None:
+                        return got
             # 2) 已满 20 或无新卡 → 复用该账号已支付过、且在当前分组内的卡（轮换、避开连续同卡）
             reuse_pool = [c for c in _all_cards
                           if c.get('number') in _paid_numbers
@@ -501,8 +525,10 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 c = reuse_pool[_sel['reuse_idx'] % n]
                 _sel['reuse_idx'] += 1
                 if n == 1 or c.get('number') != _sel['last']:
-                    return c
-            return reuse_pool[0]
+                    got = _claim(c)
+                    if got is not None:
+                        return got
+            return _claim(reuse_pool[0])
 
         def _on_invoice_paid(invoice_id, card, responses, amt, balance=None):
             """每笔发票支付成功后：更新选卡状态 + 记账（recharge_log + valid_cards + card_pool）
@@ -970,6 +996,12 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         return False, str(e), [], '', "failed"
 
     finally:
+        # 释放本账号占用的支付卡。粒度是"整个账号处理期间"而非"单笔支付"：
+        # 一张卡在同一账号内可能被复用多次，逐笔释放会在两笔之间留出窗口让别的
+        # worker 抢走，"一卡绑一账号"就守不住了。
+        if payment_registry is not None:
+            for _num in _claimed_numbers:
+                payment_registry.release(_num)
         if driver:
             print("正在关闭浏览器...")
             close_driver(driver)

@@ -361,10 +361,6 @@ def open_account_browser():
     if not email:
         return jsonify({"error": "未指定账号"}), 400
 
-    # 该账号正在执行自动任务或已有浏览器打开
-    if email in state.open_browsers:
-        return jsonify({"error": f"{email} 已有浏览器打开"}), 400
-
     rows = models['account'].search(email)
     account = None
     for r in rows:
@@ -379,7 +375,12 @@ def open_account_browser():
     if not cf_password:
         return jsonify({"error": "该账号没有保存 CF 密码"}), 400
 
-    state.open_browsers.add(email)
+    # 预约 profile：与任务 worker 的账号占用共用一把锁，避免同一 Chrome profile
+    # 被 worker 与手动会话同时使用（会互删 Singleton 锁导致浏览器崩溃）
+    ok, reason = state.account_registry.try_open_manual(email)
+    if not ok:
+        return jsonify({"error": reason}), 409
+
     state.add_log(f"{email} 正在打开浏览器...")
 
     import threading

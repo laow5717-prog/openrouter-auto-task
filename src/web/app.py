@@ -25,7 +25,10 @@ from src.models.card_payment_state import CardPaymentStateModel
 from src.models.invoice_payment_state import InvoicePaymentStateModel
 from src.services import registration, card as card_service
 from src.api.routes import api
-from src.web.worker import WorkerState, bind_current_worker, get_current_worker
+from src.web.worker import (
+    WorkerState, AccountRegistry, PaymentCardRegistry,
+    bind_current_worker, get_current_worker,
+)
 
 
 class AppState:
@@ -62,6 +65,10 @@ class AppState:
         # worker 运行时。W1 是主 worker，恒存在。
         self.workers = {self.PRIMARY_WORKER_ID: WorkerState(self.PRIMARY_WORKER_ID)}
         self._workers_lock = threading.Lock()
+
+        # 并发排他：账号（Chrome profile 单实例约束）与支付卡（选卡闸门时间差）
+        self.account_registry = AccountRegistry(self)
+        self.payment_registry = PaymentCardRegistry()
 
     # ---------- worker 管理 ----------
 
@@ -378,6 +385,7 @@ class AppState:
                 card_state_model=models['card_state'],
                 invoice_state_model=models['invoice_state'],
                 invoice_daily_cap=(invoice_daily_cap if single_step else None),
+                payment_registry=self.payment_registry,
             )
 
             # ===== 单步（round-robin）模式 =====

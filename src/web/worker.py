@@ -35,6 +35,117 @@ def get_current_worker():
     return _current_worker.get()
 
 
+class AccountRegistry:
+    """账号（email）的运行时排他。
+
+    存在理由是硬约束而非优化：driver.py 的 _clear_singleton_locks 会无条件删除
+    Chrome profile 的 Singleton 锁，其注释明确写着"本应用通过 open_browsers 保证
+    同一 profile 单实例，可安全清理"。两个 worker 若同时使用同一 email，就会互删
+    对方的锁，导致浏览器随机崩溃。
+
+    单进程内用内存 set 即可，无需落库：进程重启意味着所有持有者都已消失。
+    """
+
+    def __init__(self, app_state):
+        self._lock = threading.Lock()
+        self._claimed = {}                 # email -> worker_id
+        self._app_state = app_state        # 读 open_browsers（用户手动打开的会话）
+
+    def claim(self, email):
+        """尝试独占一个账号。成功返回 True。
+
+        与用户手动打开的浏览器（open_browsers）互斥：那也是同一个 profile 目录。"""
+        if not email:
+            return False
+        with self._lock:
+            if email in self._claimed:
+                return False
+            if email in self._app_state.open_browsers:
+                return False
+            holder = _current_worker.get()
+            self._claimed[email] = holder.worker_id if holder else '-'
+            return True
+
+    def release(self, email):
+        with self._lock:
+            self._claimed.pop(email, None)
+
+    def try_open_manual(self, email):
+        """用户手动打开浏览器时的预约，返回 (ok, reason)。
+
+        必须与 claim() 共用同一把锁：否则"检查 worker 是否占用"与"登记
+        open_browsers"之间存在窗口，worker 可能在此期间抢占同一 profile。
+        """
+        if not email:
+            return False, "未指定账号"
+        with self._lock:
+            if email in self._claimed:
+                return False, f"{email} 正在被任务 worker 使用（{self._claimed[email]}），请等待其完成"
+            if email in self._app_state.open_browsers:
+                return False, f"{email} 已有浏览器打开"
+            self._app_state.open_browsers.add(email)
+            return True, ""
+
+    def is_claimed(self, email):
+        with self._lock:
+            return email in self._claimed
+
+    def holder_of(self, email):
+        with self._lock:
+            return self._claimed.get(email)
+
+    def release_all(self):
+        with self._lock:
+            self._claimed.clear()
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._claimed)
+
+
+class PaymentCardRegistry:
+    """支付卡的运行时排他（in-flight 登记）。
+
+    为什么需要它：registration.py 的选卡资格闸门（一卡绑一账号 / 单卡 24h≤2 次 /
+    3DS 冷却）全部从 DB 实时派生，且 _eligible_cards 是**进入时一次性快照**。
+    并发下两个 worker 会同时把同一张卡判为合格，各自拿去给不同账号支付，等 DB
+    记录写下时违规已经发生——闸门形同虚设。
+
+    本注册表补的正是"判定合格"到"写入结果"之间的时间差窗口，与 DB 派生规则叠加
+    使用（双闸门）。内存态，进程崩溃即丢，此时 DB 规则仍是第二道闸。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._in_flight = {}               # card_number -> email
+
+    def try_acquire(self, card_number, email):
+        """占用一张支付卡。已被其它账号占用则返回 False。
+
+        同一账号重复占用同一张卡视为成功（幂等），因为串行路径内允许一张卡
+        为同一账号支付多笔。"""
+        if not card_number:
+            return False
+        with self._lock:
+            holder = self._in_flight.get(card_number)
+            if holder is not None and holder != email:
+                return False
+            self._in_flight[card_number] = email
+            return True
+
+    def release(self, card_number):
+        with self._lock:
+            self._in_flight.pop(card_number, None)
+
+    def in_flight_numbers(self):
+        with self._lock:
+            return set(self._in_flight)
+
+    def release_all(self):
+        with self._lock:
+            self._in_flight.clear()
+
+
 class WorkerState:
     """单个 worker 的隔离状态。
 
