@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 27
+- **Total Sessions**: 28
 - **Last Active**: 2026-07-18
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~913 | Active |
+| `journal-1.md` | ~956 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 28 | 2026-07-18 | 每日流水线多浏览器并发执行 | `201b801`, `9c8045a`, `9211e71`, `aae2a65`, `82954ff`, `356a34e`, `bcaf8d9`, `0a0765b`, `82d9bfa`, `8908a81`, `16ac210` | `main` |
 | 27 | 2026-07-18 | 底料 xlsx 按信用卡模版合并整合 | `26bb4c2` | `main` |
 | 26 | 2026-07-17 | topup 提交后强制进账单页 + can-no-longer-be-paid 永久跳过 | `19c2a76`, `b4c1001` | `main` |
 | 25 | 2026-07-17 | 被动监听 credit-balance 接口自动更新账户余额 | `b3be806`, `ad41b69` | `main` |

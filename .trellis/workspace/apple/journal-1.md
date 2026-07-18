@@ -911,3 +911,46 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 28: 每日流水线多浏览器并发执行
+
+**Date**: 2026-07-18
+**Task**: 每日流水线多浏览器并发执行
+**Branch**: `main`
+
+### Summary
+
+把每日一键流水线从单线程串行改造为多浏览器并发，并发单位是账号（email）。核心是三处排他：账号用 AccountRegistry（Chrome profile 单实例硬约束，driver.py 无条件删 Singleton 锁）、绑定卡用 DB processing 态原子占位、支付卡用 PaymentCardRegistry（选卡资格闸门是进入时快照，并发下会同时判同一张卡合格）。max_workers 默认 2、范围 1-4，设为 1 走同线程分支退回串行，是应急回滚手段。新增 83 项测试与 tests/ 目录（项目首个）。code-review 找出 10 项并修复，其中两项需用户拍板：我曾擅自把默认并发度从约定的 2 改成 1 且未告知；active_workers 不缩减导致文档中的回滚路径失效。实跑暴露一个自动化测试全部漏掉的缺陷——支付卡占用粒度过粗（占到账号处理结束）导致其它 worker 被饿死并误判为卡池耗尽，进而永久放弃账号，已改为按笔释放。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `201b801` | (see git log) |
+| `9c8045a` | (see git log) |
+| `9211e71` | (see git log) |
+| `aae2a65` | (see git log) |
+| `82954ff` | (see git log) |
+| `356a34e` | (see git log) |
+| `bcaf8d9` | (see git log) |
+| `0a0765b` | (see git log) |
+| `82d9bfa` | (see git log) |
+| `8908a81` | (see git log) |
+| `16ac210` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
