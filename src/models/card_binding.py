@@ -39,12 +39,83 @@ class CardBindingModel:
             "SELECT * FROM card_bindings WHERE task_id=? AND status='pending' ORDER BY id",
             (task_id,),
         )
+        return self._with_parsed_card(rows)
+
+    # ==================== 并发领取（processing 中间态）====================
+    # 状态机: pending -> processing -> success | failed
+    #                        `-> pending (release_unused / reap_stale)
+    #
+    # 原子性说明：Database 全进程共享单连接 + 单个 threading.Lock（database.py），
+    # 每次 db.execute 天然串行，因此单条 UPDATE 即为原子操作，无需 BEGIN IMMEDIATE
+    # 或乐观锁重试。此前提随 Database 实现绑定——若将来改为连接池或多进程，
+    # 下列 claim_batch 必须改写为显式事务。
+
+    @staticmethod
+    def _with_parsed_card(rows):
         result = []
         for r in rows:
             d = dict(r)
             d['card'] = json.loads(d['card_data_json']) if d['card_data_json'] else {}
             result.append(d)
         return result
+
+    def claim_batch(self, task_id, worker_id, limit):
+        """原子领取至多 limit 张 pending 卡，返回该 worker 已占住的记录列表。
+
+        与 get_pending 的区别：get_pending 只读不占位，并发下多个 worker 会拿到
+        同一批卡；claim_batch 在同一条语句内完成"选中+占位"，是并发场景下的唯一
+        正确入口。"""
+        if limit <= 0:
+            return []
+        self.db.execute(
+            """UPDATE card_bindings
+               SET status='processing', worker_id=?, claimed_at=datetime('now','localtime')
+               WHERE id IN (
+                   SELECT id FROM card_bindings
+                   WHERE task_id=? AND status='pending' ORDER BY id LIMIT ?
+               )""",
+            (worker_id, task_id, limit),
+        )
+        rows = self.db.fetchall(
+            "SELECT * FROM card_bindings WHERE task_id=? AND worker_id=? AND status='processing' ORDER BY id",
+            (task_id, worker_id),
+        )
+        return self._with_parsed_card(rows)
+
+    def release_unused(self, task_id, worker_id):
+        """把该 worker 仍处于 processing 的卡退回 pending，返回释放行数。
+
+        worker 正常结束或异常退出时必须调用，否则卡会滞留到超时回收才释放。"""
+        cursor = self.db.execute(
+            """UPDATE card_bindings SET status='pending', worker_id='', claimed_at=NULL
+               WHERE task_id=? AND worker_id=? AND status='processing'""",
+            (task_id, worker_id),
+        )
+        return cursor.rowcount
+
+    def reap_stale(self, timeout_minutes):
+        """回收超时未完成的 processing 记录（worker 疑似失联），返回回收行数。
+
+        已知限制：无法区分"worker 已死"与"worker 很慢"。超时阈值需显著大于单账号
+        正常处理耗时，否则慢 worker 的卡会被回收并可能被另一 worker 重复尝试
+        （不会写坏数据——mark_success 按 binding_id 更新——但会浪费一次绑卡机会）。"""
+        cursor = self.db.execute(
+            """UPDATE card_bindings SET status='pending', worker_id='', claimed_at=NULL
+               WHERE status='processing'
+                 AND claimed_at IS NOT NULL
+                 AND claimed_at < datetime('now','localtime',?)""",
+            (f'-{int(timeout_minutes)} minutes',),
+        )
+        return cursor.rowcount
+
+    def reset_all_processing(self):
+        """启动时全量重置 processing -> pending，返回重置行数。
+
+        进程重启意味着所有 worker 都已消失，其领取的卡必须无条件释放。"""
+        cursor = self.db.execute(
+            "UPDATE card_bindings SET status='pending', worker_id='', claimed_at=NULL WHERE status='processing'"
+        )
+        return cursor.rowcount
 
     def get_all_by_task(self, task_id):
         rows = self.db.fetchall(
@@ -219,15 +290,19 @@ class CardBindingModel:
         return [dict(r) for r in rows], total
 
     def get_global_summary(self):
+        # pending 口径 = 未完成（pending + processing）。被 worker 领取的卡仍属"待处理"，
+        # 若把 processing 排除在外，前端进度会在并发运行时凭空掉数。
+        # processing 单列一项供需要区分的场景使用。
         row = self.db.fetchone(
             """SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success,
                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending
+                SUM(CASE WHEN status IN ('pending','processing') THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) as processing
             FROM card_bindings"""
         )
-        return dict(row) if row else {"total": 0, "success": 0, "failed": 0, "pending": 0}
+        return dict(row) if row else {"total": 0, "success": 0, "failed": 0, "pending": 0, "processing": 0}
 
     def get_all_filtered(self, status='', keyword='', date_from='', date_to=''):
         conditions = []
@@ -253,19 +328,21 @@ class CardBindingModel:
         return [dict(r) for r in rows]
 
     def delete_pending_by_task(self, task_id):
-        """删除指定任务的所有 pending 记录，返回删除行数"""
+        """删除指定任务的所有未完成记录（pending + processing），返回删除行数。
+
+        流水线收尾时调用，此时所有 worker 已退出，残留的 processing 等同于 pending。"""
         cursor = self.db.execute(
-            "DELETE FROM card_bindings WHERE task_id=? AND status='pending'",
+            "DELETE FROM card_bindings WHERE task_id=? AND status IN ('pending','processing')",
             (task_id,)
         )
         return cursor.rowcount
 
     def cleanup_stale_pending(self, active_task_id=None):
-        """清理属于已完成/停止/僵尸任务的 pending 记录，返回删除行数"""
+        """清理属于已完成/停止/僵尸任务的未完成记录（pending + processing），返回删除行数"""
         if active_task_id is not None:
             cursor = self.db.execute(
                 """DELETE FROM card_bindings
-                   WHERE status='pending' AND (
+                   WHERE status IN ('pending','processing') AND (
                        task_id IN (SELECT id FROM tasks WHERE status IN ('stopped', 'completed'))
                        OR (task_id IN (SELECT id FROM tasks WHERE status='running') AND task_id != ?)
                    )""",
@@ -273,18 +350,20 @@ class CardBindingModel:
             )
         else:
             cursor = self.db.execute(
-                "DELETE FROM card_bindings WHERE status='pending'"
+                "DELETE FROM card_bindings WHERE status IN ('pending','processing')"
             )
         return cursor.rowcount
 
     def get_summary(self, task_id):
+        # pending 口径同 get_global_summary：含 processing（未完成）
         row = self.db.fetchone(
             """SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success,
                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending
+                SUM(CASE WHEN status IN ('pending','processing') THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) as processing
             FROM card_bindings WHERE task_id=?""",
             (task_id,),
         )
-        return dict(row) if row else {"total": 0, "success": 0, "failed": 0, "pending": 0}
+        return dict(row) if row else {"total": 0, "success": 0, "failed": 0, "pending": 0, "processing": 0}

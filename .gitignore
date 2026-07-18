@@ -24,3 +24,4 @@ registered_accounts.txt.migrated
 *.iml
 =*
 *.log
+.pytest_cache/

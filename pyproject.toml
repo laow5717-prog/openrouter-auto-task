@@ -16,3 +16,11 @@ dependencies = [
     "undetected-chromedriver>=3.5.5",
     "waitress>=3.0.2",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
