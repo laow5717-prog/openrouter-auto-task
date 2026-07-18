@@ -25,10 +25,21 @@ from src.models.card_payment_state import CardPaymentStateModel
 from src.models.invoice_payment_state import InvoicePaymentStateModel
 from src.services import registration, card as card_service
 from src.api.routes import api
+from src.web.worker import WorkerState, bind_current_worker, get_current_worker
 
 
 class AppState:
-    """全局应用状态（运行时内存数据）"""
+    """全局应用状态（运行时内存数据）。
+
+    分层：本类持有全局聚合信息（is_running / 停止标志 / 总计数 / 聚合日志），
+    每个浏览器实例的隔离状态在 WorkerState 里（src/web/worker.py）。
+
+    始终存在一个主 worker 'W1'：串行路径（单账号充值等）与 max_workers=1 时
+    都走它，因此下列 set_active_driver / _stop_screenshot_loop / _monitor 等
+    委托方法的行为与并行化改造前完全一致。
+    """
+
+    PRIMARY_WORKER_ID = 'W1'
 
     def __init__(self, db, models):
         self.db = db
@@ -42,24 +53,47 @@ class AppState:
         self.logs = []
         self.lock = threading.Lock()
 
-        # MJPEG 流缓冲区
-        self.last_frame = None
-        self.frame_lock = threading.Lock()
-
-        # 持续截图线程
-        self._screenshot_driver = None
-        self._screenshot_thread = None
-        self._screenshot_stop = threading.Event()
-
         # 当前信用卡驱动任务 ID
         self.current_card_task_id = None
 
-        # 当前活跃的自动化 driver（用于停止时强制关闭）
-        self._active_driver = None
-        self._active_driver_lock = threading.Lock()
-
         # 按账号独立跟踪的浏览器查看会话（不阻塞全局任务）
         self.open_browsers = set()
+
+        # worker 运行时。W1 是主 worker，恒存在。
+        self.workers = {self.PRIMARY_WORKER_ID: WorkerState(self.PRIMARY_WORKER_ID)}
+        self._workers_lock = threading.Lock()
+
+    # ---------- worker 管理 ----------
+
+    @property
+    def primary_worker(self):
+        return self.workers[self.PRIMARY_WORKER_ID]
+
+    def ensure_workers(self, count):
+        """确保存在 count 个 worker（W1..Wn），返回有序列表。
+
+        只增不减：已存在的 worker 复用，保留其日志供回看。"""
+        with self._workers_lock:
+            for i in range(1, count + 1):
+                wid = f'W{i}'
+                if wid not in self.workers:
+                    self.workers[wid] = WorkerState(wid)
+            return [self.workers[f'W{i}'] for i in range(1, count + 1)]
+
+    def get_worker(self, worker_id=None):
+        """按 id 取 worker；不传或不存在时回落到主 worker（保证老接口可用）。"""
+        if not worker_id:
+            return self.primary_worker
+        return self.workers.get(worker_id, self.primary_worker)
+
+    def active_workers(self, count=None):
+        """当前对外展示的 worker 列表。count 为 None 时展示全部已创建的。"""
+        ids = sorted(self.workers, key=lambda w: int(w[1:]))
+        if count is not None:
+            ids = ids[:count]
+        return [self.workers[i] for i in ids]
+
+    # ---------- 聚合日志 ----------
 
     def add_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -72,80 +106,67 @@ class AppState:
         with self.lock:
             return list(self.logs[start_index:])
 
+    # ---------- 委托给主 worker（向后兼容的旧接口）----------
+
     def update_frame(self, frame_bytes):
-        with self.frame_lock:
-            self.last_frame = frame_bytes
+        self.primary_worker.update_frame(frame_bytes)
 
     def get_frame(self):
-        with self.frame_lock:
-            return self.last_frame
-
-    def _start_screenshot_loop(self, driver):
-        """启动后台持续截图线程"""
-        self._screenshot_driver = driver
-        self._screenshot_stop.clear()
-        if self._screenshot_thread and self._screenshot_thread.is_alive():
-            return
-
-        def _loop():
-            while not self._screenshot_stop.is_set():
-                try:
-                    d = self._screenshot_driver
-                    if d:
-                        png = d.get_screenshot_as_png()
-                        self.update_frame(png)
-                except Exception:
-                    pass
-                self._screenshot_stop.wait(0.3)
-
-        self._screenshot_thread = threading.Thread(target=_loop, daemon=True)
-        self._screenshot_thread.start()
+        return self.primary_worker.get_frame()
 
     def _stop_screenshot_loop(self):
-        """停止后台截图线程"""
-        self._screenshot_stop.set()
-        self._screenshot_driver = None
+        self.primary_worker.stop_screenshot_loop()
 
     def set_active_driver(self, driver):
-        with self._active_driver_lock:
-            self._active_driver = driver
+        self.primary_worker.set_active_driver(driver)
 
     def clear_active_driver(self):
-        with self._active_driver_lock:
-            self._active_driver = None
+        self.primary_worker.clear_active_driver()
+
+    def _monitor(self, driver, step):
+        """串行路径用的 monitor 回调（绑定到主 worker）。"""
+        return self.primary_worker.make_monitor(self)(driver, step)
+
+    # ---------- 停止 ----------
 
     def force_stop(self):
-        """协作式停止：设置标志、停截图。不从本线程 quit driver。
+        """协作式停止：设置标志、停所有 worker 的截图。不从本线程 quit driver。
 
         driver 由执行任务的工作线程持有；从请求线程跨线程 quit 会让工作线程里
         正在进行的 Patchright/Playwright sync 操作永久 hang（sync API 非线程安全，
         transport 被关后挂起的调用等不到响应）。改为设置 stop_requested，工作线程
         在各自的 should_stop / _monitor 检查点抛出中断、冒泡到其 finally 里 close_driver
         自行关闭浏览器。三条任务流程（register_one_account / register_and_bind_cards /
-        recharge_account）都有 finally close_driver，故无需在此额外 quit。"""
+        recharge_account）都有 finally close_driver，故无需在此额外 quit。
+
+        并发下同理：每个 worker 在自己的检查点退出并关自己的浏览器。"""
         self.stop_requested = True
-        self._stop_screenshot_loop()
-        # 仅解除活跃 driver 引用，不 quit（quit 交给工作线程的 finally）
-        self.clear_active_driver()
+        for w in list(self.workers.values()):
+            w.stop_screenshot_loop()
+            w.clear_active_driver()
         self.add_log("已请求停止任务（工作线程将在下个检查点安全退出并关闭浏览器）")
 
-    def _hooked_print(self, *args, **kwargs):
+    # ---------- 日志路由 ----------
+
+    def dispatch_print(self, *args, **kwargs):
+        """被劫持的 print 入口：按调用线程所属 worker 路由日志。
+
+        worker 线程内（已 bind_current_worker）→ 进该 worker 的分栏日志，
+        同时以 [Wn] 前缀进聚合流；worker 外（串行路径/请求线程）→ 只进聚合流。
+        """
         sep = kwargs.get('sep', ' ')
         msg = sep.join(map(str, args))
-        self.add_log(msg)
-        # 同时输出到终端
+        w = get_current_worker()
+        if w is not None:
+            w.add_log(msg)
+            self.add_log(f"[{w.worker_id}] {msg}")
+        else:
+            self.add_log(msg)
         import builtins
         builtins.print(*args, **kwargs)
 
-    def _monitor(self, driver, step):
-        if self.stop_requested:
-            self._hooked_print("收到停止请求，正在中断...")
-            raise InterruptedError("User requested stop")
-        # 跟踪活跃 driver
-        self.set_active_driver(driver)
-        # 首次调用时启动持续截图线程
-        if self._screenshot_driver is not driver:
-            self._start_screenshot_loop(driver)
+    # 旧名保留：内部调用点众多，且语义等价（未绑定 worker 时行为与从前一致）
+    _hooked_print = dispatch_print
 
     def run_batch_task(self, count, card_info_list, cf_password, max_bindable_cards, captcha_api_key):
         self.is_running = True
@@ -799,9 +820,10 @@ class AppState:
             pass
 
 
-def gen_frames(state):
+def gen_frames(worker):
+    """MJPEG 帧生成器。接 WorkerState，使每个 worker 有独立的实时画面。"""
     while True:
-        frame = state.get_frame()
+        frame = worker.get_frame()
         if frame:
             yield (b'--frame\r\n'
                    b'Content-Type: image/png\r\n\r\n' + frame + b'\r\n')
@@ -860,10 +882,12 @@ def create_app(db_path=None):
     def index():
         return send_from_directory(static_dir, 'index.html')
 
-    # MJPEG 流
+    # MJPEG 流。?worker=W2 指定 worker；缺省取主 worker（老 URL 保持可用）
     @app.route('/video_feed')
     def video_feed():
-        return Response(gen_frames(state),
+        from flask import request
+        worker = state.get_worker(request.args.get('worker'))
+        return Response(gen_frames(worker),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
     return app
