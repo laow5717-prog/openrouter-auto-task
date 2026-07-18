@@ -489,6 +489,10 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         _new_cards = [c for c in _all_cards if c.get('number') not in _paid_numbers]
         _sel = {'new_idx': 0, 'reuse_idx': 0, 'last': None}
 
+        # 本次选卡里因「被别的 worker 占着」而没能用上的卡数。用来区分两种 None：
+        # 真的没卡可用（卡池耗尽，应放弃该账号） vs 只是这一刻被占（稍后重试即可）。
+        _contended = {'count': 0}
+
         def _claim(card):
             """并发下占住这张卡；payment_registry 为 None（串行路径）时直接放行。
 
@@ -496,24 +500,44 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             进入本函数时的一次性快照。并发时两个 worker 会同时把同一张卡判为合格，
             各自拿去给不同账号支付，等 DB 记录写下时"一卡绑一账号"已被违反。
             payment_registry 补的就是"判定合格"到"写入结果"之间的时间差窗口。
-            占用在本账号处理结束时统一释放（见函数末尾 finally）。"""
+
+            占用**只覆盖单次支付尝试**，支付有结果后立刻释放（见 _release_card）。
+            早先的实现是占到整个账号处理结束，结果在卡池偏紧时把其它 worker 饿死，
+            对方误判成「卡池已耗尽」而放弃整个账号。按笔释放是安全的：一旦某张卡
+            成功支付，valid_cards 会记下绑定关系，_eligible 就会把它挡在其它账号
+            之外——DB 规则接管了长期约束，内存登记只需守住支付进行中的那一小段。"""
             if card is None or payment_registry is None:
                 return card
             num = card.get('number', '')
             if payment_registry.try_acquire(num, email):
                 _claimed_numbers.add(num)
                 return card
-            return None                    # 被其它 worker 占用 → 视作不可用，继续找下一张
+            _contended['count'] += 1
+            return None                    # 被其它 worker 占用 → 本次跳过，但不算无效
+
+        def _release_card(card):
+            """一笔支付有结果后释放占用，让其它 worker 能立刻用上这张卡。"""
+            if card is None or payment_registry is None:
+                return
+            num = card.get('number', '')
+            payment_registry.release(num)
+            _claimed_numbers.discard(num)
 
         def _get_card():
+            _contended['count'] = 0
             # 1) 未满 20 且有新卡 → 用新卡（成功后成为一张新的 distinct 卡）
+            #    注意 new_idx 只在卡被真正取用或判定无效时才前进：若只是被别的 worker
+            #    暂时占着，必须把它留在原地，否则这张卡在本账号会话里就永久丢了。
             while len(_paid_numbers) < CARD_CAP and _sel['new_idx'] < len(_new_cards):
                 c = _new_cards[_sel['new_idx']]
-                _sel['new_idx'] += 1
-                if c.get('number') not in _invalid_numbers:
-                    got = _claim(c)
-                    if got is not None:
-                        return got
+                if c.get('number') in _invalid_numbers:
+                    _sel['new_idx'] += 1
+                    continue
+                got = _claim(c)
+                if got is not None:
+                    _sel['new_idx'] += 1
+                    return got
+                break            # 被占用 → 保持 new_idx 不动，等下次重试这张
             # 2) 已满 20 或无新卡 → 复用该账号已支付过、且在当前分组内的卡（轮换、避开连续同卡）
             reuse_pool = [c for c in _all_cards
                           if c.get('number') in _paid_numbers
@@ -529,6 +553,12 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     if got is not None:
                         return got
             return _claim(reuse_pool[0])
+
+        def _cards_only_contended():
+            """本次没取到卡，是否**纯粹**因为被其它 worker 占着？
+
+            调用方据此决定：真耗尽 → 放弃该账号；只是争用 → 下一轮再来。"""
+            return _contended['count'] > 0
 
         def _on_invoice_paid(invoice_id, card, responses, amt, balance=None):
             """每笔发票支付成功后：更新选卡状态 + 记账（recharge_log + valid_cards + card_pool）
@@ -569,6 +599,9 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
             bal_txt = f"，余额 ${balance:.2f}" if balance is not None else ""
             print(f"  已记账: invoice {invoice_id} 由卡 ****{str(num)[-4:]} 支付 ${amt}"
                   f"（该账号累计 {len(_paid_numbers)} 张成功卡）{bal_txt}")
+            # 记账已落库（valid_cards 记下了绑定关系），长期约束交给 _eligible，
+            # 内存占用可以放了——继续占着只会饿死其它 worker
+            _release_card(card)
 
         def _on_invoice_failed(invoice_id, card, reason, card_fault=False, tds=False):
             """每笔发票支付失败后：记录失败原因；仅当失败归因于卡本身时才把底料卡标为无效。
@@ -602,6 +635,9 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                     pass
             mark_txt = "，已标记为无效卡" if card_fault else "，卡状态不变（脚本侧失败）"
             print(f"  已记失败: invoice {invoice_id} 卡 ****{str(num)[-4:]} 原因: {reason}{mark_txt}")
+            # 本次尝试已有结论，释放占用。卡若确实有问题，已进 _invalid_numbers /
+            # 底料池 invalid 标记，其它 worker 的 _eligible 会挡住它
+            _release_card(card)
 
         def _skip_invoice_cooldown(invoice_id):
             """该发票是否在「无法支付」24h 冷却期内 → 选发票时跳过它，转去支付新账单。"""
@@ -824,7 +860,14 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
                 paid_n = sum(1 for r in (invoice_results or []) if r.get('status') == 'paid')
                 # 卡池耗尽：handle_unpaid_invoices 在无卡可用时回 status='skipped'。
                 # 据此让编排层停止对该账号继续生成无法支付的账单。
+                #
+                # 但并发下 skipped 有两种成因，必须区分：卡池真的空了（该放弃这个
+                # 账号），还是仅仅这一刻卡都被别的 worker 占着（下一轮就能拿到）。
+                # 把后者当成耗尽，会让账号在本次流水线内被永久丢掉。
                 cards_exhausted = any(r.get('status') == 'skipped' for r in (invoice_results or []))
+                if cards_exhausted and _cards_only_contended():
+                    cards_exhausted = False
+                    print("  本轮无可用卡是因其它 worker 正占用，非卡池耗尽——下轮重试")
                 if invoice_results:
                     print(f"单步账单处理结果: {invoice_results}")
             else:
@@ -996,11 +1039,11 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         return False, str(e), [], '', "failed"
 
     finally:
-        # 释放本账号占用的支付卡。粒度是"整个账号处理期间"而非"单笔支付"：
-        # 一张卡在同一账号内可能被复用多次，逐笔释放会在两笔之间留出窗口让别的
-        # worker 抢走，"一卡绑一账号"就守不住了。
+        # 兜底释放。正常路径下每笔支付有结果就已经 _release_card 了，这里只清理
+        # 异常路径漏放的（选中卡之后、支付回调之前抛异常）。不兜底的话那张卡会
+        # 一直挂在内存登记里，其它 worker 永远拿不到。
         if payment_registry is not None:
-            for _num in _claimed_numbers:
+            for _num in list(_claimed_numbers):
                 payment_registry.release(_num)
         if driver:
             print("正在关闭浏览器...")

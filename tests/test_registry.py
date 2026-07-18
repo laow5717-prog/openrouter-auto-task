@@ -166,3 +166,34 @@ def test_empty_card_number_is_never_acquirable():
     reg = _state().payment_registry
     assert reg.try_acquire('', 'a@example.com') is False
     assert reg.try_acquire(None, 'a@example.com') is False
+
+
+# ==================== 回归：争用不等于耗尽 ====================
+
+
+def test_release_lets_a_waiting_worker_proceed():
+    """按笔释放：一笔支付有结果后，别的 worker 应立刻能用上这张卡。
+
+    实跑中踩过的坑：早先实现把卡占到整个账号处理结束，卡池偏紧时其它 worker
+    一张都拿不到，被 registration 误判成「卡池已耗尽」，编排层据此把该账号
+    永久放弃（done[email]='no_cards'）。临时争用被当成了永久耗尽。"""
+    reg = _state().payment_registry
+
+    # W1 取卡付款
+    assert reg.try_acquire('4111', 'a@example.com') is True
+    # W2 此刻拿不到
+    assert reg.try_acquire('4111', 'b@example.com') is False
+    # W1 这笔付完就放
+    reg.release('4111')
+    # W2 立刻可用——不必等 W1 整个账号跑完
+    assert reg.try_acquire('4111', 'b@example.com') is True
+
+
+def test_in_flight_set_empties_after_each_attempt():
+    """按笔释放后，登记表不应残留——残留会让卡永远拿不到。"""
+    reg = _state().payment_registry
+    for i in range(5):
+        num = f'411{i}'
+        reg.try_acquire(num, 'a@example.com')
+        reg.release(num)
+    assert reg.in_flight_numbers() == set()
