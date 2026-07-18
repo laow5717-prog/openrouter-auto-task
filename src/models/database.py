@@ -139,6 +139,15 @@ CREATE TABLE IF NOT EXISTS invoice_payment_state (
 );
 """
 
+# 并行执行：卡领取的原子占位。status 增加 'processing' 中间态，配 worker_id + claimed_at，
+# 使多个 worker 能安全消费同一 task 的卡池（详见 WorkerPool / CardBindingModel.claim_batch）。
+# claimed_at 供回收线程判定失联 worker（超时重置回 pending）。
+_SCHEMA_V8 = """
+ALTER TABLE card_bindings ADD COLUMN worker_id TEXT DEFAULT '';
+ALTER TABLE card_bindings ADD COLUMN claimed_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_cb_status_claimed ON card_bindings(status, claimed_at);
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -147,6 +156,7 @@ _MIGRATIONS = {
     5: _SCHEMA_V5,
     6: _SCHEMA_V6,
     7: _SCHEMA_V7,
+    8: _SCHEMA_V8,
 }
 
 

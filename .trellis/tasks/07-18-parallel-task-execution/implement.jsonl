@@ -1,0 +1,7 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "card_bindings 迁移与领取查询需遵循既有 SQLite/模型约定"}
+{"file": ".trellis/spec/backend/index.md", "reason": "后端整体约定"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "日志按 worker 路由改造需遵循既有日志规范"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "并发下 InterruptedError/异常隔离与资源释放"}
+{"file": ".trellis/spec/api/index.md", "reason": "/api/status 扩展需保持既有分页/响应契约"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Workbench 分栏改造需遵循 Vue 3 页面模式"}

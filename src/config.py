@@ -106,6 +106,20 @@ class PaymentConfig:
 
 
 @dataclass
+class ConcurrencyConfig:
+    """每日流水线的并发执行配置。
+
+    max_workers: 同时驱动的浏览器 worker 数。默认 1（串行，与改造前等价）。
+                 有效范围 1-4，越界由 WorkerPool 夹紧；上限 4 源于有头 Chrome
+                 每实例约 300-500MB 内存的开销。
+    claim_timeout_minutes: 卡被领取（processing 态）后多久无进展视为 worker 失联，
+                 由回收线程重置回 pending。
+    """
+    max_workers: int = 1
+    claim_timeout_minutes: int = 20
+
+
+@dataclass
 class AppConfig:
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     email: EmailConfig = field(default_factory=EmailConfig)
@@ -117,6 +131,7 @@ class AppConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     payment: PaymentConfig = field(default_factory=PaymentConfig)
+    concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
 
 
 def get_base_dir():
@@ -240,6 +255,13 @@ class ConfigLoader:
             self.config.batch = BatchConfig(
                 interval_min=batch.get('interval_min', 5),
                 interval_max=batch.get('interval_max', 15),
+            )
+
+        if 'concurrency' in self.raw_config:
+            conc = self.raw_config['concurrency']
+            self.config.concurrency = ConcurrencyConfig(
+                max_workers=conc.get('max_workers', 1),
+                claim_timeout_minutes=conc.get('claim_timeout_minutes', 20),
             )
 
         if 'captcha' in self.raw_config:
