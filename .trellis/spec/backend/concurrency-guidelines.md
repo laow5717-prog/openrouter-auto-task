@@ -40,10 +40,18 @@ missing any one of them produces a different failure.
 
 ### 1. Account (email) — `AccountRegistry`
 
-**Why**: `driver.py:_clear_singleton_locks` deletes Chrome's `SingletonLock`
-unconditionally. Its comment says it is safe *because the app guarantees one
-instance per profile*. Two workers on the same email delete each other's locks
-and the browsers crash at random.
+**Why**: `driver.py:_clear_singleton_locks` deletes Chrome's `SingletonLock`.
+Two workers on the same email delete each other's locks and the browsers crash
+at random.
+
+That function used to justify the deletion with a comment saying it was safe
+*because the app guarantees one instance per profile*. It now **verifies** the
+premise instead of assuming it: `_kill_chrome_for_profile` reclaims any process
+still holding the `user-data-dir` before the locks come off. That is a
+belt-and-braces measure for orphans left by crashed browsers — it does **not**
+relax the email exclusion below. A live worker's Chrome is indistinguishable
+from an orphan at the process level, so two workers on one email would still
+kill each other's browsers.
 
 Profiles are keyed by email (`data/profiles/<email>`), so **email exclusion is a
 hard constraint, not an optimisation**.

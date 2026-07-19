@@ -24,6 +24,15 @@ INVOICE_DAILY_CAP = 30
 TOPUP_AMOUNT = 10
 
 
+# === 浏览器 profile 相关常量 ===
+# 单个持久化 profile 的缓存类目录（Cache / Code Cache / Service Worker / GPUCache 等）
+# 合计上限（MB），超限则在浏览器启动前整体清理。这些目录不含登录态
+# （Cookies / Login Data / Local Storage / Local State 均不在其中），清理后仍保持登录。
+# 缓存腐坏——尤其 Service Worker——会让 dash.cloudflare.com 的导航请求拿到空响应，
+# 表现为「地址栏 URL 正常但页面全白」，且 Chrome 不会自愈。
+PROFILE_CACHE_LIMIT_MB = 200
+
+
 @dataclass
 class RegistrationConfig:
     total_accounts: int = 1

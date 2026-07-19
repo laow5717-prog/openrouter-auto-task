@@ -15,7 +15,7 @@ import threading
 from datetime import datetime, timezone
 from patchright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-from src.config import cfg
+from src.config import cfg, PROFILE_CACHE_LIMIT_MB
 import src.services.captcha as captcha_solver
 from src.services.email import get_mail_token, wait_for_login_code
 
@@ -95,11 +95,15 @@ class BrowserSession:
     它只读 _last_png 缓存、绝不触碰 self.page，因此可被独立截图线程安全调用。
     """
 
-    def __init__(self, playwright, context, page, temp_profile=None, download_dir=None):
+    def __init__(self, playwright, context, page, temp_profile=None, download_dir=None,
+                 user_data_dir=None):
         self.playwright = playwright        # sync_playwright().start() 句柄
         self.context = context              # 持久化 BrowserContext
         self.page = page                    # 主 Page
         self._temp_profile = temp_profile   # 临时 profile 目录；持久化时为 None
+        # profile 目录（临时/持久化都有值）。与 _temp_profile 职责不同：后者管
+        # 「退出时要不要删目录」，本字段管「退出后按目录核查进程是否真的退干净了」。
+        self._user_data_dir = user_data_dir
         self._download_dir = download_dir
         self.console_errors = []            # page.on("console") 收集（替代 __cfAutoErrors）
         self.net_responses = []             # page.on("response") 收集（替代 __netInterceptResponses）
@@ -209,14 +213,24 @@ class BrowserSession:
         if self._closed:
             return
         self._closed = True
+        # 这两处异常绝不能静默：close 失败意味着 Chrome 进程还活着，而 playwright.stop()
+        # 随后就会拆掉 driver 传输通道，此后再没有任何途径能关掉它。以前吞掉异常的后果是
+        # 日志里只剩「初始化 55 次 / 关闭 48 次」这种事后才看得出的差值。
         try:
             self.context.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ⚠️ 关闭浏览器 context 失败: {str(e)[:120]}")
         try:
             self.playwright.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ⚠️ 停止 playwright 失败: {str(e)[:120]}")
+
+        # 核查 Chrome 是否真的退了。持久化 profile 才需要——临时 profile 目录随后就被
+        # 整个删掉，且下次不会有人复用它。grace 让正常退出的 Chrome 有时间落盘 Cookies，
+        # 只有超时还赖着不走的才回收。
+        if self._user_data_dir and not self._temp_profile:
+            _kill_chrome_for_profile(self._user_data_dir, '关闭后残留', grace=5)
+
         if self._temp_profile and os.path.exists(self._temp_profile):
             try:
                 shutil.rmtree(self._temp_profile, ignore_errors=True)
@@ -376,6 +390,141 @@ def _write_profile_language(user_data_dir):
            {'intl': {'app_locale': BROWSER_LANG}})
 
 
+# ======================================================================
+# 持久化 profile 卫生：孤儿进程回收 + 缓存清理。
+#
+# 白屏根因：Chrome 异常退出留下的孤儿进程仍占着 user-data-dir，而启动新实例前
+# 会无条件删掉 Singleton 锁，于是两个 Chrome 争抢同一份 leveldb，渲染进程起不来；
+# 叠加从不清理的 Service Worker 缓存腐坏后返回空响应，页面 URL 正常却全白。
+# ======================================================================
+
+# 缓存类目录（均在 profile 的 Default/ 下）。删除它们不影响登录态——
+# 登录信息在 Default/Cookies、Default/Login Data、Default/Local Storage
+# 和 profile 根的 Local State 里，都不在此列表中。
+_PROFILE_CACHE_DIRS = (
+    'Cache', 'Code Cache', 'Service Worker', 'GPUCache', 'DawnCache', 'ShaderCache',
+)
+
+
+def _chrome_pids_for_profile(user_data_dir):
+    """查出占用指定 user-data-dir 的 Chrome 进程 pid，主进程排在最前。
+
+    只用标准库（项目未装 psutil）。`ps -Ao command=` 不像 `ps aux` 那样截断长命令行，
+    能拿到完整的 --user-data-dir 路径。任何异常都返回空列表——本函数是尽力而为的
+    卫生检查，绝不能因为它把浏览器启动搞挂。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ['ps', '-Ao', 'pid=,command='],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return []
+
+    needle = f'--user-data-dir={user_data_dir}'
+    mains, helpers = [], []
+    for line in out.splitlines():
+        idx = line.find(needle)
+        if idx < 0:
+            continue
+        # 必须匹配到路径边界，否则 /a/b 会误命中 /a/bc 这种兄弟 profile
+        tail = line[idx + len(needle):]
+        if tail and not tail[0].isspace():
+            continue
+        try:
+            pid = int(line.split(None, 1)[0])
+        except (ValueError, IndexError):
+            continue
+        # 带 --type= 的是 renderer/gpu 等 helper 进程，杀主进程它们会跟着退
+        (helpers if '--type=' in line else mains).append(pid)
+    return mains + helpers
+
+
+def _kill_chrome_for_profile(user_data_dir, reason, grace=0):
+    """终止占用该 profile 的残留 Chrome，返回回收的进程数。
+
+    grace：先等这么多秒看进程是否自行退出，期间退干净就返回 0（不打日志）。
+    context.close() 之后必须留宽限期——close 返回时 Chrome 往往还在优雅退出、
+    正把 Cookies 和 Local Storage 落盘，此刻抢着发信号会截断落盘，
+    白屏没修成反而把登录态搞丢。启动路径则用 grace=0：那里遇到的是孤儿，等也不会退。
+
+    并发安全性：AccountRegistry（src/web/worker.py）保证同一 email profile 任一时刻
+    只被一个 worker 或一个手动会话持有，因此走到这里时占用该目录的进程必然是孤儿。
+    这比原先「无条件删 Singleton 锁让新实例与孤儿并存」严格更安全。
+    """
+    pids = _chrome_pids_for_profile(user_data_dir)
+    if not pids:
+        return 0
+
+    if grace > 0:
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            pids = _chrome_pids_for_profile(user_data_dir)
+            if not pids:
+                return 0          # 自己退干净了，正常路径，不该打日志
+            time.sleep(0.25)
+
+    import signal
+    killed = len(pids)
+    # 先一律 SIGTERM，给 Chrome 落盘 Cookies 的机会。主进程排在前面先收到信号，
+    # helper 通常跟着主进程退，轮到它们时多半已经不在了（ProcessLookupError 吞掉）。
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not _chrome_pids_for_profile(user_data_dir):
+            break
+        time.sleep(0.25)
+    else:
+        # 5 秒还没退干净就强杀，否则新实例照样要跟它抢 leveldb
+        for pid in _chrome_pids_for_profile(user_data_dir):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    print(f"  ⚠️ 回收 {reason} 的残留 Chrome 进程 {killed} 个")
+    return killed
+
+
+def _prune_profile_cache(user_data_dir):
+    """缓存类目录合计超阈值时整体清理。登录态不受影响，Chrome 会自动重建空缓存。
+
+    必须在 _kill_chrome_for_profile 之后调用——删活着的 Chrome 的 Cache 目录会让它崩溃。
+    用总量而非逐目录阈值：这几个目录是联动增长的，单看任一个都可能不触发，
+    而白屏由整体缓存腐坏引起。
+    """
+    default_dir = os.path.join(user_data_dir, 'Default')
+    targets = [os.path.join(default_dir, name) for name in _PROFILE_CACHE_DIRS]
+
+    total = 0
+    for path in targets:
+        if not os.path.isdir(path):
+            continue
+        for root, _dirs, files in os.walk(path):
+            for fname in files:
+                try:
+                    fpath = os.path.join(root, fname)
+                    if not os.path.islink(fpath):
+                        total += os.path.getsize(fpath)
+                except OSError:
+                    pass
+
+    limit = PROFILE_CACHE_LIMIT_MB * 1024 * 1024
+    if total <= limit:
+        return          # 未超限静默返回，别每次启动都刷一行日志
+
+    for path in targets:
+        shutil.rmtree(path, ignore_errors=True)
+    print(f"  🧹 profile 缓存 {total // (1024 * 1024)}MB 超过 "
+          f"{PROFILE_CACHE_LIMIT_MB}MB，已清理（登录态保留）")
+
+
 def create_driver(headless=False, profile_id=None):
     """
     创建带有反检测的 Chrome 浏览器会话（使用 Patchright）
@@ -429,9 +578,20 @@ def create_driver(headless=False, profile_id=None):
         launch_args.append("--window-position=-10000,-10000")
 
     def _clear_singleton_locks():
+        # 四步顺序不可调换，每一步都依赖前一步的结果：
+        #   1) 回收孤儿进程 —— 让第 2 步「删锁是安全的」这个前提真正成立
+        #   2) 删 Singleton 锁 —— 孤儿已清，此时删锁不会造成双实例
+        #   3) 重置臃肿 Preferences
+        #   4) 剪缓存 —— 必须在第 1 步之后，删活着的 Chrome 的 Cache 会让它崩溃
+        if is_persistent:
+            # 原注释称「本应用通过 open_browsers 保证同一 profile 单实例，可安全清理」，
+            # 但该前提在有孤儿进程时并不成立：泄漏的 Chrome 仍占着 user-data-dir，
+            # 强删锁后新实例与它争抢同一份 leveldb，渲染进程起不来 → 页面白屏。
+            # 现在改为主动验证并回收，而不是假设。
+            _kill_chrome_for_profile(user_data_dir, f'profile {safe_name}')
+
         # Chrome 异常退出会在 profile 里留下 Singleton 锁，导致下次启动失败
-        # （"Mach rendezvous failed / parent died"）。仅在无浏览器占用该 profile 时安全，
-        # 本应用通过 open_browsers 保证同一 profile 单实例，可安全清理。
+        # （"Mach rendezvous failed / parent died"）。
         for _name in ('SingletonLock', 'SingletonCookie', 'SingletonSocket'):
             _p = os.path.join(user_data_dir, _name)
             try:
@@ -449,6 +609,11 @@ def create_driver(headless=False, profile_id=None):
                 print("  🧹 检测到异常臃肿的 Preferences，已重置（登录态保留）")
         except Exception:
             pass
+
+        # 缓存腐坏（尤其 Service Worker）会让 dash 的导航请求拿到空响应导致白屏。
+        # 临时 profile 每次全新创建，无积累，跳过以省开销。
+        if is_persistent:
+            _prune_profile_cache(user_data_dir)
 
     playwright = sync_playwright().start()
     context = None
@@ -500,7 +665,8 @@ def create_driver(headless=False, profile_id=None):
 
         temp_profile = None if is_persistent else user_data_dir
         session = BrowserSession(playwright, context, page,
-                                 temp_profile=temp_profile, download_dir=download_dir)
+                                 temp_profile=temp_profile, download_dir=download_dir,
+                                 user_data_dir=user_data_dir)
 
         # 仅注册网络响应监听（用于充值/支付响应捕获，走 Network 域，Patchright 已适配）。
         # 关键：绝不注册 page.on("console") —— 它会强制启用 CDP Runtime.enable，
