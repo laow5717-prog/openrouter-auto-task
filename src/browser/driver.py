@@ -1356,6 +1356,67 @@ def _expand_stripe_card_accordion(page):
     return False
 
 
+def _uncheck_link_opt_in(page):
+    """取消 Stripe Link 的「Save my information for faster checkout」勾选。
+
+    该勾选框默认勾选，勾上后 Link 会要求填手机号，提交时报
+    "Please provide a mobile phone number." 导致绑卡失败。我们只需存卡、不需要
+    Link 账户，取消即可，无需真的去填手机号。
+
+    DOM 结构（真机确认）：
+        <label for="payment-linkOptInInput">
+          <input id="payment-linkOptInInput" name="linkOptIn" type="checkbox" checked>
+    input 被自定义样式遮住，直接 uncheck() 过不了可操作性检查，必须点 label。
+
+    返回: 是否已处于未勾选状态
+    """
+    fl = stripe_card_frame(page)
+    if fl is None:
+        return False
+    try:
+        cb = fl.locator('input[name="linkOptIn"], input#payment-linkOptInInput').first
+        if cb.count() == 0:
+            return True          # 无该勾选框（Link 未启用），视为已满足
+        if not cb.is_checked():
+            return True
+    except Exception:
+        return False
+
+    for sel in ('label[for="payment-linkOptInInput"]',
+                'label#Field-linkOptInCheckbox',
+                '.p-LinkOptIn-checkbox label'):
+        try:
+            lbl = fl.locator(sel).first
+            if lbl.count() == 0:
+                continue
+            lbl.click(timeout=SHORT_TIMEOUT_MS)
+            time.sleep(1)
+            if not cb.is_checked():
+                print("  ☑️ 已取消 Link「保存信息以便快捷结账」勾选")
+                return True
+        except Exception:
+            continue
+
+    # label 点不动时兜底：直接改 checked 并派发事件（Stripe 靠 React 状态渲染，
+    # 只改属性不派发事件不会生效）
+    try:
+        cb.evaluate("""el => {
+            if (el.checked) {
+                el.checked = false;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+        }""")
+        time.sleep(1)
+        if not cb.is_checked():
+            print("  ☑️ 已取消 Link 勾选（JS 兜底）")
+            return True
+    except Exception:
+        pass
+    print("  ⚠️ 未能取消 Link 勾选，提交可能因缺少手机号而失败")
+    return False
+
+
 def _dump_visual_vs_dom(driver):
     """对比「屏幕上渲染出来的」与「DOM 查询看到的」，用于排查两者不一致。
 
@@ -5621,6 +5682,8 @@ def _fill_stripe_payment_element(driver, card_info):
             filled_any = True
         time.sleep(0.3)
     if fl_ok >= 2:
+        # Link 勾选框是填完卡号后才出现的，故必须放在填写之后取消
+        _uncheck_link_opt_in(page)
         # 至少填成两个字段才认为主路径可用，否则继续走下面的兜底。
         # 账单地址不在这里填——调用方 add_credit_card 有独立步骤负责（driver.py:4148）。
         return True
@@ -5673,6 +5736,7 @@ def _fill_stripe_payment_element(driver, card_info):
             continue
 
     if card_filled_nested or expiry_filled_nested or cvc_filled_nested:
+        _uncheck_link_opt_in(page)
         # 卡信息填了部分，也尝试在主文档层填写账单地址
         if not billing_filled_in_nested:
             try_fill_billing_fields(page)

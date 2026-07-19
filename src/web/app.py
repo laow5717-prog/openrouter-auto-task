@@ -672,6 +672,10 @@ class AppState:
                             max_bindable_cards=max_bindable_cards,
                             captcha_api_key=captcha_api_key,
                             monitor_callback=worker.make_monitor(self),
+                            # 卡都试完仍未补够时再领一批，复用已登录的浏览器。
+                            # 仍走 claim_batch，保持并发下的占位语义不变。
+                            claim_more=lambda n: card_binding_model.claim_batch(
+                                task_id, worker.worker_id, n),
                         )
                         if bound_count > 0:
                             with totals_lock:

@@ -311,11 +311,15 @@ def _get_email_password(account_model, email):
 def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
                                    email, cf_password, batch_records,
                                    max_bindable_cards=2, captcha_api_key=None,
-                                   monitor_callback=None):
+                                   monitor_callback=None, claim_more=None):
     """登录已有 Cloudflare 账号并补绑信用卡，补到账号总绑卡数达 max_bindable_cards。
 
     与 register_and_bind_cards 的区别：跳过注册，直接登录已有账号。以账单页真实
     已绑卡数（get_bound_card_count）决定还需补几张，避免超绑。
+
+    claim_more: 可选回调 claim_more(n) -> [record, ...]，用于「卡都试完仍未补够」时
+        再领一批。传入才启用，最多追加 3 轮，避免单个账号把卡池吃光。不传则维持
+        原行为：batch_records 用完即结束。
 
     返回: (bound_count, login_ok)
       - login_ok=False → bound_count=0，且 batch_records 里的卡未被消耗（保留 pending），
@@ -373,11 +377,17 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
             print("账号已达目标绑卡数，无需补绑")
             return 0, True
 
-        for idx, record in enumerate(batch_records):
+        # 队列可在中途追加：卡都试完但还没补够时，向上层再领一批继续，
+        # 复用当前已登录的浏览器（重开浏览器要再登录一次，代价高得多）。
+        queue = list(batch_records)
+        idx = 0
+        extra_rounds = 0
+        while idx < len(queue):
             if bound_count >= need:
                 print(f"已补满 {need} 张，剩余卡片留待下个账号处理")
                 break
 
+            record = queue[idx]
             card_info = record["card"]
             card_display = f"****{record['card_display']}"
             binding_id = record["id"]
@@ -389,16 +399,34 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
                 card_binding_model.mark_success(binding_id, email)
                 print(f"{card_display} 绑定成功！(本轮已绑 {bound_count} 张)")
                 _report("card_added")
-                if bound_count < need and idx < len(batch_records) - 1:
-                    navigate_to_billing(driver)
-                    time.sleep(3)
             else:
                 card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")
-                print(f"{card_display} 绑定失败，尝试下一张... ({_err_reason})")
+                print(f"{card_display} 绑定失败 ({_err_reason})")
                 _report("card_failed")
-                if idx < len(batch_records) - 1:
-                    navigate_to_billing(driver)
-                    time.sleep(3)
+
+            idx += 1
+            still_need = need - bound_count
+
+            # 卡试完但没补够 → 再领一批。限制轮数，避免某账号把整个卡池吃光。
+            if idx >= len(queue) and still_need > 0 and claim_more and extra_rounds < 3:
+                extra = claim_more(still_need) or []
+                extra_rounds += 1
+                # claim_batch 返回该 worker 名下所有 processing 记录。已处理的卡此时
+                # 已转为 success/failed 不会回流，但仍按 id 去重，避免任何情况下重复绑同一张。
+                seen_ids = {r["id"] for r in queue}
+                fresh = [r for r in extra if r["id"] not in seen_ids]
+                if fresh:
+                    queue.extend(fresh)
+                    print(f"仍需 {still_need} 张，已再领 {len(fresh)} 张继续尝试")
+
+            if idx < len(queue) and bound_count < need:
+                print("准备下一张...")
+                navigate_to_billing(driver)
+                time.sleep(3)
+            elif bound_count < need:
+                # 说明「没卡了」而不是「不想试了」——此前这里无条件打印「尝试下一张」
+                # 然后直接关浏览器，日志与实际行为矛盾
+                print(f"已无可用卡片，本账号补绑结束（still_need={still_need}）")
 
         if bound_count > 0:
             account_model.update_bound_cards(email, current + bound_count)

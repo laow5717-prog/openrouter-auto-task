@@ -75,6 +75,28 @@ Stripe 字段在输入过程中重格式化并重建 DOM，与逐字输入构成
 
 展开操作要**每轮轮询都尝试**，不能只在首轮点一次：Stripe 重建 iframe 后会退回折叠态。
 
+## Link 勾选框必须取消
+
+填完卡号后，Payment Element 底部出现 Link 的
+「Save my information for faster checkout」勾选框，**默认勾选**。勾上后 Link 会把
+邮箱与手机号变成必填，提交时报 `Please provide a mobile phone number.`，
+以 `[Stripe字段错误]` 形式导致绑卡失败。我们只需存卡、不需要 Link 账户，取消即可。
+
+```html
+<label for="payment-linkOptInInput" id="Field-linkOptInCheckbox">
+  <input id="payment-linkOptInInput" name="linkOptIn" type="checkbox" checked>
+  <span class="p-LinkOptIn-labelText">Save my information for faster checkout</span>
+```
+
+`input` 被自定义样式遮住，`uncheck()` 过不了可操作性检查，**必须点 `label`**
+（见 `_uncheck_link_opt_in`，另有 JS 派发 input/change 事件的兜底——Stripe 靠
+React 状态渲染，只改 checked 属性不派发事件不生效）。
+
+时序要求：勾选框在**填完卡号后**才出现，取消操作必须排在填写之后。
+
+注意：该勾选框只在特定条件下出现，本地用测试 key 挂载时不一定复现（曾出现只有
+手机号字段、没有勾选框的形态），因此这段逻辑**未经本地验证**，选择器取自真机 DOM。
+
 ## 就绪判定
 
 `elements-inner-loader-ui` frame 在场**不能**用来判断界面是否还在加载——折叠态下
