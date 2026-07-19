@@ -41,12 +41,44 @@ Stripe 字段在输入过程中重格式化并重建 DOM，与逐字输入构成
 
 改进后连跑 5 轮，三个字段全部通过（卡号偶尔需要第 2 次）。
 
-## 渲染耗时
+## 折叠手风琴：字段在展开前不存在于 DOM
 
-frame 列表里出现 `elements-inner-loader-ui` 即表示 Stripe 仍在显示**加载骨架屏**，
-字段尚未渲染。曾因 `_wait_for_stripe_fields_ready` 超时仅 15s 而在骨架屏阶段就放弃，
-退化到 Tab 盲打。弹窗内同时加载 PayPal / hCaptcha / GooglePay，慢网络下远超 15s
-属正常，现为 90s。
+**这是「找不到卡号字段」的首要原因，排查时先查这一条。**
+
+账号有多种支付方式（Card / Bank）时，Stripe 把 Payment Element 渲染成**折叠的
+手风琴**。此时 payment frame 的 body 只有约 3.7KB，结构是：
+
+```html
+<div class="p-PaymentElement ... is-collapsed">
+  <div data-is-collapsed="true" data-selected-payment-form="card">
+    <div class="p-AccordionButton" role="button" data-value="card" aria-expanded="false">Card</div>
+    <div class="p-AccordionPanel" id="card"></div>   <!-- 空 -->
+    <div class="p-AccordionButton" data-value="link_card_brand">Bank</div>
+```
+
+关键点：**卡号/有效期/CVC 输入框在展开前根本不存在**，不是「还没加载完」。
+必须点击 `[role="button"][data-value="card"]` 展开（见 `_expand_stripe_card_accordion`），
+面板填充后字段才被创建。
+
+这个现象极具迷惑性，曾连续误判三轮：
+
+- 界面上「Card / Bank」两栏渲染完好、肉眼完全可见 → 看起来已加载完成
+- DOM 查询读到零 input → 看起来是选择器失配
+- 等再久也不变（实测等满 90s 无变化）→ 又被误判为加载卡住
+
+三条线索单看都指向错误方向，只有 dump payment frame 的 innerHTML 全文才能定死。
+诊断「字段找不到」时**第一步就该打这段 HTML**。
+
+只有一种支付方式时 Stripe 直接平铺，无手风琴——本地用测试 key 挂载默认就是这种
+形态，**复现折叠态需显式指定** `paymentMethodTypes: ['card','us_bank_account']` +
+`layout: {type:'accordion', defaultCollapsed:true}`。
+
+展开操作要**每轮轮询都尝试**，不能只在首轮点一次：Stripe 重建 iframe 后会退回折叠态。
+
+## 就绪判定
+
+`elements-inner-loader-ui` frame 在场**不能**用来判断界面是否还在加载——折叠态下
+它同样挂着，而界面其实已渲染完毕。该 frame 只作日志如实记录，不作推断依据。
 
 判定就绪只能以**卡号字段可定位**为准。「弹窗内 iframe ≥ 2 个」只是容器已渲染的
 弱判据，据此返回就绪会把问题掩盖到填写阶段才暴露。

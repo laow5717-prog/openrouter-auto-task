@@ -1323,6 +1323,39 @@ def _card_field_locator(page, selector):
     return None
 
 
+def _expand_stripe_card_accordion(page):
+    """展开 Payment Element 的 "Card" 折叠项，使卡号/有效期/CVC 字段被创建。
+
+    账号有多种支付方式（Card / Bank）时，Stripe 把 Payment Element 渲染成折叠的
+    手风琴：界面上看得见 "Card" 和 "Bank" 两栏，但卡片面板 <div id="card"> 是空的，
+    输入框在点击展开前根本不存在于 DOM 中。此前误判为「还在加载」并一路加长等待，
+    实际上不点击就永远不会出现。
+
+    只有一种支付方式时 Stripe 直接平铺，没有手风琴——此时本函数找不到按钮，
+    返回 False，属正常情况，调用方不应据此判定失败。
+
+    返回: 是否执行了展开操作
+    """
+    fl = stripe_card_frame(page)
+    if fl is None:
+        return False
+    for sel in ('[role="button"][data-value="card"]',
+                '[data-testid="payment-accordion-wrapper"] [role="button"]'):
+        try:
+            btn = fl.locator(sel).first
+            if btn.count() == 0:
+                continue
+            if (btn.get_attribute('aria-expanded') or '').lower() == 'true':
+                return False        # 已展开，无需再点
+            btn.click(timeout=SHORT_TIMEOUT_MS)
+            print("  🖱️ 已展开 Payment Element 的 Card 折叠项")
+            time.sleep(2)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _dump_visual_vs_dom(driver):
     """对比「屏幕上渲染出来的」与「DOM 查询看到的」，用于排查两者不一致。
 
@@ -1410,6 +1443,16 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
                 print("  ✅ Stripe 输入字段已就绪")
                 time.sleep(0.5)
                 return True
+
+            # 字段不存在时先试着展开 Card 折叠项——多支付方式下 Payment Element 是
+            # 折叠手风琴，输入框在展开前不存在于 DOM。每轮都试：Stripe 重建 iframe 后
+            # 会退回折叠态，只在首轮点一次不够。
+            if _expand_stripe_card_accordion(page):
+                inp = _card_field_locator(page, card_inputs_sel)
+                if inp is not None and _vis(inp):
+                    print("  ✅ Stripe 输入字段已就绪（展开 Card 折叠项后）")
+                    time.sleep(0.5)
+                    return True
 
             # 兜底: 遍历 page.frames。卡表单 iframe 锚点变更时仍有机会命中，
             # 但拿到的 Frame 可能已失效，故仅作补充而非主路径。
@@ -5556,8 +5599,13 @@ def _fill_stripe_payment_element(driver, card_info):
     expiry = f"{exp_month}{exp_year[-2:]}" if exp_year else exp_month
     cvc = card_info.get('cvc', '')
 
+    # 多支付方式下 Payment Element 是折叠手风琴，字段在展开前不存在于 DOM。
+    # 等待阶段通常已展开过，这里再确保一次（本函数也可能被单独调用）。
+    if _card_field_locator(page, CARD_NUMBER_SEL) is None:
+        _expand_stripe_card_accordion(page)
+
     # 主路径: 经 FrameLocator 填写。每个字段各自重新解析 iframe，Stripe 中途重建
-    # 也不会拿到失效的 Frame（这正是此前所有 frame 都读到零 input 的原因）。
+    # 也不会拿到失效的 Frame。
     fl_ok = 0
     for sel, value, label in ((CARD_NUMBER_SEL, number, '卡号'),
                               (CARD_EXPIRY_SEL, expiry, '有效期'),
