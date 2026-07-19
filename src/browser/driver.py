@@ -3258,7 +3258,12 @@ def fill_signup_form(driver, email: str, password: str):
         print("🔒 等待人机验证组件加载...")
         _wait_for_turnstile_widget(driver, timeout=15)
         print("🔒 检查注册页面内嵌的人机验证...")
-        _handle_inline_turnstile(driver)
+        # 必须尊重返回值：Turnstile 没过就提交，CF 后端收到空 token 会静默拒绝——
+        # 不报错、不发验证邮件，上层只能看到「等待验证邮件超时」，根因被完全掩盖。
+        # 宁可在这里失败，也不要制造一次查不出原因的注册失败。
+        if not _handle_inline_turnstile(driver):
+            print("❌ 人机验证未通过，放弃提交注册表单")
+            return False
         time.sleep(2)
 
         # 点击注册按钮
@@ -3304,11 +3309,47 @@ def fill_signup_form(driver, email: str, password: str):
         # 提交后处理可能的质询
         check_and_handle_cf_challenge(driver)
 
+        _report_signup_page_error(driver)
+
         return True
 
     except Exception as e:
         print(f"❌ 填写注册表单失败: {e}")
         return False
+
+
+def _report_signup_page_error(driver):
+    """把注册页上 CF 给出的错误文本打进日志。
+
+    存在的理由：注册失败时唯一的信号曾经是「等待验证邮件超时」，而 CF 拒绝的原因
+    （token 无效、邮箱域名被拒、密码不合规……）就写在页面上，却从来没人看。
+    排查一次要翻半天日志才能确认「表单提交了但什么都没发生」。
+
+    纯诊断用途，任何异常都吞掉，绝不影响注册主流程。
+    """
+    try:
+        if 'sign-up' not in (driver.current_url or ''):
+            return          # 已经跳走了，说明提交被接受
+
+        errors = driver.page.evaluate("""() => {
+            const out = [];
+            const sel = '[role="alert"], [class*="error" i], [class*="Error"], ' +
+                        '[data-testid*="error"], [aria-invalid="true"] ~ *';
+            document.querySelectorAll(sel).forEach(el => {
+                const t = (el.innerText || '').trim();
+                if (t && t.length < 300) out.push(t);
+            });
+            return [...new Set(out)].slice(0, 5);
+        }""")
+        if errors:
+            print("  ⚠️ 注册页错误提示:")
+            for text in errors:
+                print(f"     • {text}")
+        else:
+            print("  ℹ️ 仍停留在注册页，但页面未给出错误提示"
+                  "（多为后端静默拒绝，检查 Turnstile token 是否真的交付）")
+    except Exception:
+        pass
 
 
 def handle_email_verification(driver, verification_data):

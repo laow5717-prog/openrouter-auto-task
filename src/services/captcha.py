@@ -486,38 +486,101 @@ def _inject_hcaptcha_token(driver, token, sitekey):
 
 
 def _inject_turnstile_token(driver, token):
+    """把 2Captcha 解出的 token 交付给页面。
+
+    光设 input.value 是不够的：Cloudflare 注册页是 React 应用，直接赋值不会触发
+    受控组件的 onChange，React state 里的 token 仍是空的，提交时 payload 带空值，
+    后端静默拒绝（表现为验证邮件永不到达）。必须走 native setter 再派发
+    input/change 事件，才能让框架看见这次变更。
+
+    返回 (success, detail)：detail 记录每一步的实际结果，便于失败时诊断到底是
+    哪一环没交付，而不是只得到一个 True/False。
+    """
     try:
-        injected = driver.page.evaluate("""(token) => {
-            var success = false;
+        detail = driver.page.evaluate("""(token) => {
+            var out = {inputs: 0, reactSetter: 0, events: 0, callbacks: [], api: [],
+                       turnstileApi: typeof window.turnstile};
+
+            // 拿 React 绕不过去的 native setter。直接 el.value = x 会被 React 的
+            // 值追踪器认为「没变过」，onChange 不会触发。
+            var nativeSetter = null;
+            try {
+                nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+            } catch(e) {}
+
+            function setValue(el) {
+                try {
+                    if (nativeSetter) { nativeSetter.call(el, token); out.reactSetter++; }
+                    else { el.value = token; }
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    out.events++;
+                    return true;
+                } catch(e) { return false; }
+            }
+
+            // 1. 具名的 response 字段
             var inputs = document.querySelectorAll(
                 'input[name="cf-turnstile-response"], ' +
                 'input[name="cf_challenge_response"], ' +
                 'input[name*="turnstile"], ' +
                 'input[name*="challenge_response"]'
             );
-            for (var i = 0; i < inputs.length; i++) { inputs[i].value = token; success = true; }
-            var hiddenInputs = document.querySelectorAll('input[type="hidden"]');
-            for (var i = 0; i < hiddenInputs.length; i++) {
-                var name = hiddenInputs[i].name || '';
-                var id = hiddenInputs[i].id || '';
+            for (var i = 0; i < inputs.length; i++) {
+                if (setValue(inputs[i])) out.inputs++;
+            }
+
+            // 2. 兜底：id/name 含 response 且当前为空的隐藏字段
+            var hidden = document.querySelectorAll('input[type="hidden"]');
+            for (var i = 0; i < hidden.length; i++) {
+                var name = hidden[i].name || '', id = hidden[i].id || '';
                 if (name.indexOf('response') >= 0 || id.indexOf('response') >= 0) {
-                    if (!hiddenInputs[i].value || hiddenInputs[i].value.length < 10) {
-                        hiddenInputs[i].value = token; success = true;
+                    if (!hidden[i].value || hidden[i].value.length < 10) {
+                        if (setValue(hidden[i])) out.inputs++;
                     }
                 }
             }
+
+            // 3. Turnstile 官方回调。注意 Turnstile 没有 hCaptcha 那样的
+            //    setResponse——explicit render 的 callback 是闭包，外部取不到，
+            //    只能走 data-callback 这条公开路径。
+            try {
+                document.querySelectorAll('[data-callback]').forEach(function(c) {
+                    var name = c.getAttribute('data-callback');
+                    if (name && typeof window[name] === 'function') {
+                        try { window[name](token); out.callbacks.push(name); } catch(e) {}
+                    }
+                });
+            } catch(e) {}
+
+            // 4. 若页面把 turnstile 实例挂在 window 上，尝试其公开方法
             try {
                 if (window.turnstile) {
-                    var containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                    containers.forEach(function(c) {
-                        var widgetId = c.getAttribute('data-turnstile-id');
+                    ['execute', 'reset'].forEach(function(m) {
+                        if (typeof window.turnstile[m] === 'function') out.api.push(m);
                     });
                 }
             } catch(e) {}
-            try { document.dispatchEvent(new CustomEvent('turnstile-solved', {detail: {token: token}})); } catch(e) {}
-            return success;
+
+            try {
+                document.dispatchEvent(new CustomEvent('turnstile-solved',
+                                                       {detail: {token: token}}));
+            } catch(e) {}
+
+            return out;
         }""", token)
-        return injected
+
+        success = detail.get('inputs', 0) > 0
+        print(f"  Token 交付: 字段 {detail.get('inputs')} 个"
+              f"（native setter {detail.get('reactSetter')}，事件 {detail.get('events')}）"
+              f"，回调 {detail.get('callbacks') or '无'}"
+              f"，window.turnstile={detail.get('turnstileApi')}")
+        if not success:
+            print("  ⚠️ 未找到任何可写入的 response 字段，token 没有交付出去")
+        elif not detail.get('reactSetter'):
+            print("  ⚠️ native setter 不可用，React 可能收不到本次变更")
+        return success
     except Exception as e:
         print(f"  Inject turnstile token error: {e}")
         return False
