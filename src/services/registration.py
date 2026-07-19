@@ -145,7 +145,7 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
                             time.sleep(3)
 
                 if cards_added > 0:
-                    account_model.update_status(email, f"bound_{cards_added}_cards")
+                    account_model.update_bound_cards(email, cards_added)
                 else:
                     account_model.update_status(email, "card_bind_failed")
             else:
@@ -273,7 +273,7 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
                     time.sleep(3)
 
         if bound_count > 0:
-            account_model.update_status(email, f"bound_{bound_count}_cards")
+            account_model.update_bound_cards(email, bound_count)
         else:
             account_model.update_status(email, "all_bindings_failed")
 
@@ -344,6 +344,11 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
             return 0, False
         _report("logged_in")
 
+        # 登录过程中弹出过欠费/待支付弹窗 = 该账号已产生账单 = 已绑过卡。
+        # 此时只核对账单页真实卡数并回写账号，不再补绑：这些卡多半不在卡池里，
+        # 库里查不到也不做关联（card_bindings 不写），仅以 bound_card_count 体现。
+        already_bound = getattr(driver, "overdue_dialog_seen", False)
+
         if not navigate_to_billing(driver):
             print("导航到账单页面失败，跳过该账号")
             return 0, True
@@ -353,6 +358,15 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
         current = get_bound_card_count(driver)
         if current is None:
             current = 0
+        # 无论走哪条分支，页面读数都是权威值，先落库
+        account_model.update_bound_cards(email, current)
+
+        if already_bound:
+            print(f"账号 {email} 登录时出现待支付弹窗，判定为已绑卡账号；"
+                  f"账单页核对到 {current} 张，已更新账号信息，跳过补绑")
+            _report("cards_checked")
+            return 0, True
+
         need = max_bindable_cards - current
         print(f"账号 {email} 当前已绑 {current} 张，目标 {max_bindable_cards} 张，需补 {max(need, 0)} 张")
         if need <= 0:
@@ -387,7 +401,7 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
                     time.sleep(3)
 
         if bound_count > 0:
-            account_model.update_status(email, f"bound_{current + bound_count}_cards")
+            account_model.update_bound_cards(email, current + bound_count)
 
     except InterruptedError:
         print("任务被用户中断")

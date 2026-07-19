@@ -149,6 +149,14 @@ ALTER TABLE card_bindings ADD COLUMN claimed_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_cb_status_claimed ON card_bindings(status, claimed_at);
 """
 
+# 账号绑卡数落库。此前绑卡数只编码在 status 文本 'bound_N_cards' 里，靠字符串解析取值；
+# 补绑流程现在会在「账号本就已绑卡（登录后弹出待支付弹窗）」这条分支上只核对不补绑，
+# 需要一个不依赖 status 语义的权威计数列。cards_checked_at 记录该计数的核对时刻。
+_SCHEMA_V9 = """
+ALTER TABLE accounts ADD COLUMN bound_card_count INTEGER;
+ALTER TABLE accounts ADD COLUMN cards_checked_at TEXT;
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -158,6 +166,7 @@ _MIGRATIONS = {
     6: _SCHEMA_V6,
     7: _SCHEMA_V7,
     8: _SCHEMA_V8,
+    9: _SCHEMA_V9,
 }
 
 

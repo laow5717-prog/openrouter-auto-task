@@ -296,7 +296,12 @@ def get_accounts():
             "status": acc.get('status') or '',
             "time": acc.get('created_at') or '',
             "email_password": acc.get('email_password') or '',
+            # card_count：库内 card_bindings 成功关联的卡数（可点开看明细）
+            # bound_card_count：账单页核对到的真实绑卡数，可能大于 card_count
+            #   —— 账号绑过卡池外的卡时，那些卡不入库、只体现在这个计数上
             "card_count": card_counts.get(acc['email'], 0),
+            "bound_card_count": acc.get('bound_card_count'),
+            "cards_checked_at": acc.get('cards_checked_at') or '',
             "credits_balance": acc.get('credits_balance'),
             "balance_updated_at": acc.get('balance_updated_at') or '',
         })

@@ -113,6 +113,10 @@ class BrowserSession:
         self._cdp_session = None            # 惰性创建的 CDPSession（缓存）
         self._closed = False
         self.account_banned = False         # 登录时检测到账号被 Cloudflare 封禁则置 True
+        # 本会话内是否出现过欠费/待支付弹窗。该弹窗只对「已产生账单」的账号弹，
+        # 因此是「账号已绑过卡」的强信号。dismiss_overdue_dialog 在登录流程里被多处调用，
+        # 弹窗关掉后就无从追溯，故在此留痕供上层业务分支判断（见 bind_cards_to_existing_account）。
+        self.overdue_dialog_seen = False
         self.credit_balance = None          # 被动监听 credit-balance 接口捕获的最新余额（美元）
         self.credit_balance_ts = None       # 上次捕获余额的时间戳（time.time()）
 
@@ -789,6 +793,11 @@ def dismiss_overdue_dialog(driver):
         if btn.count() == 0:
             btn = d0.get_by_role("button", name="I understand")
         if btn.count() > 0:
+            # 留痕：弹窗出现即视为该账号已有账单（已绑过卡），供上层跳过补绑分支
+            try:
+                driver.overdue_dialog_seen = True
+            except Exception:
+                pass
             # 弹窗按钮偶有 actionability 问题，_safe_click 失败则 JS click 兜底
             try:
                 _safe_click(btn.first, session=driver, desc="欠费弹窗 I understand", retries=1)
