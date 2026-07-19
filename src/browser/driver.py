@@ -1323,6 +1323,66 @@ def _card_field_locator(page, selector):
     return None
 
 
+def _dump_visual_vs_dom(driver):
+    """对比「屏幕上渲染出来的」与「DOM 查询看到的」，用于排查两者不一致。
+
+    实测存在这种情况：卡号/有效期/CVC 在界面上完全可见，但对应 frame 的 DOM 查询
+    读到零 input。这类问题不是选择器能解决的，必须先确认代码操作的页面是否就是
+    显示中的那个页面。这里做三件事：
+      1. 存一张截图，肉眼确认代码看到的画面是否与用户看到的一致
+      2. 列出浏览器上下文里所有 page，确认没有在操作另一个标签页
+      3. 用 elementFromPoint 反查卡表单 iframe 中心点，看命中的到底是什么元素
+    """
+    page = driver.page
+    try:
+        shot = os.path.join(tempfile.gettempdir(),
+                            f"cf_stripe_debug_{int(time.time())}.png")
+        page.screenshot(path=shot)
+        print(f"  📸 已保存截图: {shot}")
+    except Exception as e:
+        print(f"  📸 截图失败: {str(e)[:80]}")
+
+    try:
+        pages = driver.context.pages
+        print(f"  🔍 上下文内 page 数: {len(pages)}（当前操作的是第 "
+              f"{pages.index(page) if page in pages else -1} 个）")
+        for i, pg in enumerate(pages):
+            mark = " ←当前" if pg is page else ""
+            print(f"        [{i}] {str(pg.url)[:110]}{mark}")
+    except Exception as e:
+        print(f"  🔍 枚举 page 失败: {str(e)[:80]}")
+
+    try:
+        info = page.evaluate("""() => {
+            const ifr = document.querySelector(
+                '[data-test-id="credit-card-form"] iframe[title="Secure payment input frame"]')
+                || document.querySelector('[data-test-id="credit-card-form"] iframe');
+            if (!ifr) return {found: false};
+            const r = ifr.getBoundingClientRect();
+            const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+            const hit = document.elementFromPoint(cx, cy);
+            return {
+                found: true,
+                rect: {x: Math.round(r.left), y: Math.round(r.top),
+                       w: Math.round(r.width), h: Math.round(r.height)},
+                hitTag: hit ? hit.tagName.toLowerCase() : null,
+                hitTitle: hit ? (hit.getAttribute('title') || '') : '',
+                isSameIframe: hit === ifr,
+            };
+        }""")
+        if not info.get('found'):
+            print("  🔍 主文档中未找到卡表单 iframe 元素")
+        else:
+            r = info['rect']
+            print(f"  🔍 卡表单 iframe 位置 {r['w']}x{r['h']} @({r['x']},{r['y']})，"
+                  f"中心点命中 <{info['hitTag']}> title={info['hitTitle']!r} "
+                  f"{'(就是该 iframe)' if info['isSameIframe'] else '(被其它元素遮挡)'}")
+            if r['w'] == 0 or r['h'] == 0:
+                print("        ❗ iframe 尺寸为 0，DOM 中存在但未占位")
+    except Exception as e:
+        print(f"  🔍 坐标反查失败: {str(e)[:80]}")
+
+
 def _wait_for_stripe_fields_ready(driver, timeout=90):
     """
     等待 Stripe 卡号字段真正可定位。弹窗和外层 iframe 会先出现，内部字段延迟加载。
@@ -1341,6 +1401,7 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
 
     weak_ready = False
     start = time.time()
+    next_report = 15          # 首次进度播报时刻（秒），之后每 15s 一次
     while time.time() - start < timeout:
         try:
             # 主路径: 经 FrameLocator 定位（每轮重新解析，跟得上 Stripe 重建 iframe）
@@ -1373,20 +1434,25 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
                 except Exception:
                     continue
 
-            # 检查2: 嵌套 iframe 数量。这只是「容器已渲染」的弱判据——iframe 存在不等于
-            # 卡号字段可定位。不能据此立即返回，否则选择器失配会被伪装成就绪；
-            # 只记录一次，继续轮询真字段直到超时。
+            # 「弹窗内 iframe ≥2 个」只表示容器已渲染，不等于卡号字段可定位，
+            # 故仅作状态记录、不能据此返回就绪。
             if not weak_ready:
                 inner_frames = page.locator('[role="dialog"] iframe').all()
-                visible_frames = [f for f in inner_frames if _vis(f)]
-                if len(visible_frames) >= 2:
+                if len([f for f in inner_frames if _vis(f)]) >= 2:
                     weak_ready = True
-                    # loader-ui 是 Stripe 的加载骨架屏，它在场即表示字段仍未渲染
-                    loading = any('elements-inner-loader-ui' in (f.url or '')
-                                  for f in page.frames)
-                    hint = "（Stripe 仍在加载骨架屏）" if loading else ""
-                    print(f"  ℹ️ Stripe 嵌套 iframe 已渲染 ({len(visible_frames)} 个)"
-                          f"{hint}，继续等待卡号字段...")
+
+            # 周期性进度：整段等待可长达 90s，若只在开头打一行，看起来会像卡死。
+            # 每 15s 报一次已等时长与骨架屏是否仍在，便于区分「在等」和「真卡住」。
+            waited = int(time.time() - start)
+            if waited >= next_report:
+                next_report += 15
+                # 注意：loader-ui frame 在场不代表界面真的还在加载——实测存在
+                # 「界面已完全渲染可见、DOM 查询却读到零 input」的情况，此时该 frame
+                # 仍挂着。故这里只如实报告 frame 状态，不推断界面是否加载完成。
+                loader = any('elements-inner-loader-ui' in (f.url or '')
+                             for f in page.frames)
+                print(f"  ⏳ 等待卡号字段 {waited}s/{timeout}s"
+                      f"（loader-ui frame {'在' if loader else '不在'}）")
         except Exception:
             pass
         time.sleep(1)
@@ -1403,6 +1469,7 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
             _dump_stripe_frame_fields(page, probe)
         except Exception:
             pass
+        _dump_visual_vs_dom(driver)
         # Payment Element 卡在加载态时，原因往往不在 DOM 而在被拒的接口或 JS 报错
         try:
             errs = list(driver.console_all_errors or []) or list(driver.console_errors or [])
