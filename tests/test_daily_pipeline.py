@@ -64,9 +64,11 @@ class _Stub:
             if email:
                 self._in_flight_emails.discard(email)
 
+    # **kwargs 吸收 claim_more 等新增可选参数：这些替身验证的是流水线编排，
+    # 不该因被测函数新增可选形参而失败
     def bind_existing(self, account_model, card_binding_model, task_id, email,
                       cf_password, batch_records, max_bindable_cards=2,
-                      captcha_api_key=None, monitor_callback=None):
+                      captcha_api_key=None, monitor_callback=None, **kwargs):
         self._enter(email)
         try:
             threading.Event().wait(self.delay)
@@ -80,7 +82,7 @@ class _Stub:
 
     def register(self, db, account_model, card_binding_model, task_id, batch_records,
                  cf_password=None, max_bindable_cards=2, captcha_api_key=None,
-                 monitor_callback=None):
+                 monitor_callback=None, **kwargs):
         with self.lock:
             self.n += 1
             email = f'new{self.n}@example.com'

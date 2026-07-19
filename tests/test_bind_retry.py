@@ -16,6 +16,9 @@ class FakeAccountModel:
     def get_email_password(self, email):
         return None
 
+    def upsert(self, email, cf_password=None, email_password=None, status='registered'):
+        pass
+
     def update_bound_cards(self, email, count, sync_status=True):
         self.bound[email] = count
 
@@ -125,6 +128,52 @@ def test_extra_claim_rounds_are_bounded(monkeypatch):
 
     assert bound == 0
     assert len(rounds) <= 3, f"再领轮数应有上限，实际 {len(rounds)}"
+
+
+def _patch_register(monkeypatch, results):
+    """打桩注册路径的浏览器与邮箱依赖。"""
+    calls = {"n": 0}
+
+    def fake_add_card(driver, card_info):
+        i = calls["n"]
+        calls["n"] += 1
+        return results[i] if i < len(results) else (False, "no more stub")
+
+    monkeypatch.setattr(reg, "create_driver", lambda **kw: object())
+    monkeypatch.setattr(reg, "close_driver", lambda d: None)
+    monkeypatch.setattr(reg, "create_temp_email",
+                        lambda: ("n@x.com", "epw", "jwt"))
+    monkeypatch.setattr(reg, "fill_signup_form", lambda *a, **kw: True)
+    monkeypatch.setattr(reg, "wait_for_verification_email", lambda t: {"code": "1"})
+    monkeypatch.setattr(reg, "handle_email_verification", lambda *a, **kw: True)
+    monkeypatch.setattr(reg, "navigate_to_billing", lambda d: True)
+    monkeypatch.setattr(reg, "add_credit_card", fake_add_card)
+    monkeypatch.setattr(reg.time, "sleep", lambda s: None)
+    return calls
+
+
+def test_register_path_failed_card_does_not_consume_quota(monkeypatch):
+    """注册路径：失败的卡不占 max_bindable_cards 名额，应再领卡补足。
+
+    真实场景：每账号只领 max_bindable_cards 张卡，一张被拒就永远绑不满目标。
+    """
+    _patch_register(monkeypatch, [(False, "declined"), (True, None), (True, None)])
+    acct, cards = FakeAccountModel(), FakeCardBindingModel()
+    handed = []
+    counter = {"id": 50}
+
+    def claim_more(n):
+        handed.append(n)
+        counter["id"] += 1
+        return [_record(counter["id"])]
+
+    email, _pw, bound = reg.register_and_bind_cards(
+        db=None, account_model=acct, card_binding_model=cards, task_id=1,
+        batch_records=[_record(1), _record(2)], max_bindable_cards=2,
+        claim_more=claim_more)
+
+    assert bound == 2, f"失败卡不该占名额，应补到 2 张，实际 {bound}"
+    assert handed == [1], f"应按仍缺张数补领，实际 {handed}"
 
 
 def test_duplicate_records_are_not_bound_twice(monkeypatch):

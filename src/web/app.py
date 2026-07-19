@@ -323,6 +323,10 @@ class AppState:
                     max_bindable_cards=max_bindable_cards,
                     captcha_api_key=captcha_api_key,
                     monitor_callback=worker.make_monitor(self),
+                    # 失败的卡不占名额：本批只领了 max_bindable_cards 张，
+                    # 一张被拒就再补一张，否则该账号永远绑不满
+                    claim_more=lambda n: card_binding_model.claim_batch(
+                        task_id, worker.worker_id, n),
                 )
 
                 if email and bound_count > 0:

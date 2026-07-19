@@ -29,7 +29,10 @@ class _Recorder:
 
     def register_and_bind_cards(self, db, account_model, card_binding_model, task_id,
                                 batch_records, cf_password=None, max_bindable_cards=2,
-                                captcha_api_key=None, monitor_callback=None):
+                                captcha_api_key=None, monitor_callback=None,
+                                **kwargs):
+        # **kwargs 吸收 claim_more 等新增可选参数：本替身只验证卡的领取/归还编排，
+        # 不该因被测函数新增可选形参而失败
         with self.lock:
             self._active += 1
             self.concurrent_peak = max(self.concurrent_peak, self._active)

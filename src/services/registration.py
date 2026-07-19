@@ -180,9 +180,14 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
 
 def register_and_bind_cards(db, account_model, card_binding_model, task_id,
                             batch_records, cf_password=None, max_bindable_cards=2,
-                            captcha_api_key=None, monitor_callback=None):
+                            captcha_api_key=None, monitor_callback=None,
+                            claim_more=None):
     """
     注册一个账号并逐张绑定信用卡，精细跟踪每张卡的状态
+
+    claim_more: 可选回调 claim_more(n) -> [record, ...]。绑定失败的卡不占用
+        max_bindable_cards 名额，卡试完仍未绑够时用它再领一批继续（最多 3 轮）。
+        不传则维持原行为：batch_records 用完即结束。
 
     返回: (email, password, bound_count)
     """
@@ -243,16 +248,21 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
         print("已进入账单页面")
         _report("billing_page")
 
-        # 逐张绑定信用卡，失败不计数，继续尝试直到绑够 max_bindable_cards
-        for idx, record in enumerate(batch_records):
+        # 逐张绑定信用卡。失败的卡不计入 bound_count，也不占用 max_bindable_cards 名额：
+        # 队列可在中途追加，卡都试完仍未绑够时再领一批，复用当前浏览器继续。
+        queue = list(batch_records)
+        idx = 0
+        extra_rounds = 0
+        while idx < len(queue):
             if bound_count >= max_bindable_cards:
                 print(f"账号已达到最大绑卡数 ({max_bindable_cards})，停止绑卡，剩余卡片留待下个账号处理")
                 break
 
+            record = queue[idx]
             card_info = record["card"]
             card_display = f"****{record['card_display']}"
             binding_id = record["id"]
-            print(f"\n绑定 {idx + 1}/{len(batch_records)}: {card_display}...")
+            print(f"\n绑定 {idx + 1}/{len(queue)}: {card_display}...")
 
             _success, _err_reason = add_credit_card(driver, card_info)
             if _success:
@@ -260,17 +270,30 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
                 card_binding_model.mark_success(binding_id, email)
                 print(f"{card_display} 绑定成功！(已绑 {bound_count} 张)")
                 _report("card_added")
-
-                if idx < len(batch_records) - 1:
-                    navigate_to_billing(driver)
-                    time.sleep(3)
             else:
                 card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")
-                print(f"{card_display} 绑定失败，尝试下一张... ({_err_reason})")
+                print(f"{card_display} 绑定失败 ({_err_reason})")
                 _report("card_failed")
-                if idx < len(batch_records) - 1:
-                    navigate_to_billing(driver)
-                    time.sleep(3)
+
+            idx += 1
+            still_need = max_bindable_cards - bound_count
+
+            # 卡试完但没绑够 → 再领一批。失败的卡不该消耗名额，否则一张卡被拒
+            # 就永远达不到目标（本批只领了 max_bindable_cards 张）。
+            if idx >= len(queue) and still_need > 0 and claim_more and extra_rounds < 3:
+                extra = claim_more(still_need) or []
+                extra_rounds += 1
+                seen_ids = {r["id"] for r in queue}
+                fresh = [r for r in extra if r["id"] not in seen_ids]
+                if fresh:
+                    queue.extend(fresh)
+                    print(f"仍需 {still_need} 张，已再领 {len(fresh)} 张继续尝试")
+
+            if idx < len(queue) and bound_count < max_bindable_cards:
+                navigate_to_billing(driver)
+                time.sleep(3)
+            elif bound_count < max_bindable_cards:
+                print(f"已无可用卡片，本账号绑卡结束（已绑 {bound_count}/{max_bindable_cards} 张）")
 
         if bound_count > 0:
             account_model.update_bound_cards(email, bound_count)
