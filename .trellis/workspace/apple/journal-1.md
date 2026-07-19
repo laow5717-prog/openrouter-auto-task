@@ -954,3 +954,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 29: 登录邮箱二次验证自动化
+
+**Date**: 2026-07-19
+**Task**: 登录邮箱二次验证自动化
+**Branch**: `main`
+
+### Summary
+
+清除账号 profile 后 Cloudflare 判定为新设备，登录卡在 two-factor?type=email。实现自动过 2FA：识别该页后用库里的 email_password 现换 mail.tm token、收码、填入。DOM 侦察推翻了用户报告的白屏假说（页面渲染正常），但证实现有填码选择器对真实输入框 name=twofactor_token 全部失配。顺带修掉两个原本必然失败的缺陷：extract_verification_code 的 (\d{6}) 会把 7 位码截成 6 位；取码只按发件人不按时间会返回收件箱里的历史过期码。实跑通过，83 个既有测试全过。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3bf2539` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
