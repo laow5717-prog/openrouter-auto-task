@@ -1030,3 +1030,40 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 31: 修复浏览器 profile 白屏；定位 Turnstile token 未交付
+
+**Date**: 2026-07-19
+**Task**: 修复浏览器 profile 白屏；定位 Turnstile token 未交付
+**Branch**: `main`
+
+### Summary
+
+排查每日任务中浏览器白屏：定位到两个独立成因——Service Worker 缓存腐坏（SW 拦截导航返回空响应，现场单 profile 695M/SW 133M，从未清理）与孤儿 Chrome 抢占同一 profile（_clear_singleton_locks 无条件删锁，其注释声称的单实例前提在有孤儿时不成立）。泄漏源是 quit() 静默吞掉 context.close() 异常。修复：新增 _prune_profile_cache（超 200MB 清缓存，不碰 Cookies/Login Data/Local Storage/Local State）、_chrome_pids_for_profile/_kill_chrome_for_profile（删锁前主动验证并回收，仅用标准库 ps，不引入 psutil）、quit() 不再吞异常并留 5 秒宽限期让 Chrome 落盘后再核查残留。在 455M profile 副本上实跑验证：清理 386M 后 URL 仍重定向到带 account_id 的 /home（登录态完好）、页面正常渲染、无残留进程；新增 12 个回归测试，全量 108 通过。新增 spec: browser-profile-guidelines.md，并订正 concurrency-guidelines 中引用旧行为的段落。
+
+后续排查注册 Turnstile：日志显示 Turnstile 实际已通过（2Captcha 解出 token 并注入、表单已提交），真正卡点是验证邮件永不到达，4 次尝试全同。根因定位为 _inject_turnstile_token（captcha.py:488-523）只设 DOM value——对比同文件 hCaptcha 版的四步（填值/调官方 setResponse/派发 input+change/调 data-callback），Turnstile 版仅做第一步，:509-516 取出 widgetId 后是空壳。CF 注册页是 React 应用，不派发 input/change 则受控组件状态不更新，提交 payload 中 token 为空。判定函数 _is_turnstile_truly_solved 改看「submit 按钮 enabled」等间接信号，故误报成功；fill_signup_form:3261 又忽略返回值照样点提交，失败被吞。该结论未实证，竞争假设（mail.tm 的 web-library.net 域名被 CF 拉黑，症状完全一致）未排除，取证脚本 scratchpad/probe_turnstile.py 已备好（被动监听抓提交 payload，决定性证据是 cf_challenge_response 是否为空）。任务已归档，PRD 在 archive/2026-07/07-19-turnstile-token-delivery。
+
+会话内还协作式停止并重启了服务（等 IN-72053681 三张卡落库后才停，浏览器 0 残留，新 PID 19297）。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9202eb7` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

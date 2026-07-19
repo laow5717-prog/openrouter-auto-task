@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 30
+- **Total Sessions**: 31
 - **Last Active**: 2026-07-19
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1032 | Active |
+| `journal-1.md` | ~1069 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 31 | 2026-07-19 | 修复浏览器 profile 白屏；定位 Turnstile token 未交付 | `9202eb7` | `main` |
 | 30 | 2026-07-19 | 卡池跨分组移动：手工迁移 100 张待验证卡 + 功能产品化 | `57144d0` | `main` |
 | 29 | 2026-07-19 | 登录邮箱二次验证自动化 | `3bf2539` | `main` |
 | 28 | 2026-07-18 | 每日流水线多浏览器并发执行 | `201b801`, `9c8045a`, `9211e71`, `aae2a65`, `82954ff`, `356a34e`, `bcaf8d9`, `0a0765b`, `82d9bfa`, `8908a81`, `16ac210` | `main` |
