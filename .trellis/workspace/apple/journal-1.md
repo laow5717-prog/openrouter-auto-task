@@ -987,3 +987,46 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 30: 卡池跨分组移动：手工迁移 100 张待验证卡 + 功能产品化
+
+**Date**: 2026-07-19
+**Task**: 卡池跨分组移动：手工迁移 100 张待验证卡 + 功能产品化
+**Branch**: `main`
+
+### Summary
+
+用户要求把支付卡分组里 100 张「待验证」卡移到绑定卡分组。先用 SQL 完成手工迁移（group 4 → group 2，迁移前已备份），随后建 Trellis 任务把该操作产品化。
+
+关键发现：「待验证」不是 card_pool.status 的存储值，而是派生桶（非 expired/invalid 且不在 valid_cards 表中），必须走 CardPoolModel._bucket_where() 统一口径，写 WHERE status='pending' 会静默返回空。
+
+新增 POST /api/card-pool/<group_id>/move + CardPoolModel.move_bucket_to_group()：支持 unverified/valid/non_invalid 三桶、按 id 升序限量移动。与已有 /merge 的一处刻意分歧：目标组有同卡号时**跳过**而非删除源行——merge 在「合并整组」语境下删行合理，但「只移 N 张」语境下会造成意外丢卡。
+
+实现中发现 Database.execute() 逐条自动提交，无法满足原子性，于是补了 transaction() 上下文管理器。它不可重入：块内只能用 yield 出的 conn，调 self.db.execute 会死锁且提前提交。该约束与卡池桶口径均已写入 .trellis/spec/backend/database-guidelines.md。
+
+验证：单测 96 项全过（含 merge 回归），真实库副本验证桶口径，并起临时实例用浏览器实跑完整 UI 流程确认计数刷新与无效卡不被搬运。
+
+遗留未处理：mark_status_by_number() 按 card_number 全表更新、不带 group_id 条件，靠「同卡号不跨组」不变量兜底，该不变量较脆弱，可另开任务收紧。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `57144d0` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
