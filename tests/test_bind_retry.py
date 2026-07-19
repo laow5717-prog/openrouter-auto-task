@@ -130,6 +130,43 @@ def test_extra_claim_rounds_are_bounded(monkeypatch):
     assert len(rounds) <= 3, f"再领轮数应有上限，实际 {len(rounds)}"
 
 
+def test_overdue_dialog_account_still_tops_up_to_target(monkeypatch):
+    """登录见到待支付弹窗、但实测张数未达目标时，仍应继续补绑。
+
+    弹窗只说明该账号有账单历史，不代表不能再绑。此前据此直接跳过，
+    导致只绑了 1 张的账号永远停在 1 张，且每轮任务都要重新登录一次才发现要跳过。
+    """
+    _patch(monkeypatch, [(True, None)])
+
+    class DriverWithDialog:
+        overdue_dialog_seen = True
+
+    monkeypatch.setattr(reg, "create_driver", lambda **kw: DriverWithDialog())
+    monkeypatch.setattr(reg, "get_bound_card_count", lambda d: 1)
+
+    acct, cards = FakeAccountModel(), FakeCardBindingModel()
+    bound, ok = reg.bind_cards_to_existing_account(
+        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        batch_records=[_record(1)], max_bindable_cards=2)
+
+    assert (bound, ok) == (1, True), "见到弹窗也应补到目标张数"
+    assert acct.bound["a@x.com"] == 2, "落库应为核对值 1 + 本轮绑成 1"
+
+
+def test_account_already_at_target_is_not_rebound(monkeypatch):
+    """实测已达目标张数时不再绑卡，避免超绑。"""
+    _patch(monkeypatch, [(True, None)])
+    monkeypatch.setattr(reg, "get_bound_card_count", lambda d: 2)
+
+    acct, cards = FakeAccountModel(), FakeCardBindingModel()
+    bound, ok = reg.bind_cards_to_existing_account(
+        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        batch_records=[_record(1)], max_bindable_cards=2)
+
+    assert (bound, ok) == (0, True)
+    assert cards.success == [] and cards.failed == []
+
+
 class FakeCardPoolModel:
     def __init__(self):
         self.invalidated = []

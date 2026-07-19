@@ -72,6 +72,11 @@ SHORT_TIMEOUT_MS = SHORT_WAIT_TIME * 1000     # 短等待 = 5s
 CLICK_TIMEOUT_MS = 15_000
 FILL_TIMEOUT_MS = 15_000
 
+# 关闭浏览器的看门狗时限（秒）。Chrome 卡死时 context.close() 会无限期阻塞，
+# 整条任务线程随之静默且不报错。超过此时限就按 profile 目录强杀 Chrome 解除阻塞。
+# 取值需明显大于 Chrome 正常退出耗时（含 Cookies 落盘），否则会误杀正常关闭流程。
+_CLOSE_WATCHDOG_SEC = 30
+
 # 支付/卡错误 console 日志匹配（复刻原 console 拦截器正则，L158-164）
 _CARD_ERROR_PATTERNS = [
     re.compile(r'setup.intent.error', re.I),
@@ -235,6 +240,25 @@ class BrowserSession:
         if self._closed:
             return
         self._closed = True
+
+        # 看门狗：context.close() / playwright.stop() 会等 Chrome 应答，Chrome 卡死时
+        # 这两个调用会无限期阻塞，整条任务线程就此静默——现象是日志停在
+        # 「正在关闭浏览器...」之后再无任何输出，且不报错（close_driver 吞异常也救不了，
+        # 因为根本没抛出）。超时后直接按 profile 目录杀掉 Chrome，阻塞的调用随即解开。
+        # 只做 OS 层 os.kill，不碰任何 Playwright 对象，故可安全地从别的线程执行。
+        watchdog = None
+        if self._user_data_dir:
+            def _force_kill():
+                print(f"  ⏱️ 关闭浏览器超时 {_CLOSE_WATCHDOG_SEC}s，强制回收 Chrome 进程")
+                try:
+                    _kill_chrome_for_profile(self._user_data_dir, '关闭超时', grace=0)
+                except Exception as e:
+                    print(f"  ⚠️ 强制回收失败: {str(e)[:120]}")
+
+            watchdog = threading.Timer(_CLOSE_WATCHDOG_SEC, _force_kill)
+            watchdog.daemon = True
+            watchdog.start()
+
         # 这两处异常绝不能静默：close 失败意味着 Chrome 进程还活着，而 playwright.stop()
         # 随后就会拆掉 driver 传输通道，此后再没有任何途径能关掉它。以前吞掉异常的后果是
         # 日志里只剩「初始化 55 次 / 关闭 48 次」这种事后才看得出的差值。
@@ -246,6 +270,9 @@ class BrowserSession:
             self.playwright.stop()
         except Exception as e:
             print(f"  ⚠️ 停止 playwright 失败: {str(e)[:120]}")
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
 
         # 核查 Chrome 是否真的退了。持久化 profile 才需要——临时 profile 目录随后就被
         # 整个删掉，且下次不会有人复用它。grace 让正常退出的 Chrome 有时间落盘 Cookies，

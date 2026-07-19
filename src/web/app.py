@@ -634,13 +634,29 @@ class AppState:
                 accts = account_model.get_all(order_desc=False)  # 按创建顺序（id 升序）
                 emails = [a['email'] for a in accts]
                 counts = card_binding_model.count_by_emails(emails)
+
+                def _known_bound(a):
+                    """该账号已知的绑卡数：取库内成功数与账单页实测数的较大者。
+
+                    只看库内数会漏掉「卡不在卡池、由外部绑定」的情况——那类账号
+                    库内恒为 0，于是每轮任务都要重新登录一次才发现已绑过，纯属浪费。
+                    bound_card_count 是登录后从账单页读到的真实值（可能为 None）。
+                    """
+                    return max(counts.get(a['email'], 0), a.get('bound_card_count') or 0)
+
                 candidates = [
                     a for a in accts
                     if a.get('cf_password')
                     and (a.get('status') or '') != 'banned'
-                    and counts.get(a['email'], 0) < max_bindable_cards
+                    and _known_bound(a) < max_bindable_cards
                 ]
-                self._hooked_print(f"补绑候选账号 {len(candidates)} 个")
+                skipped_full = sum(
+                    1 for a in accts
+                    if a.get('cf_password') and (a.get('status') or '') != 'banned'
+                    and _known_bound(a) >= max_bindable_cards)
+                self._hooked_print(
+                    f"补绑候选账号 {len(candidates)} 个"
+                    + (f"（已满 {skipped_full} 个，跳过）" if skipped_full else ""))
 
                 max_consecutive_failures = 3
                 counters['bind_fail_streak'] = 0

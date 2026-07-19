@@ -401,8 +401,11 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
         _report("logged_in")
 
         # 登录过程中弹出过欠费/待支付弹窗 = 该账号已产生账单 = 已绑过卡。
-        # 此时只核对账单页真实卡数并回写账号，不再补绑：这些卡多半不在卡池里，
-        # 库里查不到也不做关联（card_bindings 不写），仅以 bound_card_count 体现。
+        # 这些卡多半不在卡池里，库里查不到也不做关联（card_bindings 不写），
+        # 只体现在 bound_card_count 上。
+        # 注意：弹窗只说明「有账单历史」，不代表不能再绑——若实测张数未达目标仍继续
+        # 补绑。此前据此直接跳过，导致只绑了 1 张的账号永远停在 1 张，且每轮任务都要
+        # 重新登录一次才发现要跳过。
         already_bound = getattr(driver, "overdue_dialog_seen", False)
 
         if not navigate_to_billing(driver):
@@ -418,10 +421,9 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
         account_model.update_bound_cards(email, current)
 
         if already_bound:
-            print(f"账号 {email} 登录时出现待支付弹窗，判定为已绑卡账号；"
-                  f"账单页核对到 {current} 张，已更新账号信息，跳过补绑")
+            print(f"账号 {email} 登录时出现待支付弹窗（已有账单），"
+                  f"账单页核对到 {current} 张，已更新账号信息")
             _report("cards_checked")
-            return 0, True
 
         need = max_bindable_cards - current
         print(f"账号 {email} 当前已绑 {current} 张，目标 {max_bindable_cards} 张，需补 {max(need, 0)} 张")
