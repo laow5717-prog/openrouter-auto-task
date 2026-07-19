@@ -424,7 +424,8 @@ def open_account_browser():
         driver = None
         try:
             driver = create_driver(headless=False, profile_id=email)
-            account_id = login_cloudflare(driver, email, cf_password)
+            account_id = login_cloudflare(
+                driver, email, cf_password, account.get('email_password'))
             if account_id:
                 state.add_log(f"{email} 浏览器已打开")
             elif getattr(driver, 'account_banned', False):

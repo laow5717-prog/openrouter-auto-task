@@ -6,6 +6,7 @@
 import random
 import string
 import time
+from datetime import datetime, timezone
 
 from src.config import cfg
 from src.utils import http_session, extract_verification_link, extract_verification_code
@@ -90,6 +91,119 @@ def create_temp_email():
         print(f"  获取 token 失败: {e}")
 
     return None, None, None
+
+
+def get_mail_token(address: str, password: str):
+    """用已存库的邮箱密码换取 mail.tm 访问 token。
+
+    用于老账号（注册时的 token 未落库）重新读取收件箱。token 不缓存、不落库，
+    每次现换。
+
+    返回:
+        str | None: 成功返回 token，失败返回 None（不抛异常）
+    """
+    if not address or not password:
+        print("  缺少邮箱地址或密码，无法获取 mail.tm token")
+        return None
+
+    try:
+        response = http_session.post(
+            f"{MAIL_TM_API}/token",
+            headers={"Content-Type": "application/json"},
+            json={"address": address, "password": password},
+            timeout=cfg.retry.http_timeout,
+        )
+
+        if response.status_code == 200:
+            token = response.json().get('token', '')
+            if token:
+                return token
+            print("  mail.tm 响应中无 token")
+        else:
+            print(f"  获取 mail.tm token 失败: HTTP {response.status_code}")
+
+    except Exception as e:
+        print(f"  获取 mail.tm token 异常: {e}")
+
+    return None
+
+
+def _parse_created_at(value):
+    """解析 mail.tm 的 createdAt（形如 2026-07-19T00:03:48+00:00）。
+
+    返回 aware datetime；无法解析时返回 None——调用方必须把 None 当作
+    「不可信，跳过该邮件」，绝不能当作新邮件放行，否则旧验证码会漏进来。
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def wait_for_login_code(token: str, since_ts, timeout: int = None):
+    """等待并提取 Cloudflare 登录二次验证码（two-factor）。
+
+    与 wait_for_verification_email 的区别，二者不可互换：
+      1. 只认验证码，不认验证链接；
+      2. 按 createdAt 过滤，只接受 since_ts 之后到达的邮件。
+
+    第 2 点是关键：账号收件箱通常已积压多封历史 "Your Cloudflare login token"
+    邮件，不做时间过滤会立刻返回一个早已过期的码。
+
+    参数:
+        token: mail.tm 访问 token
+        since_ts: aware datetime，只接受严格晚于它的邮件。
+                  调用方须在「点击登录按钮之前」取值，否则可能错过邮件。
+        timeout: 秒，默认取 cfg.email.wait_timeout
+    返回:
+        str | None: 验证码；超时未收到新邮件返回 None
+    """
+    if timeout is None:
+        timeout = cfg.email.wait_timeout
+
+    print(f"等待登录验证码 (最长 {timeout} 秒，只认 {since_ts} 之后的邮件)...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        messages = fetch_emails(token) or []
+
+        for msg in messages:
+            created = _parse_created_at(msg.get('createdAt'))
+            if created is None or created <= since_ts:
+                continue  # 旧邮件或时间不可信，一律跳过
+
+            sender = str(msg.get('from', {}).get('address', '')).lower()
+            subject = _to_str(msg.get('subject', ''))
+            if 'cloudflare' not in sender and 'cloudflare' not in subject.lower():
+                continue
+
+            # 登录码通常直接在主题里（Your Cloudflare login token: 1234567）
+            code = extract_verification_code(subject)
+            if not code:
+                detail = get_email_detail(token, msg.get('id', '')) or {}
+                for content in (_to_str(detail.get('text')),
+                                _to_str(detail.get('html')),
+                                _to_str(detail.get('intro'))):
+                    if content:
+                        code = extract_verification_code(content)
+                        if code:
+                            break
+
+            if code:
+                print(f"\n收到登录验证码: {code} (邮件时间 {created})")
+                return code
+
+        elapsed = int(time.time() - start_time)
+        print(f"  等待中... ({elapsed}秒)", end='\r')
+        time.sleep(cfg.email.poll_interval)
+
+    print("\n等待登录验证码超时")
+    return None
 
 
 def fetch_emails(token: str):

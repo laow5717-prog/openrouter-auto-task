@@ -38,6 +38,16 @@ class AccountModel:
             (float(balance), email),
         )
 
+    def get_email_password(self, email):
+        """取该账号的邮箱密码（用于登录二次验证时换 mail.tm token）。
+
+        返回 str | None；账号不存在或未存密码均返回 None。
+        """
+        row = self.db.fetchone(
+            "SELECT email_password FROM accounts WHERE email=?", (email,)
+        )
+        return (dict(row).get('email_password') or None) if row else None
+
     def get_all(self, order_desc=True):
         order = "DESC" if order_desc else "ASC"
         rows = self.db.fetchall(f"SELECT * FROM accounts ORDER BY id {order}")

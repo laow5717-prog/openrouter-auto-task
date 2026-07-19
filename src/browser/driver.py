@@ -12,10 +12,12 @@ import logging
 import tempfile
 import shutil
 import threading
+from datetime import datetime, timezone
 from patchright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 from src.config import cfg
 import src.services.captcha as captcha_solver
+from src.services.email import get_mail_token, wait_for_login_code
 
 # US 州名缩写 → 全称映射
 US_STATE_ABBR = {
@@ -1392,7 +1394,7 @@ def _detect_account_banned(driver):
     return False
 
 
-def login_cloudflare(driver, email: str, password: str):
+def login_cloudflare(driver, email: str, password: str, email_password: str = None):
     """
     登录已有的 Cloudflare 账号
 
@@ -1400,6 +1402,8 @@ def login_cloudflare(driver, email: str, password: str):
         driver: 浏览器驱动
         email: 邮箱地址
         password: CF 密码
+        email_password: 邮箱密码。传入后可自动通过邮箱二次验证
+                        (two-factor?type=email)；不传则遇到 2FA 页会登录失败。
     返回:
         str | None: 成功时返回 account_id，失败返回 None
     """
@@ -1459,6 +1463,10 @@ def login_cloudflare(driver, email: str, password: str):
         _handle_inline_turnstile(driver)
         time.sleep(1)
 
+        # 时间闸门起点：必须在点击登录按钮「之前」取。若在提交后才取，
+        # 邮件可能已先一步到达，导致被当成旧邮件过滤掉而白等到超时。
+        login_submit_ts = datetime.now(timezone.utc)
+
         # 点击登录按钮
         print("正在点击登录按钮...")
         login_selectors = [
@@ -1497,6 +1505,11 @@ def login_cloudflare(driver, email: str, password: str):
         check_and_handle_cf_challenge(driver)
         time.sleep(3)
 
+        # 邮箱二次验证：清空过 profile 的账号会被 CF 判定为新设备，
+        # 跳转到 two-factor?type=email 要求填 7 位邮箱验证码。
+        if not _handle_email_two_factor(driver, email, email_password, login_submit_ts):
+            return None
+
         # 检查是否登录成功：URL 应包含 account_id
         dismiss_overdue_dialog(driver)
         account_id = _extract_account_id(driver)
@@ -1522,6 +1535,61 @@ def login_cloudflare(driver, email: str, password: str):
     except Exception as e:
         print(f"登录失败: {e}")
         return None
+
+
+def _handle_email_two_factor(driver, email, email_password, since_ts, wait_page=15):
+    """处理登录后的邮箱二次验证页 (two-factor?type=email)。
+
+    参数:
+        since_ts: aware datetime，取值时机须早于登录按钮点击（见调用处注释）
+        wait_page: 秒，等待 2FA 页出现的观察窗口
+    返回:
+        bool: True 表示可以继续后续流程（没出现 2FA 页，或已成功填码）；
+              False 表示登录应判定为失败。
+    """
+    # 2FA 页可能在跳转链路上稍后才出现，短轮询确认
+    on_2fa = False
+    for _ in range(wait_page):
+        if 'two-factor' in (driver.current_url or ''):
+            on_2fa = True
+            break
+        if _extract_account_id(driver):
+            return True  # 已直达控制台，无需 2FA
+        time.sleep(1)
+
+    if not on_2fa:
+        return True
+
+    print("检测到邮箱二次验证页 (two-factor)")
+
+    if not email_password:
+        print("  未提供邮箱密码，无法自动获取验证码 —— 登录失败")
+        return False
+
+    token = get_mail_token(email, email_password)
+    if not token:
+        print("  获取邮箱 token 失败 —— 登录失败")
+        return False
+
+    code = wait_for_login_code(token, since_ts)
+    if not code:
+        print("  未收到新的登录验证码 —— 登录失败")
+        return False
+
+    if not handle_email_verification(driver, code):
+        print("  填入验证码失败 —— 登录失败")
+        return False
+
+    print("  验证码已提交，等待跳转...")
+    time.sleep(5)
+    check_and_handle_cf_challenge(driver)
+    time.sleep(3)
+
+    if 'two-factor' in (driver.current_url or ''):
+        print("  提交后仍停留在二次验证页（码可能已过期或被拒） —— 登录失败")
+        return False
+
+    return True
 
 
 def _extract_account_id(driver):
@@ -3110,9 +3178,14 @@ def handle_email_verification(driver, verification_data):
         else:
             print(f"🔢 正在输入验证码: {verification_data}")
             try:
+                # 前三个选择器服务注册流程的邮箱验证页；后两个是登录二次验证
+                # (two-factor?type=email) 的输入框——它 name=twofactor_token、
+                # autocomplete=off、无 maxlength，前三个一个都不命中。
                 code_input = driver.page.locator(
                     'input[name="code"], input[type="text"][maxlength="6"], '
-                    'input[autocomplete="one-time-code"]'
+                    'input[autocomplete="one-time-code"], '
+                    'input[name="twofactor_token"], '
+                    'input[data-testid="email-mfa-login-input-2fa-code"]'
                 ).first
                 if not _wait_visible(code_input, timeout=30_000):
                     raise RuntimeError("验证码输入框未出现")

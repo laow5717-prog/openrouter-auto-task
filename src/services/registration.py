@@ -293,6 +293,21 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
     return email, password, bound_count
 
 
+def _get_email_password(account_model, email):
+    """取邮箱密码供登录二次验证使用。
+
+    account_model 在部分调用路径上是可选的（可能为 None），且老账号未必存了
+    邮箱密码——两种情况都返回 None，此时登录遇到 2FA 页会失败，与改动前行为一致。
+    """
+    if not account_model or not email:
+        return None
+    try:
+        return account_model.get_email_password(email)
+    except Exception as e:
+        print(f"  读取邮箱密码失败: {e}")
+        return None
+
+
 def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
                                    email, cf_password, batch_records,
                                    max_bindable_cards=2, captcha_api_key=None,
@@ -322,7 +337,8 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
             captcha_solver.init_solver(captcha_api_key)
 
         print(f"正在登录账号: {email}")
-        account_id = login_cloudflare(driver, email, cf_password)
+        account_id = login_cloudflare(
+            driver, email, cf_password, _get_email_password(account_model, email))
         if not account_id:
             print("登录失败，跳过该账号（卡片保留待下个账号处理）")
             return 0, False
@@ -439,7 +455,8 @@ def recharge_account(email, cf_password, recharge_log_model=None, monitor_callba
         _report("init_browser")
 
         print(f"正在登录账号: {email}")
-        account_id = login_cloudflare(driver, email, cf_password)
+        account_id = login_cloudflare(
+            driver, email, cf_password, _get_email_password(account_model, email))
         if not account_id:
             if invoice_daily_cap is not None:
                 return False, "登录失败，无法获取 account_id", [], '', "failed", {'today_count': None}

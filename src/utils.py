@@ -137,10 +137,14 @@ def extract_verification_code(content: str):
     if not content:
         return None
 
+    # 码长不固定：注册验证码为 6 位，登录二次验证（two-factor）为 7 位。
+    # 兜底模式用 (?<!\d)...(?!\d) 锚定数字边界，否则 \d{6} 会把 7 位码
+    # 5221150 截成 522115，得到一个必然失败的码。
     patterns = [
-        r'code is\s*(\d{6})',
-        r'verification code[:\s]*(\d{6})',
-        r'(\d{6})',
+        r'login token[:\s]*(\d{6,8})',
+        r'code is\s*(\d{6,8})',
+        r'verification code[:\s]*(\d{6,8})',
+        r'(?<!\d)(\d{6,8})(?!\d)',
     ]
 
     for pattern in patterns:
