@@ -3,6 +3,7 @@ SQLite 数据库管理模块
 提供连接管理、schema 创建、版本迁移
 """
 
+import contextlib
 import os
 import sys
 import sqlite3
@@ -243,6 +244,21 @@ class Database:
             cursor = self._conn.execute(sql, params or ())
             self._conn.commit()
             return cursor
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """把多条语句合成一个事务，异常时整体回滚。
+
+        注意：块内**不能**调用 self.execute/fetchone/fetchall —— _lock 不可重入会死锁，
+        且 execute 会提前 commit 破坏原子性。直接用 yield 出来的 conn 执行。
+        """
+        with self._lock:
+            try:
+                yield self._conn
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def fetchone(self, sql, params=None):
         with self._lock:

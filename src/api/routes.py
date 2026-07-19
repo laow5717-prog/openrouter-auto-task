@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request, send_from_directory, send_file
 from src.config import cfg, get_data_dir
 from src.services import card as card_service
 from src.services import registration
+from src.models.card_pool import CardPoolModel
 from src.utils import is_card_expired
 
 api = Blueprint('api', __name__)
@@ -694,6 +695,38 @@ def merge_card_pools():
     result = models['card_pool'].move_non_invalid_to_group(source_ids, new_id)
     return jsonify({"status": "ok", "group_id": new_id,
                     "moved": result['moved'], "deduped": result['deduped']})
+
+
+@api.route('/api/card-pool/<int:group_id>/move', methods=['POST'])
+def move_cards_to_group(group_id):
+    """把源分组内指定桶的卡片，按数量上限移动到已存在的目标分组。
+
+    与 /merge 的区别：目标分组必须已存在，可限制数量与桶，重复卡跳过而非删除。
+    """
+    models = get_models()
+    data = request.json or {}
+
+    target_id = data.get('target_group_id')
+    if not isinstance(target_id, int) or isinstance(target_id, bool):
+        return jsonify({"error": "未选择目标分组"}), 400
+    if target_id == group_id:
+        return jsonify({"error": "源分组与目标分组相同"}), 400
+
+    bucket = data.get('bucket')
+    if bucket not in CardPoolModel.MOVABLE_BUCKETS:
+        return jsonify({"error": "卡片范围无效"}), 400
+
+    limit = data.get('limit')
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return jsonify({"error": "移动数量必须为正整数"}), 400
+
+    if not models['card_group'].get_by_id(group_id):
+        return jsonify({"error": "源分组不存在"}), 404
+    if not models['card_group'].get_by_id(target_id):
+        return jsonify({"error": "目标分组不存在"}), 404
+
+    result = models['card_pool'].move_bucket_to_group(group_id, target_id, bucket, limit)
+    return jsonify({"status": "ok", "moved": result['moved'], "skipped": result['skipped']})
 
 
 @api.route('/api/card-pool/<int:group_id>/delete-invalid', methods=['POST'])

@@ -90,6 +90,7 @@ export const uploadCardPool = (groupId, file) => {
 export const deletePoolCard = (cardId) => request(`/api/card-pool/card/${cardId}`, { method: 'DELETE' }).then(r => r.json())
 export const clearCardPool = (groupId) => post(`/api/card-pool/${groupId}/clear`)
 export const mergeCardPools = (body) => post('/api/card-pool/merge', body)
+export const moveCardsToGroup = (groupId, body) => post(`/api/card-pool/${groupId}/move`, body)
 export const deleteInvalidCards = (groupId) => post(`/api/card-pool/${groupId}/delete-invalid`)
 
 // Valid cards

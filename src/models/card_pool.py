@@ -169,6 +169,54 @@ class CardPoolModel:
                 moved += 1
         return {'moved': moved, 'deduped': deduped}
 
+    # 桶 → 可移动性：'non_invalid' 不是 _bucket_where 的桶，单独拼（= 有效 + 未验证）
+    MOVABLE_BUCKETS = ('unverified', 'valid', 'non_invalid')
+
+    def move_bucket_to_group(self, source_group_id, target_group_id, bucket, limit):
+        """把源分组内指定桶的卡片，按 id 升序最多 limit 张**移动**到已存在的目标分组。
+
+        与 move_non_invalid_to_group 的区别：目标分组已有同卡号时**跳过**（源行保留），
+        而不是删除源行 —— 只移动 N 张的语境下删卡会造成意外丢卡。
+        返回 {moved, skipped}。
+        """
+        if bucket not in self.MOVABLE_BUCKETS:
+            raise ValueError(f"不支持的桶: {bucket}")
+        if limit <= 0:
+            return {'moved': 0, 'skipped': 0}
+
+        # 与 count_buckets / delete_invalid_by_group 一致：先刷新过期状态，
+        # 否则已过期但未标记的卡会被算进 unverified 桶。
+        self.refresh_expired_status(source_group_id)
+
+        if bucket == 'non_invalid':
+            ph = ','.join('?' * len(CARD_STATUS_UNUSABLE))
+            frag, fparams = f"COALESCE(status,'') NOT IN ({ph})", list(CARD_STATUS_UNUSABLE)
+        else:
+            frag, fparams = self._bucket_where(bucket)
+
+        rows = self.db.fetchall(
+            f"""SELECT id, card_number FROM card_pool
+                WHERE group_id=? AND {frag}
+                ORDER BY id ASC LIMIT ?""",
+            [source_group_id] + fparams + [limit],
+        )
+        # seen 同时挡住"目标组已有"和"本批内同号重复"两种 UNIQUE(card_number, group_id) 冲突
+        seen = {r['card_number'] for r in self.db.fetchall(
+            "SELECT card_number FROM card_pool WHERE group_id=?", (target_group_id,))}
+
+        moved = 0
+        skipped = 0
+        with self.db.transaction() as conn:
+            for r in rows:
+                if r['card_number'] in seen:
+                    skipped += 1
+                    continue
+                conn.execute(
+                    "UPDATE card_pool SET group_id=? WHERE id=?", (target_group_id, r['id']))
+                seen.add(r['card_number'])
+                moved += 1
+        return {'moved': moved, 'skipped': skipped}
+
     def get_all_by_group(self, group_id):
         """获取分组内所有卡片（用于任务执行）"""
         rows = self.db.fetchall(

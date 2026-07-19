@@ -71,6 +71,7 @@
         <input type="file" ref="fileInput" accept=".xlsx,.xls" style="font-size:12px;max-width:200px">
         <button class="action-btn" @click="handleUpload">上传卡片</button>
         <a href="/api/card/template" class="action-btn" style="text-decoration:none">下载模版</a>
+        <button class="action-btn" @click="showMove">移动到分组</button>
         <button class="action-btn danger" @click="handleDeleteInvalid">删除无效卡</button>
         <button class="action-btn danger" @click="handleClearPool">清空</button>
       </div>
@@ -194,6 +195,40 @@
     </div>
   </Modal>
 
+  <!-- 移动到分组弹窗 -->
+  <Modal :visible="moveModal.visible" title="移动到分组" @close="moveModal.visible = false">
+    <div class="form-group">
+      <label class="form-label">从「{{ selectedGroup?.name }}」移动到</label>
+      <select v-model="moveModal.targetId" class="ctrl-input">
+        <option :value="null">请选择目标分组</option>
+        <option v-for="g in moveTargets" :key="g.id" :value="g.id">
+          {{ g.name }}（{{ g.type === 'bind' ? '绑定卡' : '支付卡' }}，{{ g.card_count }} 张）
+        </option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">卡片范围</label>
+      <select v-model="moveModal.bucket" class="ctrl-input">
+        <option value="unverified">未验证（{{ poolBuckets.unverified }} 张）</option>
+        <option value="valid">有效(在库)（{{ poolBuckets.valid }} 张）</option>
+        <option value="non_invalid">有效 + 未验证（{{ poolBuckets.valid + poolBuckets.unverified }} 张）</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">移动数量（按导入顺序从最早的开始取，不足则全部移动）</label>
+      <input v-model.number="moveModal.limit" type="number" min="1" class="ctrl-input" placeholder="如：100">
+    </div>
+    <div style="font-size:12px;color:var(--text-sub);line-height:1.5">
+      无效卡（拒付/过期）不会被移动。目标分组已存在相同卡号的卡将被跳过，保留在当前分组。
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn" style="width:auto;padding:8px 20px" @click="moveModal.visible = false">取消</button>
+      <button class="btn btn-primary" style="width:auto;padding:8px 20px" :disabled="moveModal.busy" @click="doMove">
+        {{ moveModal.busy ? '移动中...' : '开始移动' }}
+      </button>
+    </div>
+  </Modal>
+
   <!-- 有效卡弹窗 -->
   <Modal :visible="validModal.visible" title="有效卡列表（全局历史验证卡）" @close="validModal.visible = false" wide>
     <div class="stats-grid" style="margin-bottom:12px">
@@ -276,11 +311,11 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import {
   getCardGroups, createCardGroup, updateCardGroup, deleteCardGroup,
   getCardPool, uploadCardPool, deletePoolCard, clearCardPool,
-  getValidCards, mergeCardPools, deleteInvalidCards,
+  getValidCards, mergeCardPools, deleteInvalidCards, moveCardsToGroup,
 } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
@@ -302,6 +337,10 @@ const poolBuckets = reactive({ total: 0, invalid: 0, valid: 0, unverified: 0 })
 
 // 归纳合并弹窗
 const mergeModal = reactive({ visible: false, sourceIds: [], name: '', type: 'bind' })
+
+// 移动到分组弹窗
+const moveModal = reactive({ visible: false, targetId: null, bucket: 'unverified', limit: 100, busy: false })
+const moveTargets = computed(() => groups.value.filter(g => g.id !== selectedGroup.value?.id))
 
 // Group modal
 const groupModal = reactive({ visible: false, editing: false, id: null, name: '', type: 'bind', description: '' })
@@ -384,6 +423,34 @@ async function doMerge() {
     mergeModal.visible = false
     await loadGroups()
   } catch (e) { alert('合并失败: ' + e.message) }
+}
+
+function showMove() {
+  if (!selectedGroup.value) return
+  moveModal.targetId = null
+  moveModal.bucket = 'unverified'
+  moveModal.limit = 100
+  moveModal.busy = false
+  moveModal.visible = true
+}
+
+async function doMove() {
+  if (!moveModal.targetId) { alert('请选择目标分组'); return }
+  if (!Number.isInteger(moveModal.limit) || moveModal.limit <= 0) { alert('移动数量必须为正整数'); return }
+  moveModal.busy = true
+  try {
+    const r = await moveCardsToGroup(selectedGroup.value.id, {
+      target_group_id: moveModal.targetId,
+      bucket: moveModal.bucket,
+      limit: moveModal.limit,
+    })
+    const skipped = r.skipped ? `，跳过重复卡 ${r.skipped} 张` : ''
+    alert(`已移动 ${r.moved} 张卡${skipped}`)
+    moveModal.visible = false
+    poolPage.value = 1
+    await loadPoolCards()
+    await loadGroups()
+  } catch (e) { alert('移动失败: ' + e.message) } finally { moveModal.busy = false }
 }
 
 function showCreateGroup() {

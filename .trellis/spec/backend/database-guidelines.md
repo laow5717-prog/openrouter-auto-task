@@ -58,6 +58,46 @@ single connection behind one `threading.Lock`, so each `execute()` is
 serialized. **If that ever changes** (connection pool, multi-process), rewrite
 `claim_batch` with an explicit `BEGIN IMMEDIATE` transaction.
 
+#### `card_pool` status buckets are derived, not stored
+
+`card_pool.status` only ever holds `''` / `'paid'` / `'expired'` / `'invalid'` /
+`'failed'`. The buckets the UI shows are **derived**:
+
+| Bucket | Definition |
+|---|---|
+| `invalid` | `status IN ('expired','invalid')` (= `CARD_STATUS_UNUSABLE`) |
+| `valid` | not invalid **AND** `card_number IN valid_cards` |
+| `unverified` | not invalid **AND** `card_number NOT IN valid_cards` |
+
+There is no `status='unverified'` row anywhere — writing `WHERE status='pending'`
+or similar silently returns nothing. Always go through
+`CardPoolModel._bucket_where(bucket)` so all call sites share one definition.
+
+Anything that *counts* or *moves* by bucket must call
+`refresh_expired_status(group_id)` first (see `count_buckets`,
+`delete_invalid_by_group`, `move_bucket_to_group`) — a card whose expiry has
+passed but has not been re-stamped yet would otherwise be counted as
+`unverified`.
+
+Do not confuse this with `card_bindings.status`, whose `'pending'` is a real
+stored value for the *binding task*, unrelated to the card pool.
+
+### Multi-statement transactions
+
+`Database.execute()` commits every statement. When a batch must be atomic, use
+`Database.transaction()`:
+
+```python
+with self.db.transaction() as conn:
+    for row in rows:
+        conn.execute("UPDATE ... WHERE id=?", (row['id'],))
+```
+
+**Inside the block, use the yielded `conn` only.** Calling
+`self.db.execute/fetchone/fetchall` there deadlocks — `_lock` is a plain
+`threading.Lock`, not reentrant — and would commit mid-transaction anyway. Do
+reads before opening the block.
+
 ## Query Patterns
 
 ### Pagination
