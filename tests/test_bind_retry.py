@@ -130,6 +130,55 @@ def test_extra_claim_rounds_are_bounded(monkeypatch):
     assert len(rounds) <= 3, f"再领轮数应有上限，实际 {len(rounds)}"
 
 
+class FakeCardPoolModel:
+    def __init__(self):
+        self.invalidated = []
+
+    def mark_invalid_by_number(self, number):
+        self.invalidated.append(number)
+
+
+def test_card_fault_failure_marks_pool_card_invalid(monkeypatch):
+    """因卡自身原因失败 → 底料卡标为 invalid，下次不再选中。"""
+    _patch(monkeypatch, [(False, "[外部原因] card was declined")])
+    acct, cards, pool = FakeAccountModel(), FakeCardBindingModel(), FakeCardPoolModel()
+
+    reg.bind_cards_to_existing_account(
+        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        batch_records=[_record(1)], max_bindable_cards=1, card_pool_model=pool)
+
+    assert pool.invalidated == ["1"], "拒付的卡应被标为无效"
+
+
+def test_environment_failure_keeps_pool_card(monkeypatch):
+    """流程/环境原因失败 → 卡留在池里，绝不能误杀。
+
+    真实场景：Stripe Link 要手机号导致整批卡失败，若按失败即标记，好卡会被全废。
+    """
+    _patch(monkeypatch, [
+        (False, "[Stripe字段错误] Please provide a mobile phone number."),
+    ])
+    acct, cards, pool = FakeAccountModel(), FakeCardBindingModel(), FakeCardPoolModel()
+
+    reg.bind_cards_to_existing_account(
+        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        batch_records=[_record(1)], max_bindable_cards=1, card_pool_model=pool)
+
+    assert pool.invalidated == [], "非卡片原因不该标记无效"
+
+
+def test_no_pool_model_is_tolerated(monkeypatch):
+    """不传 card_pool_model 时维持原行为，不应抛异常。"""
+    _patch(monkeypatch, [(False, "[外部原因] declined")])
+    acct, cards = FakeAccountModel(), FakeCardBindingModel()
+
+    bound, ok = reg.bind_cards_to_existing_account(
+        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        batch_records=[_record(1)], max_bindable_cards=1)
+
+    assert (bound, ok) == (0, True)
+
+
 def _patch_register(monkeypatch, results):
     """打桩注册路径的浏览器与邮箱依赖。"""
     calls = {"n": 0}

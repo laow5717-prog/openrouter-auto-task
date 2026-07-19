@@ -24,6 +24,63 @@ CARD_STATUS_FAILED = 'failed'     # 历史遗留：支付失败但未归因
 CARD_STATUS_UNUSABLE = (CARD_STATUS_EXPIRED, CARD_STATUS_INVALID)
 
 
+# ---- 绑卡失败归因：只有卡自身的问题才该把底料卡标为 invalid ----
+# 误标的代价是不可逆的：好卡被打成 invalid 后再也不会被选中。因此采用白名单，
+# 只在确信是卡的问题时才归因，拿不准一律不标。
+
+# 确定是卡的问题：银行拒付 / 卡号·CVC·有效期无效
+_CARD_FAULT_PREFIXES = ('[外部原因]', '[表单字段错误]')
+
+# 确定与卡无关：自动化流程、人机验证、浏览器、超时
+_ENV_FAULT_PREFIXES = ('[操作失败]', '[验证超时]', '[浏览器中断]', '[超时]')
+
+# 前缀不足以判定时（[Stripe字段错误] / [控制台表单错误] 既可能是拒卡，
+# 也可能是像「缺手机号」这种与卡无关的表单校验），再按文案判定
+_CARD_FAULT_PHRASES = (
+    'declined', 'do not honor', 'insufficient funds', 'lost or stolen',
+    'pickup card', 'call issuer', 'restricted card', 'card not supported',
+    'security code is incorrect', 'incorrect cvc', 'cvc is invalid',
+    'card number is invalid', 'invalid card number', 'is not a valid card number',
+    'expiration date is in the past', 'expiration year is invalid',
+    'expiration month is invalid', 'card has expired', 'expired card',
+    '被拒', '资金不足', '余额不足', '安全码错误', '安全码不正确', '安全码无效',
+    '卡号错误', '卡号无效', '卡号不正确', '有效期已过', '卡已过期',
+)
+
+# 出现这些字样时明确不是卡的问题——即便前缀看着像。
+# 'mobile phone number' 是真实踩过的坑：Stripe Link 勾选框要求填手机号，
+# 报错被打上 [Stripe字段错误] 前缀，按前缀归因会把一整批好卡全标成无效。
+_NOT_CARD_PHRASES = (
+    'mobile phone number', 'phone number', 'captcha', 'turnstile',
+    'required field', '人机验证', '手机号',
+)
+
+
+def is_card_fault(err_reason):
+    """判断一次绑卡/支付失败是否应归咎于卡本身（据此把底料卡标为 invalid）。
+
+    拿不准时返回 False：漏标只是下次还会再试一次这张卡，误标则永久废掉一张好卡。
+    """
+    if not err_reason:
+        return False
+    text = str(err_reason)
+    low = text.lower()
+
+    for phrase in _NOT_CARD_PHRASES:
+        if phrase in low or phrase in text:
+            return False
+
+    if text.startswith(_ENV_FAULT_PREFIXES):
+        return False
+    if text.startswith(_CARD_FAULT_PREFIXES):
+        return True
+
+    for phrase in _CARD_FAULT_PHRASES:
+        if phrase in low or phrase in text:
+            return True
+    return False
+
+
 def is_card_expired(expiry_month, expiry_year, today=None):
     """
     判断信用卡有效期是否已过期（当月最后一天前仍有效）。

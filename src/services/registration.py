@@ -6,7 +6,7 @@ import time
 import random
 
 from src.config import cfg, TOPUP_AMOUNT, INVOICE_DAILY_CAP
-from src.utils import generate_random_password, filter_expired_cards
+from src.utils import generate_random_password, filter_expired_cards, is_card_fault
 from src.services.email import create_temp_email, wait_for_verification_email
 from src.browser.driver import (
     create_driver,
@@ -178,16 +178,40 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
     return email, password, success
 
 
+def _mark_pool_card_invalid(card_pool_model, card_info, err_reason, card_display):
+    """绑卡失败且归因于卡本身时，把底料卡标为 invalid，使其不再被选中。
+
+    只标「卡自身的问题」（银行拒付、卡号/CVC/有效期无效）。流程失败、人机验证超时、
+    浏览器中断等一律不标——误标不可逆，好卡一旦被打成 invalid 就再也选不到，
+    而漏标的代价仅仅是下次还会再试一次这张卡。判定见 utils.is_card_fault。
+    """
+    if not card_pool_model:
+        return
+    number = (card_info or {}).get('number', '')
+    if not number:
+        return
+    if not is_card_fault(err_reason):
+        print(f"  {card_display} 失败原因非卡片自身问题，保留在卡池")
+        return
+    try:
+        card_pool_model.mark_invalid_by_number(number)
+        print(f"  {card_display} 已标记为无效卡，后续不再选用")
+    except Exception as e:
+        print(f"  标记无效卡失败: {e}")
+
+
 def register_and_bind_cards(db, account_model, card_binding_model, task_id,
                             batch_records, cf_password=None, max_bindable_cards=2,
                             captcha_api_key=None, monitor_callback=None,
-                            claim_more=None):
+                            claim_more=None, card_pool_model=None):
     """
     注册一个账号并逐张绑定信用卡，精细跟踪每张卡的状态
 
     claim_more: 可选回调 claim_more(n) -> [record, ...]。绑定失败的卡不占用
         max_bindable_cards 名额，卡试完仍未绑够时用它再领一批继续（最多 3 轮）。
         不传则维持原行为：batch_records 用完即结束。
+    card_pool_model: 传入后，因卡自身原因绑定失败的卡会在卡池被标为 invalid，
+        后续选卡不再选中它。
 
     返回: (email, password, bound_count)
     """
@@ -273,6 +297,8 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
             else:
                 card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")
                 print(f"{card_display} 绑定失败 ({_err_reason})")
+                _mark_pool_card_invalid(card_pool_model, card_info, _err_reason,
+                                        card_display)
                 _report("card_failed")
 
             idx += 1
@@ -334,7 +360,8 @@ def _get_email_password(account_model, email):
 def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
                                    email, cf_password, batch_records,
                                    max_bindable_cards=2, captcha_api_key=None,
-                                   monitor_callback=None, claim_more=None):
+                                   monitor_callback=None, claim_more=None,
+                                   card_pool_model=None):
     """登录已有 Cloudflare 账号并补绑信用卡，补到账号总绑卡数达 max_bindable_cards。
 
     与 register_and_bind_cards 的区别：跳过注册，直接登录已有账号。以账单页真实
@@ -343,6 +370,8 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
     claim_more: 可选回调 claim_more(n) -> [record, ...]，用于「卡都试完仍未补够」时
         再领一批。传入才启用，最多追加 3 轮，避免单个账号把卡池吃光。不传则维持
         原行为：batch_records 用完即结束。
+    card_pool_model: 传入后，因卡自身原因绑定失败的卡会在卡池被标为 invalid，
+        后续选卡不再选中它。
 
     返回: (bound_count, login_ok)
       - login_ok=False → bound_count=0，且 batch_records 里的卡未被消耗（保留 pending），
@@ -425,6 +454,8 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
             else:
                 card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")
                 print(f"{card_display} 绑定失败 ({_err_reason})")
+                _mark_pool_card_invalid(card_pool_model, card_info, _err_reason,
+                                        card_display)
                 _report("card_failed")
 
             idx += 1

@@ -327,6 +327,8 @@ class AppState:
                     # 一张被拒就再补一张，否则该账号永远绑不满
                     claim_more=lambda n: card_binding_model.claim_batch(
                         task_id, worker.worker_id, n),
+                    # 因卡自身原因失败的卡在卡池标为 invalid，后续不再选中
+                    card_pool_model=self.models.get('card_pool'),
                 )
 
                 if email and bound_count > 0:
@@ -680,6 +682,7 @@ class AppState:
                             # 仍走 claim_batch，保持并发下的占位语义不变。
                             claim_more=lambda n: card_binding_model.claim_batch(
                                 task_id, worker.worker_id, n),
+                            card_pool_model=self.models.get('card_pool'),
                         )
                         if bound_count > 0:
                             with totals_lock:
