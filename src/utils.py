@@ -19,9 +19,17 @@ CARD_STATUS_PAID = 'paid'         # 已成功支付过
 CARD_STATUS_EXPIRED = 'expired'   # 有效期已过 → 无效
 CARD_STATUS_INVALID = 'invalid'   # 支付被拒（卡本身问题）→ 无效
 CARD_STATUS_FAILED = 'failed'     # 历史遗留：支付失败但未归因
+CARD_STATUS_BOUND = 'bound'       # 已绑定到某个账号 → 一卡一账号，不再参与选卡
 
-# 视为不可用的状态（选卡时跳过）
+# 视为「无效」的状态。仅这两个算无效——卡池界面的无效桶按此归类，
+# 已绑定的卡是正常消耗掉的，不该被展示成无效卡。
 CARD_STATUS_UNUSABLE = (CARD_STATUS_EXPIRED, CARD_STATUS_INVALID)
+
+# 选卡时要排除的全部状态：无效卡 + 已绑定卡。
+# 「一卡一账号」此前只在建任务时由 card_bindings 实时派生（见
+# get_successfully_bound_card_numbers），卡池自身无记录，于是界面看不出卡已被用掉，
+# 且不走那条过滤的入口（如启动校验）会把已绑卡算进可用数。
+CARD_STATUS_NOT_SELECTABLE = CARD_STATUS_UNUSABLE + (CARD_STATUS_BOUND,)
 
 
 # ---- 绑卡失败归因：只有卡自身的问题才该把底料卡标为 invalid ----

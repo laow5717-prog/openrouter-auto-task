@@ -178,6 +178,24 @@ def register_one_account(db, account_model, card_info_list=None, cf_password=Non
     return email, password, success
 
 
+def _mark_pool_card_bound(card_pool_model, card_info):
+    """绑定成功后把底料卡标为 bound，落实「一卡一账号」。
+
+    此前该约束只在建任务时由 card_bindings 实时派生（get_successfully_bound_card_numbers），
+    卡池自身不留痕：界面上看不出卡已被用掉，且不走那条过滤的入口（如启动校验的
+    可用卡计数）会把已绑卡算进可用数。落到卡池后 get_usable_cards_as_list 直接排除。
+    """
+    if not card_pool_model:
+        return
+    number = (card_info or {}).get('number', '')
+    if not number:
+        return
+    try:
+        card_pool_model.mark_bound_by_number(number)
+    except Exception as e:
+        print(f"  标记已绑定卡失败: {e}")
+
+
 def _mark_pool_card_invalid(card_pool_model, card_info, err_reason, card_display):
     """绑卡失败且归因于卡本身时，把底料卡标为 invalid，使其不再被选中。
 
@@ -293,6 +311,7 @@ def register_and_bind_cards(db, account_model, card_binding_model, task_id,
                 bound_count += 1
                 card_binding_model.mark_success(binding_id, email)
                 print(f"{card_display} 绑定成功！(已绑 {bound_count} 张)")
+                _mark_pool_card_bound(card_pool_model, card_info)
                 _report("card_added")
             else:
                 card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")
@@ -452,6 +471,7 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
                 bound_count += 1
                 card_binding_model.mark_success(binding_id, email)
                 print(f"{card_display} 绑定成功！(本轮已绑 {bound_count} 张)")
+                _mark_pool_card_bound(card_pool_model, card_info)
                 _report("card_added")
             else:
                 card_binding_model.mark_failed(binding_id, _err_reason or "bind failed")

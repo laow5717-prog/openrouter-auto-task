@@ -799,7 +799,8 @@ def clear_card_pool(group_id):
 
 # ==================== 有效卡 ====================
 
-_POOL_STATUS_ZH = {'': '在库(未验证)', 'paid': '有效(已支付)', 'invalid': '无效', 'expired': '已过期'}
+_POOL_STATUS_ZH = {'': '在库(未验证)', 'paid': '有效(已支付)', 'invalid': '无效',
+                   'expired': '已过期', 'bound': '已绑定'}
 
 
 def _valid_card_status(models, card):

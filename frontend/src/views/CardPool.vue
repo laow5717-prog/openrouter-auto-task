@@ -121,6 +121,8 @@
             <td>
               <span v-if="card.status === 'expired'" class="status-tag fail">已过期</span>
               <span v-else-if="card.status === 'invalid'" class="status-tag fail">无效</span>
+              <!-- 已绑定：一卡一账号，卡已被消耗，不再参与选卡（不同于"无效"） -->
+              <span v-else-if="card.status === 'bound'" class="status-tag bound">已绑定</span>
               <span v-else-if="card.is_valid" class="status-tag success">有效</span>
               <span v-else class="status-tag">待验证</span>
               <!-- 选卡规则状态：告知用户为何该卡暂不被选用 -->

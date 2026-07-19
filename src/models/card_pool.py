@@ -8,7 +8,9 @@ from src.utils import (
     is_card_expired,
     CARD_STATUS_EXPIRED,
     CARD_STATUS_INVALID,
+    CARD_STATUS_BOUND,
     CARD_STATUS_UNUSABLE,
+    CARD_STATUS_NOT_SELECTABLE,
 )
 
 
@@ -255,14 +257,18 @@ class CardPoolModel:
         """
         self.refresh_expired_status(group_id)
         cards = self.get_cards_as_list(group_id)
-        usable = [c for c in cards if c['status'] not in CARD_STATUS_UNUSABLE]
-        unusable = [c for c in cards if c['status'] in CARD_STATUS_UNUSABLE]
+        # 排除的是 NOT_SELECTABLE（无效 + 已绑定），而非仅 UNUSABLE：
+        # 已绑定的卡遵循「一卡一账号」不能再选，但它不是无效卡，
+        # 界面的无效桶仍只按 UNUSABLE 归类。
+        usable = [c for c in cards if c['status'] not in CARD_STATUS_NOT_SELECTABLE]
+        unusable = [c for c in cards if c['status'] in CARD_STATUS_NOT_SELECTABLE]
         return usable, unusable
 
     def refresh_expired_status(self, group_id=None):
         """按当前日期重新判定过期卡并标记为 expired（卡会随时间推移过期，故每次取卡前刷新）。
 
-        不覆盖 paid/invalid 状态：paid 是历史事实，invalid 已是无效态。返回新标记的数量。
+        不覆盖 paid/invalid/bound 状态：paid 与 bound 是历史事实（卡已被用掉），
+        invalid 已是无效态。返回新标记的数量。
         """
         if group_id is None:
             rows = self.db.fetchall("SELECT id, expiry_month, expiry_year, status FROM card_pool")
@@ -274,7 +280,7 @@ class CardPoolModel:
         marked = 0
         for r in rows:
             status = (r['status'] or '')
-            if status in (CARD_STATUS_EXPIRED, CARD_STATUS_INVALID):
+            if status in (CARD_STATUS_EXPIRED, CARD_STATUS_INVALID, CARD_STATUS_BOUND):
                 continue
             if is_card_expired(r['expiry_month'], r['expiry_year']):
                 self.db.execute(
@@ -297,6 +303,19 @@ class CardPoolModel:
     def mark_expired_by_number(self, card_number):
         """标记为已过期（有效期已过）"""
         self.mark_status_by_number(card_number, CARD_STATUS_EXPIRED)
+
+    def mark_bound_by_number(self, card_number):
+        """标记为已绑定到某账号（一卡一账号），此后不再参与选卡。
+
+        不覆盖已是无效/过期的记录：那类卡本就不可用，且 invalid 记录着「卡有问题」
+        这一更重要的事实，被 bound 覆盖会丢失归因。
+        """
+        ph = ','.join('?' * len(CARD_STATUS_UNUSABLE))
+        self.db.execute(
+            f"UPDATE card_pool SET status=? WHERE card_number=? "
+            f"AND COALESCE(status,'') NOT IN ({ph})",
+            (CARD_STATUS_BOUND, card_number, *CARD_STATUS_UNUSABLE),
+        )
 
     def delete_card(self, card_id):
         self.db.execute("DELETE FROM card_pool WHERE id=?", (card_id,))
