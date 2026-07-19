@@ -538,11 +538,19 @@ class AppState:
             return "failed", str(e), {}
 
     def run_daily_pipeline(self, bind_group_id, payment_group_id, cf_password,
-                           max_bindable_cards, captcha_api_key):
+                           max_bindable_cards, captcha_api_key, mode='full'):
         """每日一键流水线：补绑已有账号 → 注册新号 → 批量充值，串行跑在单个后台线程。
 
         三段共享同一个 daily task 的 pending 卡池（消耗顺序：补绑 → 注册）。全程持有
-        is_running 锁，复用现有日志/截图/停止机制。补绑与充值均设连续失败阈值兜底。"""
+        is_running 锁，复用现有日志/截图/停止机制。补绑与充值均设连续失败阈值兜底。
+
+        mode 控制跑哪几段：
+          full          绑卡 + 充值（阶段0/1a/1b/2，默认，与历史行为一致）
+          bind_only     仅绑卡（跳过阶段2）
+          recharge_only 仅充值（跳过阶段0/1a/1b，此时 bind_group_id 可为 None）
+
+        recharge_only 下不建 daily task 记录，task_id 恒为 None——阶段1a/1b 与收尾的
+        卡池清理/报告导出都以 task_id 为门，故无需在这些地方再判 mode。"""
         self.is_running = True
         self.stop_requested = False
         self.success_count = 0
@@ -582,11 +590,18 @@ class AppState:
 
         try:
             # ===== 阶段0：准备卡池 =====
+            mode_label = {'full': '绑卡 + 充值', 'bind_only': '仅绑卡',
+                          'recharge_only': '仅充值'}.get(mode, mode)
             self._hooked_print(f"\n{'#' * 50}")
-            self._hooked_print("每日流水线开始")
+            self._hooked_print(f"每日流水线开始（模式：{mode_label}）")
             self._hooked_print(f"{'#' * 50}")
 
-            cards, unusable = self.models['card_pool'].get_usable_cards_as_list(bind_group_id)
+            # 仅充值模式不碰卡池：cards 留空后续过滤/建 task 自然全部空转，
+            # task_id 保持 None，阶段1a/1b 与收尾的卡池清理都以它为门，无需再判 mode
+            if mode == 'recharge_only':
+                cards, unusable = [], []
+            else:
+                cards, unusable = self.models['card_pool'].get_usable_cards_as_list(bind_group_id)
             if unusable:
                 self._hooked_print(f"绑卡分组已跳过 {len(unusable)} 张无效卡（过期/被拒）")
 
@@ -625,6 +640,10 @@ class AppState:
                 self.current_card_task_id = task_id
                 card_binding_model.create_batch(task_id, filtered_cards)
                 self._hooked_print(f"阶段0：共 {len(filtered_cards)} 张卡待绑定")
+            elif mode == 'recharge_only':
+                self._hooked_print("阶段0：仅充值模式，跳过卡池准备与绑卡阶段")
+            elif mode == 'bind_only':
+                self._hooked_print("阶段0：无可用卡，仅绑卡模式无事可做")
             else:
                 self._hooked_print("阶段0：无可用卡，跳过补绑/注册，仅执行充值阶段")
 
@@ -753,7 +772,9 @@ class AppState:
             # 防封控：每个账号每轮只「生成 1 张账单 + 用掉 1 张」，随即切下一个账号；
             # 一整轮跑完所有账号后从头再来，直到每个账号当日账单数达 INVOICE_DAILY_CAP
             # 或触发停止条件。当日账单数以 CF invoice-history 接口为权威（recharge_account 内读取）。
-            if not self.stop_requested:
+            if mode == 'bind_only':
+                self._hooked_print("\n阶段2：仅绑卡模式，跳过充值阶段")
+            elif not self.stop_requested:
                 self._hooked_print(f"\n{'=' * 50}\n阶段2：轮询式充值（每账号当日上限 {INVOICE_DAILY_CAP} 张账单）\n{'=' * 50}")
                 accts_after = account_model.get_all(order_desc=False)
                 emails_after = [a['email'] for a in accts_after]

@@ -7,8 +7,11 @@ export const useSettingsStore = defineStore('settings', () => {
   const dailyBindGroupId = ref(localStorage.getItem('dailyBindGroupId') || '')
   const dailyPaymentGroupId = ref(localStorage.getItem('dailyPaymentGroupId') || '')
   const maxBindableCards = ref(Number(localStorage.getItem('maxBindableCards')) || 2)
+  // 每日任务运行模式：full=绑卡+充值 / bind_only=仅绑卡 / recharge_only=仅充值
+  const dailyMode = ref(localStorage.getItem('dailyMode') || 'full')
 
   function save() {
+    localStorage.setItem('dailyMode', dailyMode.value || 'full')
     localStorage.setItem('cfPassword', cfPassword.value || '')
     localStorage.setItem('captchaApiKey', captchaApiKey.value || '')
     localStorage.setItem('dailyBindGroupId', dailyBindGroupId.value || '')
@@ -16,5 +19,5 @@ export const useSettingsStore = defineStore('settings', () => {
     localStorage.setItem('maxBindableCards', String(maxBindableCards.value || 2))
   }
 
-  return { cfPassword, captchaApiKey, dailyBindGroupId, dailyPaymentGroupId, maxBindableCards, save }
+  return { cfPassword, captchaApiKey, dailyBindGroupId, dailyPaymentGroupId, maxBindableCards, dailyMode, save }
 })

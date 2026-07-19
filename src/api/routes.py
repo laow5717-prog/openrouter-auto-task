@@ -906,45 +906,58 @@ def start_daily_pipeline():
 
     models = get_models()
     data = request.json or {}
-    bind_group_id = data.get('bind_group_id')
-    if not bind_group_id:
-        return jsonify({"error": "未指定绑卡分组"}), 400
 
-    group = models['card_group'].get_by_id(bind_group_id)
-    if not group:
-        return jsonify({"error": "绑卡分组不存在"}), 404
+    # mode：full=绑卡+充值（默认，历史行为）／bind_only=仅绑卡／recharge_only=仅充值
+    mode = data.get('mode') or 'full'
+    if mode not in ('full', 'bind_only', 'recharge_only'):
+        return jsonify({"error": f"未知运行模式: {mode}"}), 400
+
+    bind_group_id = data.get('bind_group_id')
+    group = None
+    if mode == 'recharge_only':
+        # 仅充值不消耗卡池，绑卡分组无意义，一律忽略
+        bind_group_id = None
+    else:
+        if not bind_group_id:
+            return jsonify({"error": "未指定绑卡分组"}), 400
+        group = models['card_group'].get_by_id(bind_group_id)
+        if not group:
+            return jsonify({"error": "绑卡分组不存在"}), 404
 
     cf_password = data.get('cf_password')
     payment_group_id = data.get('payment_group_id') or None
     max_bindable_cards = data.get('max_bindable_cards', 2)
     captcha_api_key = data.get('captcha_api_key')
 
-    # 校验：绑卡分组有可用卡 或 有已绑卡账号可充值，二者至少其一，否则无事可做。
-    # 注意：这里不再用 has_today_record 排除今日已充账号——流水线阶段2 会放行所有绑卡账号
-    # （今日已充的转去执行账单支付/复查），启动门若继续排除会与流水线不一致，导致「没有绑卡
-    # 数据、只想跑充值」的场景被误拦。只要有账号绑卡数≥1 即允许启动，无卡时自动跳过补绑/注册。
-    cards, unusable = models['card_pool'].get_usable_cards_as_list(bind_group_id)
-    has_rechargeable = False
-    if not cards:
+    def _has_rechargeable():
+        """是否存在可充值账号——口径必须与流水线阶段2 一致（app.py:_recharge 候选筛选）：
+        cf_password 非空 且 card_bindings 里成功绑卡数≥1。不能用 has_today_record 排除
+        今日已充账号：阶段2 会放行它们去做账单支付/复查，启动门更严会误拦。"""
         accts = models['account'].get_all(order_desc=False)
-        emails = [a['email'] for a in accts]
-        counts = models['card_binding'].count_by_emails(emails)
-        has_rechargeable = any(
-            a.get('cf_password') and counts.get(a['email'], 0) >= 1
-            for a in accts
-        )
-        if not has_rechargeable:
-            if unusable:
-                return jsonify({"error": f"绑卡分组 {len(unusable)} 张卡均已无效，且无已绑卡账号可充值，无事可做"}), 400
-            return jsonify({"error": "绑卡分组无可用卡，且无已绑卡账号可充值，无事可做"}), 400
+        counts = models['card_binding'].count_by_emails([a['email'] for a in accts])
+        return any(a.get('cf_password') and counts.get(a['email'], 0) >= 1 for a in accts)
+
+    cards, unusable = [], []
+    if mode == 'recharge_only':
+        if not _has_rechargeable():
+            return jsonify({"error": "无已绑卡账号可充值，无事可做"}), 400
+    else:
+        cards, unusable = models['card_pool'].get_usable_cards_as_list(bind_group_id)
+        if not cards:
+            suffix = f"绑卡分组 {len(unusable)} 张卡均已无效" if unusable else "绑卡分组无可用卡"
+            if mode == 'bind_only':
+                # 仅绑卡模式下没卡就彻底无事可做，不再看充值侧
+                return jsonify({"error": f"{suffix}，仅绑卡模式无事可做"}), 400
+            if not _has_rechargeable():
+                return jsonify({"error": f"{suffix}，且无已绑卡账号可充值，无事可做"}), 400
 
     import threading
     threading.Thread(
         target=state.run_daily_pipeline,
         args=(bind_group_id, payment_group_id, cf_password,
-              max_bindable_cards, captcha_api_key),
+              max_bindable_cards, captcha_api_key, mode),
         daemon=True,
     ).start()
 
-    return jsonify({"status": "started", "usable_cards": len(cards),
-                    "group_name": group['name']})
+    return jsonify({"status": "started", "mode": mode, "usable_cards": len(cards),
+                    "group_name": group['name'] if group else None})
