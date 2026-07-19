@@ -1261,23 +1261,77 @@ def _wait_for_turnstile_widget(driver, timeout=15):
     print("  ℹ️ Turnstile 组件等待超时，继续执行")
 
 
+# 卡号/有效期/CVC 字段选择器。命名经本地挂载真实 Payment Element 实测确认：
+# name=number/expiry/cvc，id=payment-{number,expiry,cvc}Input（前缀是 element 类型，
+# 故用后缀匹配）。旧 Card Element 命名一并保留。详见 spec/backend/stripe-payment-element.md
+CARD_NUMBER_SEL = (
+    'input[name="number"], input[id$="-numberInput"], '
+    'input[name="cardnumber"], input[autocomplete="cc-number"], '
+    'input[data-elements-stable-field-name="cardNumber"]'
+)
+CARD_EXPIRY_SEL = (
+    'input[name="expiry"], input[id$="-expiryInput"], '
+    'input[name="exp-date"], input[name="cardExpiry"], '
+    'input[autocomplete="cc-exp"], '
+    'input[data-elements-stable-field-name="cardExpiry"]'
+)
+CARD_CVC_SEL = (
+    'input[name="cvc"], input[id$="-cvcInput"], '
+    'input[name="cardCvc"], input[autocomplete="cc-csc"], '
+    'input[data-elements-stable-field-name="cardCvc"]'
+)
+
+# 卡表单 iframe 的定位锚点，按优先级尝试。
+# credit-card-form 下有两个 iframe（payment 与 ach-bank-search-results），
+# 泛化选择器必须带 >> nth=0，否则 frame_locator 会因严格模式匹配到多个而报错。
+_CARD_IFRAME_SELECTORS = [
+    '[data-test-id="credit-card-form"] iframe[title="Secure payment input frame"]',
+    'iframe[title="Secure payment input frame"]',
+    '[data-test-id="credit-card-form"] iframe >> nth=0',
+]
+
+
+def stripe_card_frame(page):
+    """返回卡表单 iframe 的 FrameLocator，找不到返回 None。
+
+    必须用 FrameLocator 而非 page.frames 枚举出的 Frame 对象：Stripe 会反复销毁重建
+    这个 iframe（实跑中观察到 name 从 __privateStripeFrame3005 变到 5985），
+    缓存下来的 Frame 会指向已失效的旧文档——表现为 body 只剩几 KB、零 input，
+    且怎么等都不会变，因为真正的新 frame 从未被看到。
+    FrameLocator 是惰性的，每次使用都重新解析，天然免疫重建。
+    """
+    for sel in _CARD_IFRAME_SELECTORS:
+        try:
+            if page.locator(sel).count() > 0:
+                return page.frame_locator(sel)
+        except Exception:
+            continue
+    return None
+
+
+def _card_field_locator(page, selector):
+    """在卡表单 iframe 内定位字段，返回 Locator 或 None（每次调用重新解析）。"""
+    fl = stripe_card_frame(page)
+    if fl is None:
+        return None
+    try:
+        loc = fl.locator(selector).first
+        if loc.count() > 0:
+            return loc
+    except Exception:
+        pass
+    return None
+
+
 def _wait_for_stripe_fields_ready(driver, timeout=90):
     """
-    等待 Stripe 输入字段实际渲染完成。弹窗和外层 iframe 会先出现，内部字段延迟加载。
+    等待 Stripe 卡号字段真正可定位。弹窗和外层 iframe 会先出现，内部字段延迟加载。
 
-    超时从 15s 提到 90s 是有依据的：实跑失败时 frame 列表里存在
-    elements-inner-loader-ui（Stripe 的加载骨架屏），说明 15s 到期时字段压根没渲染，
-    随后一路退化到 Tab 盲打。弹窗里同时在加载 PayPal / hCaptcha / GooglePay，
-    慢网络下远超 15s 属正常。
+    判定只认「卡号字段可定位且可见」。曾用「弹窗内 iframe ≥2 个」当就绪判据，
+    结果把 frame 失效问题伪装成就绪，拖到填写阶段才暴露。
     """
     page = driver.page
-    # 命名经本地挂载真实 Payment Element 实测确认，见 _fill_stripe_payment_element 注释
-    card_inputs_sel = (
-        'input[name="number"], input[id$="-numberInput"], '
-        'input[name="cardnumber"], '
-        'input[autocomplete="cc-number"], '
-        'input[data-elements-stable-field-name="cardNumber"]'
-    )
+    card_inputs_sel = CARD_NUMBER_SEL
 
     def _vis(loc):
         try:
@@ -1289,7 +1343,15 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            # 检查1: 主文档或 Stripe frame 内的卡号输入框
+            # 主路径: 经 FrameLocator 定位（每轮重新解析，跟得上 Stripe 重建 iframe）
+            inp = _card_field_locator(page, card_inputs_sel)
+            if inp is not None and _vis(inp):
+                print("  ✅ Stripe 输入字段已就绪")
+                time.sleep(0.5)
+                return True
+
+            # 兜底: 遍历 page.frames。卡表单 iframe 锚点变更时仍有机会命中，
+            # 但拿到的 Frame 可能已失效，故仅作补充而非主路径。
             main = page.main_frame
             for fr in [main] + [f for f in page.frames if f is not main]:
                 try:
@@ -1297,7 +1359,6 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
                     name = (fr.name or '').lower()
                 except Exception:
                     url = name = ''
-                # 主文档也检查一次；其余仅检查 Stripe 相关 frame
                 if fr is not main and not (
                     'stripe' in url or 'stripe' in name
                     or name.startswith('__privatestripeframe')
@@ -1306,7 +1367,7 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
                 try:
                     inp = fr.locator(card_inputs_sel).first
                     if inp.count() > 0 and _vis(inp):
-                        print("  ✅ Stripe 输入字段已就绪")
+                        print("  ✅ Stripe 输入字段已就绪 (frames 兜底)")
                         time.sleep(0.5)
                         return True
                 except Exception:
@@ -5427,6 +5488,29 @@ def _fill_stripe_payment_element(driver, card_info):
     exp_year = card_info.get('expiry_year', '')
     expiry = f"{exp_month}{exp_year[-2:]}" if exp_year else exp_month
     cvc = card_info.get('cvc', '')
+
+    # 主路径: 经 FrameLocator 填写。每个字段各自重新解析 iframe，Stripe 中途重建
+    # 也不会拿到失效的 Frame（这正是此前所有 frame 都读到零 input 的原因）。
+    fl_ok = 0
+    for sel, value, label in ((CARD_NUMBER_SEL, number, '卡号'),
+                              (CARD_EXPIRY_SEL, expiry, '有效期'),
+                              (CARD_CVC_SEL, cvc, 'CVC')):
+        if not value:
+            continue
+        loc = _card_field_locator(page, sel)
+        if loc is None:
+            continue
+        if _type_and_verify_stripe_field(loc, str(value), label):
+            print(f"  ✅ 填写 {label}")
+            fl_ok += 1
+            filled_any = True
+        time.sleep(0.3)
+    if fl_ok >= 2:
+        # 至少填成两个字段才认为主路径可用，否则继续走下面的兜底。
+        # 账单地址不在这里填——调用方 add_credit_card 有独立步骤负责（driver.py:4148）。
+        return True
+    if fl_ok:
+        print(f"  ⚠️ FrameLocator 路径仅填成 {fl_ok} 个字段，继续尝试其它路径")
 
     def try_fill_billing_fields(ctx):
         """尝试在指定上下文内填写 Stripe 表单账单地址字段"""
