@@ -1243,24 +1243,22 @@ def _wait_for_turnstile_widget(driver, timeout=15):
     print("  ℹ️ Turnstile 组件等待超时，继续执行")
 
 
-def _wait_for_stripe_fields_ready(driver, timeout=15):
+def _wait_for_stripe_fields_ready(driver, timeout=90):
     """
-    等待 Stripe 输入字段或嵌套 iframe 实际渲染完成。
-    弹窗和外层 iframe 可能先出现，但内部字段延迟加载。
+    等待 Stripe 输入字段实际渲染完成。弹窗和外层 iframe 会先出现，内部字段延迟加载。
 
-    Patchright 版：不依赖「已切入 iframe」的状态，直接枚举 page.frames
-    （原生穿透所有嵌套层级）查找 Stripe 字段，或统计弹窗内可见 iframe 数量。
+    超时从 15s 提到 90s 是有依据的：实跑失败时 frame 列表里存在
+    elements-inner-loader-ui（Stripe 的加载骨架屏），说明 15s 到期时字段压根没渲染，
+    随后一路退化到 Tab 盲打。弹窗里同时在加载 PayPal / hCaptcha / GooglePay，
+    慢网络下远超 15s 属正常。
     """
     page = driver.page
-    # 必须同时覆盖旧 Card Element (cardnumber/cardNumber) 与新 Payment Element
-    # (number/Field-numberInput) 两套命名，否则真字段永远等不到，只能靠下面的
-    # 「iframe 数量」弱判据放行，把选择器失配的问题拖到填写阶段才暴露。
+    # 命名经本地挂载真实 Payment Element 实测确认，见 _fill_stripe_payment_element 注释
     card_inputs_sel = (
-        'input[name="cardnumber"], input[name="number"], '
-        'input#Field-numberInput, '
+        'input[name="number"], input[id$="-numberInput"], '
+        'input[name="cardnumber"], '
         'input[autocomplete="cc-number"], '
-        'input[data-elements-stable-field-name="cardNumber"], '
-        'input[data-elements-stable-field-name="number"]'
+        'input[data-elements-stable-field-name="cardNumber"]'
     )
 
     def _vis(loc):
@@ -1304,16 +1302,26 @@ def _wait_for_stripe_fields_ready(driver, timeout=15):
                 visible_frames = [f for f in inner_frames if _vis(f)]
                 if len(visible_frames) >= 2:
                     weak_ready = True
-                    print(f"  ℹ️ Stripe 嵌套 iframe 已渲染 ({len(visible_frames)} 个)，继续等待卡号字段...")
+                    # loader-ui 是 Stripe 的加载骨架屏，它在场即表示字段仍未渲染
+                    loading = any('elements-inner-loader-ui' in (f.url or '')
+                                  for f in page.frames)
+                    hint = "（Stripe 仍在加载骨架屏）" if loading else ""
+                    print(f"  ℹ️ Stripe 嵌套 iframe 已渲染 ({len(visible_frames)} 个)"
+                          f"{hint}，继续等待卡号字段...")
         except Exception:
             pass
         time.sleep(1)
 
     if weak_ready:
         # 容器在、字段定位不到：多半是 Stripe 改版导致选择器失配，打印结构便于修选择器
-        print("  ⚠️ iframe 已渲染但未定位到卡号字段，可能选择器失配")
+        print("  ⚠️ iframe 已渲染但未定位到卡号字段")
         try:
-            _dump_stripe_frame_fields(page, [f for f in page.frames if f is not page.main_frame])
+            # 两条解析路径都打：page.frames 全局枚举 + DOM→content_frame 锚定
+            probe = [f for f in page.frames if f is not page.main_frame]
+            for f in _card_form_frames(page):
+                if f not in probe:
+                    probe.append(f)
+            _dump_stripe_frame_fields(page, probe)
         except Exception:
             pass
     else:
@@ -5020,14 +5028,52 @@ def _wait_for_payment_submit_result(driver, max_wait=180):
     return False, f"[超时] 等待提交结果超过{max_wait}秒"
 
 
-def _dump_stripe_frame_fields(page, frames):
-    """把各 Stripe frame 内的输入字段结构打进日志，供选择器失配时定位。
+# 深度查找输入元素：穿透 open shadow root，并把 contenteditable 也算作输入位。
+# Stripe 若把字段放进 shadow DOM，普通 querySelectorAll 会返回空——那会与「文档没加载」
+# 表现完全一致，必须靠这段区分开。
+_DEEP_INPUT_PROBE = """() => {
+    const out = [];
+    const walk = (root, depth) => {
+        if (!root || depth > 6) return;
+        let nodes = [];
+        try { nodes = Array.from(root.querySelectorAll('input, [contenteditable=""], [contenteditable="true"], select')); }
+        catch (e) { return; }
+        for (const el of nodes) {
+            out.push({
+                tag: el.tagName.toLowerCase(),
+                name: el.getAttribute('name') || '',
+                id: el.id || '',
+                ph: el.getAttribute('placeholder') || el.getAttribute('aria-label') || '',
+                type: el.getAttribute('type') || '',
+                stable: el.getAttribute('data-elements-stable-field-name') || '',
+                shadow: depth > 0,
+                vis: !!(el.offsetWidth || el.offsetHeight),
+            });
+        }
+        let all = [];
+        try { all = Array.from(root.querySelectorAll('*')); } catch (e) { return; }
+        for (const el of all) if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+    };
+    walk(document, 0);
+    return {
+        fields: out,
+        readyState: document.readyState,
+        bodyLen: (document.body && document.body.innerHTML.length) || 0,
+        iframeCount: document.querySelectorAll('iframe').length,
+    };
+}"""
 
-    Stripe 会不定期改版字段命名（Card Element 的 cardnumber → Payment Element 的
-    number/Field-numberInput），失配时表现为静默退化到 Tab 盲打。这里打出 frame URL
-    的 componentName 与每个 input 的 name/id/placeholder，下次改选择器有据可依。
+
+def _dump_stripe_frame_fields(page, frames):
+    """把各 frame 的文档状态与输入字段结构打进日志，用于定位「字段找不到」的真因。
+
+    上一轮诊断里 27 个 frame 全报 0 个 input，无法区分三种情形，故本函数除字段外
+    还打印 readyState / body 长度 / 子 frame 数：
+      - body 长度为 0 或 readyState 非 complete → 拿到的不是真实文档（跨域上下文问题）
+      - body 有内容但字段为空、且子 frame 数 > 0 → 真实输入框在更深一层 frame
+      - 字段带 shadow=True → 字段在 shadow DOM 内，需穿透查询
     """
-    print("  🔍 Stripe frame 字段结构诊断:")
+    print("  🔍 Stripe frame 结构诊断:")
     if not frames:
         print("    (无匹配的 Stripe frame)")
     for idx, fr in enumerate(frames):
@@ -5040,20 +5086,99 @@ def _dump_stripe_frame_fields(page, frames):
         m = re.search(r'componentName=([A-Za-z]+)', url)
         if m:
             comp = m.group(1)
-        print(f"    [{idx}] componentName={comp or '?'} url={url[:90]}")
         try:
-            fields = fr.evaluate("""() => Array.from(document.querySelectorAll('input')).map(
-                el => ({name: el.name || '', id: el.id || '',
-                        ph: el.placeholder || '', type: el.type || '',
-                        vis: !!(el.offsetWidth || el.offsetHeight)}))""")
+            kids = len(fr.child_frames)
+        except Exception:
+            kids = -1
+        try:
+            info = fr.evaluate(_DEEP_INPUT_PROBE)
         except Exception as e:
-            print(f"        (读取字段失败: {e})")
+            print(f"    [{idx}] componentName={comp or '?'} 子frame={kids} url={url[:70]}")
+            print(f"        ❗ evaluate 失败: {str(e)[:120]}")
             continue
+        print(f"    [{idx}] componentName={comp or '?'} readyState={info['readyState']} "
+              f"bodyLen={info['bodyLen']} 内嵌iframe={info['iframeCount']} 子frame={kids} "
+              f"url={url[:70]}")
+        fields = info['fields']
         if not fields:
-            print("        (该 frame 内无 input)")
+            print("        (无 input/contenteditable/select)")
         for f in fields:
-            print(f"        input name={f['name']!r} id={f['id']!r} "
-                  f"placeholder={f['ph']!r} type={f['type']!r} visible={f['vis']}")
+            print(f"        {f['tag']} name={f['name']!r} id={f['id']!r} ph={f['ph']!r} "
+                  f"type={f['type']!r} stable={f['stable']!r} shadow={f['shadow']} vis={f['vis']}")
+
+
+def _type_and_verify_stripe_field(el, value, label, attempts=4):
+    """向 Stripe 格式化字段逐字输入并回读校验，不符则清空重填。
+
+    Stripe 字段在输入过程中会重格式化并重建 DOM，与逐字输入形成竞态，表现为随机吞字符：
+    实测同一份代码连续跑，有效期 '1230' 会得到 '12 / 30'（对）、'1'、'02 / 30'（月份都错）。
+    因此不能靠固定延迟——必须回读校验。两个要点均为实测所得：
+      - 清空要逐次 Backspace：Control+a + Delete 清不干净，残留会与重填字符混合成 '10 / 23'
+      - 重试要递增延迟：失败几乎都是输入过快被吞，加大间隔后一次即过
+
+    比对时只取数字，因为 Stripe 会插入空格/斜杠（'4242 4242 4242 4242'、'12 / 30'）。
+    """
+    want = re.sub(r'\D', '', value)
+    shown = ''
+    for i in range(attempts):
+        try:
+            el.click()
+            time.sleep(0.15)
+            el.press('End')
+            for _ in range(len((el.input_value() or '')) + 2):
+                el.press('Backspace')
+            time.sleep(0.2)
+            el.press_sequentially(value, delay=60 + i * 120)
+            time.sleep(0.5)
+            shown = el.input_value() or ''
+            if re.sub(r'\D', '', shown) == want:
+                return True
+            print(f"  ⚠️ {label} 回读不符 (得到 {shown!r})，重填 {i + 2}/{attempts}")
+        except Exception as e:
+            print(f"  ⚠️ {label} 第 {i + 1} 次填写异常: {str(e)[:60]}")
+    print(f"  ❌ {label} 重试 {attempts} 次仍不符，最终值 {shown!r}")
+    return False
+
+
+def _card_form_frames(page):
+    """从 credit-card-form 容器内的 iframe 元素解析出 Frame，并递归收集其子 frame。
+
+    与 _stripe_field_frames 的 page.frames 全局枚举是两条独立路径：这里走
+    DOM 元素 → content_frame，锚定的是「弹窗里那个信用卡表单」本身，不受
+    全局枚举顺序/遗漏影响，也能拿到只挂在该 iframe 下的嵌套层级。
+    """
+    frames = []
+
+    def _collect(fr, depth=0):
+        if fr is None or depth > 4 or fr in frames:
+            return
+        frames.append(fr)
+        try:
+            for kid in fr.child_frames:
+                _collect(kid, depth + 1)
+        except Exception:
+            pass
+
+    selectors = [
+        '[data-test-id="credit-card-form"] iframe',
+        'iframe[title="Secure payment input frame"]',
+        '[role="dialog"] iframe',
+    ]
+    for sel in selectors:
+        try:
+            for el in page.locator(sel).all():
+                try:
+                    handle = el.element_handle(timeout=SHORT_TIMEOUT_MS)
+                    if handle is None:
+                        continue
+                    _collect(handle.content_frame())
+                except Exception:
+                    continue
+        except Exception:
+            continue
+        if frames:
+            break
+    return frames
 
 
 def _fill_stripe_payment_element(driver, card_info):
@@ -5078,36 +5203,38 @@ def _fill_stripe_payment_element(driver, card_info):
     # 命名分两套：旧 Card Element 用 cardnumber/exp-date/cvc + cardNumber/cardExpiry/cardCvc；
     # 新 Payment Element 用 number/expiry/cvc + id="Field-{number,expiry,cvc}Input"。
     # 两套必须都覆盖——只写旧的会导致所有 frame 都匹配不上而退化到 Tab 兜底。
+    # 以下命名经本地挂载真实 Stripe Payment Element 实测确认（见 stripe-payment-element.md）：
+    #   input[name="number"] id="payment-numberInput"
+    #   input[name="expiry"] id="payment-expiryInput"
+    #   input[name="cvc"]    id="payment-cvcInput"
+    # id 前缀是 element 类型而非固定串，故用后缀匹配；旧 Card Element 命名一并保留。
     card_selectors = [
-        'input[name="cardnumber"]',
         'input[name="number"]',
-        'input#Field-numberInput',
+        'input[id$="-numberInput"]',
+        'input[name="cardnumber"]',
         'input[autocomplete="cc-number"]',
         'input[placeholder*="Card number"]',
         'input[placeholder*="card number"]',
         'input[data-elements-stable-field-name="cardNumber"]',
-        'input[data-elements-stable-field-name="number"]',
     ]
 
     expiry_selectors = [
+        'input[name="expiry"]',
+        'input[id$="-expiryInput"]',
         'input[name="exp-date"]',
         'input[name="cardExpiry"]',
-        'input[name="expiry"]',
-        'input#Field-expiryInput',
         'input[autocomplete="cc-exp"]',
         'input[placeholder*="MM"]',
         'input[data-elements-stable-field-name="cardExpiry"]',
-        'input[data-elements-stable-field-name="expiry"]',
     ]
 
     cvc_selectors = [
         'input[name="cvc"]',
+        'input[id$="-cvcInput"]',
         'input[name="cardCvc"]',
-        'input#Field-cvcInput',
         'input[autocomplete="cc-csc"]',
         'input[placeholder*="CVC"]',
         'input[data-elements-stable-field-name="cardCvc"]',
-        'input[data-elements-stable-field-name="cvc"]',
     ]
 
     # Stripe Payment Element 内的账单地址字段选择器
@@ -5187,6 +5314,11 @@ def _fill_stripe_payment_element(driver, card_info):
                     or name.startswith('__privatestripeframe')
                     or 'elements-inner' in url):
                 result.append(fr)
+        # 并入 DOM→content_frame 路径的结果（去重）。两条路径解析机制不同，
+        # page.frames 漏掉的嵌套层级可能只有这条能拿到。
+        for fr in _card_form_frames(page):
+            if fr not in result:
+                result.append(fr)
         return result
 
     def try_fill_selectors(ctx, selectors, value, label):
@@ -5229,10 +5361,9 @@ def _fill_stripe_payment_element(driver, card_info):
                                         break
                             except Exception:
                                 pass
-                else:
-                    el.click()
-                    time.sleep(0.3)
-                    el.press_sequentially(str(value), delay=50)
+                elif not _type_and_verify_stripe_field(el, str(value), label):
+                    # 回读不符且重试用尽：换下一个选择器，别把错值当成功
+                    continue
                 print(f"  ✅ 填写 {label}")
                 filled_any = True
                 return True
