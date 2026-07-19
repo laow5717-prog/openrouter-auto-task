@@ -107,6 +107,8 @@ class BrowserSession:
         self._download_dir = download_dir
         self.console_errors = []            # page.on("console") 收集（替代 __cfAutoErrors）
         self.net_responses = []             # page.on("response") 收集（替代 __netInterceptResponses）
+        self.failed_responses = []          # 所有 4xx/5xx 响应（URL+状态码），不受拦截模式约束
+        self.console_all_errors = []        # 未经卡片模式过滤的 error 级控制台日志（诊断用）
         self._net_patterns = []             # 网络拦截关键词模式（子列表内 AND，列表间 OR）
         self._last_png = None               # 最近一帧截图缓存（业务线程写、截图线程读）
         self._png_lock = threading.Lock()
@@ -126,6 +128,14 @@ class BrowserSession:
             text = msg.text or ''
         except Exception:
             return
+        # console_errors 只留匹配卡片错误模式的条目（供 _check_browser_console_for_errors
+        # 提取拒卡原因）；诊断「表单卡在加载态」需要的是未经过滤的 error 级日志，
+        # 那类报错不含卡片关键词，会被上面的模式全部丢掉，故另存一份。
+        try:
+            if msg.type == 'error' and len(self.console_all_errors) < 100:
+                self.console_all_errors.append(text[:300])
+        except Exception:
+            pass
         for pat in _CARD_ERROR_PATTERNS:
             if pat.search(text):
                 self.console_errors.append(text[:300])
@@ -140,6 +150,14 @@ class BrowserSession:
         # 无论当前是否在拦截其它模式，都抓一次最新余额缓存到 session（供落库用）。
         if _CREDIT_BALANCE_URL_MARK in url:
             self._capture_credit_balance(response)
+        # 失败响应始终记录（不受 _net_patterns 约束）：排查「表单卡在加载态」这类问题时，
+        # 原因常在被拒的接口而非 DOM，而那时没人会预先设置拦截模式。只留 URL+状态码，
+        # 不读响应体，开销可忽略；上限 200 条防止长任务累积。
+        try:
+            if (response.status or 0) >= 400 and len(self.failed_responses) < 200:
+                self.failed_responses.append({'url': url, 'status': response.status})
+        except Exception:
+            pass
         if not self._net_patterns or not _match_net_url(url, self._net_patterns):
             return
         # 读响应体（sync 回调内允许；失败不影响主流程）
@@ -1322,6 +1340,27 @@ def _wait_for_stripe_fields_ready(driver, timeout=90):
                 if f not in probe:
                     probe.append(f)
             _dump_stripe_frame_fields(page, probe)
+        except Exception:
+            pass
+        # Payment Element 卡在加载态时，原因往往不在 DOM 而在被拒的接口或 JS 报错
+        try:
+            errs = list(driver.console_all_errors or []) or list(driver.console_errors or [])
+            if errs:
+                print(f"  🔍 控制台错误 (最近 {min(len(errs), 15)} 条):")
+                for e in errs[-15:]:
+                    print(f"        {e[:200]}")
+            else:
+                print("  🔍 控制台无错误记录")
+        except Exception:
+            pass
+        try:
+            bad = list(driver.failed_responses or [])
+            if bad:
+                print(f"  🔍 失败的网络请求 (最近 {min(len(bad), 15)} 条):")
+                for r in bad[-15:]:
+                    print(f"        {r.get('status')} {str(r.get('url'))[:150]}")
+            else:
+                print("  🔍 无 4xx/5xx 网络请求记录")
         except Exception:
             pass
     else:
@@ -5105,6 +5144,18 @@ def _dump_stripe_frame_fields(page, frames):
         for f in fields:
             print(f"        {f['tag']} name={f['name']!r} id={f['id']!r} ph={f['ph']!r} "
                   f"type={f['type']!r} stable={f['stable']!r} shadow={f['shadow']} vis={f['vis']}")
+        # payment frame 没有字段时，把它的实际内容整段打出来——正常渲染时 body 约 32KB
+        # 且含 12 个 input，若只有几 KB 且无字段，内容本身会直接说明是骨架屏、
+        # 错误提示还是别的东西，比继续猜选择器有效。
+        if comp == 'payment' and not fields:
+            try:
+                html = fr.evaluate("() => document.body ? document.body.innerHTML : ''")
+            except Exception as e:
+                print(f"        (读取 payment frame 内容失败: {str(e)[:80]})")
+            else:
+                print("        ↓↓↓ payment frame 内容全文 ↓↓↓")
+                print(html[:4000])
+                print("        ↑↑↑ 内容结束 ↑↑↑")
 
 
 def _type_and_verify_stripe_field(el, value, label, attempts=4):
