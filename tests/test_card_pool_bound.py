@@ -7,7 +7,9 @@
 
 from src.models.card_pool import CardPoolModel
 from src.models.card_group import CardGroupModel
-from src.utils import CARD_STATUS_BOUND, CARD_STATUS_INVALID, CARD_STATUS_EXPIRED
+from src.utils import (
+    CARD_STATUS_BOUND, CARD_STATUS_INVALID, CARD_STATUS_EXPIRED, CARD_STATUS_PAID,
+)
 
 
 def _card(number, month='12', year='2030'):
@@ -50,6 +52,22 @@ def test_bound_does_not_overwrite_invalid(db):
 
     rows = pool.get_all_by_group(gid)
     assert rows[0]['status'] == CARD_STATUS_INVALID
+
+
+def test_bound_does_not_overwrite_paid(db):
+    """paid 证明该卡真实付款成功过，是可用性的最强证据，不能被 bound 盖掉。
+
+    这类卡不会因保留 paid 而被重复绑定——建任务时
+    get_successfully_bound_card_numbers 那层派生过滤仍然生效。
+    """
+    pool, gid = _setup(db)
+    pool.add_cards(gid, [_card('4111111111111111')])
+    pool.mark_status_by_number('4111111111111111', CARD_STATUS_PAID)
+
+    pool.mark_bound_by_number('4111111111111111')
+
+    rows = pool.get_all_by_group(gid)
+    assert rows[0]['status'] == CARD_STATUS_PAID
 
 
 def test_bound_does_not_overwrite_expired(db):

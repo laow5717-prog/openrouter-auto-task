@@ -8,6 +8,7 @@ from src.utils import (
     is_card_expired,
     CARD_STATUS_EXPIRED,
     CARD_STATUS_INVALID,
+    CARD_STATUS_PAID,
     CARD_STATUS_BOUND,
     CARD_STATUS_UNUSABLE,
     CARD_STATUS_NOT_SELECTABLE,
@@ -307,14 +308,19 @@ class CardPoolModel:
     def mark_bound_by_number(self, card_number):
         """标记为已绑定到某账号（一卡一账号），此后不再参与选卡。
 
-        不覆盖已是无效/过期的记录：那类卡本就不可用，且 invalid 记录着「卡有问题」
-        这一更重要的事实，被 bound 覆盖会丢失归因。
+        只改写空状态。以下状态一律保留，因为它们的信息量都比「被绑过」更大：
+          - invalid / expired：记录着卡不可用及其归因，本就不会被选中
+          - paid：证明该卡真实付款成功过，是卡可用性的最强证据
+
+        被保留的 paid 卡不会因此被重复绑定——建任务时
+        card_bindings.get_successfully_bound_card_numbers() 那层派生过滤仍然生效。
         """
-        ph = ','.join('?' * len(CARD_STATUS_UNUSABLE))
+        keep = tuple(CARD_STATUS_UNUSABLE) + (CARD_STATUS_PAID,)
+        ph = ','.join('?' * len(keep))
         self.db.execute(
             f"UPDATE card_pool SET status=? WHERE card_number=? "
             f"AND COALESCE(status,'') NOT IN ({ph})",
-            (CARD_STATUS_BOUND, card_number, *CARD_STATUS_UNUSABLE),
+            (CARD_STATUS_BOUND, card_number, *keep),
         )
 
     def delete_card(self, card_id):

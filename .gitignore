@@ -25,3 +25,4 @@ registered_accounts.txt.migrated
 =*
 *.log
 .pytest_cache/
+data/*.db.bak-*
