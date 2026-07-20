@@ -98,16 +98,18 @@
             <th>CVC</th>
             <th>持卡人</th>
             <th>国家</th>
+            <th>累计充值</th>
+            <th>当日充值</th>
             <th>状态</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="poolLoading">
-            <td colspan="8" class="table-loading">加载中...</td>
+            <td colspan="10" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="poolCards.length === 0">
-            <td colspan="8" class="table-empty">暂无卡片数据，请上传 Excel 文件</td>
+            <td colspan="10" class="table-empty">暂无卡片数据，请上传 Excel 文件</td>
           </tr>
           <tr v-for="card in poolCards" :key="card.id">
             <td>{{ card.id }}</td>
@@ -118,6 +120,8 @@
             <td>{{ card.cvc }}</td>
             <td>{{ card.first_name }} {{ card.last_name }}</td>
             <td>{{ card.country }}</td>
+            <td>{{ card.recharge_total || 0 }}</td>
+            <td :style="{ color: card.recharge_today ? '#059669' : 'inherit' }">{{ card.recharge_today || 0 }}</td>
             <td>
               <span v-if="card.status === 'expired'" class="status-tag fail">已过期</span>
               <span v-else-if="card.status === 'invalid'" class="status-tag fail">无效</span>
@@ -272,16 +276,18 @@
             <th>来源</th>
             <th>关联账号</th>
             <th>池内位置</th>
+            <th>累计充值</th>
+            <th>当日充值</th>
             <th>状态</th>
             <th>验证时间</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="validLoading">
-            <td colspan="8" class="table-loading">加载中...</td>
+            <td colspan="10" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="validCards.length === 0">
-            <td colspan="8" class="table-empty">暂无有效卡记录</td>
+            <td colspan="10" class="table-empty">暂无有效卡记录</td>
           </tr>
           <tr v-for="c in validCards" :key="c.id">
             <td style="font-family:monospace">{{ c.card_number }}</td>
@@ -297,6 +303,8 @@
               <template v-if="c.pool_group">{{ c.pool_group }} · {{ c.pool_status }}</template>
               <span v-else style="color:var(--text-sub)">{{ c.pool_status || '不在卡池' }}</span>
             </td>
+            <td>{{ c.recharge_total || 0 }}</td>
+            <td :style="{ color: c.recharge_today ? '#059669' : 'inherit' }">{{ c.recharge_today || 0 }}</td>
             <td>
               <span class="status-tag" :class="(c.tds_cooldown || c.rate_cooldown) ? 'fail' : 'success'">
                 {{ c.status_text || '可用' }}

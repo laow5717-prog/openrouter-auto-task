@@ -652,6 +652,16 @@ def delete_card_group(group_id):
     return jsonify({"status": "ok"})
 
 
+def _attach_recharge_counts(card, counts):
+    """给一张卡补充 recharge_total（累计成功充值次数）/ recharge_today（当日成功充值次数）。
+    counts 由 RechargeLogModel.count_success_by_last4() 一次性聚合得到，按卡号末 4 位匹配。"""
+    last4 = (card.get('card_number') or '').replace(' ', '')[-4:]
+    c = counts.get(last4) or {}
+    card['recharge_total'] = c.get('total', 0)
+    card['recharge_today'] = c.get('today', 0)
+    return card
+
+
 @api.route('/api/card-pool/<int:group_id>')
 def get_card_pool(group_id):
     models = get_models()
@@ -665,12 +675,14 @@ def get_card_pool(group_id):
         group_id, page=page, page_size=page_size, bucket=bucket)
 
     # 标记有效卡 + 选卡规则状态（供列表状态列展示 3DS临时/24h次数冷却）
+    recharge_counts = models['recharge_log'].count_success_by_last4()
     for card in cards:
         num = card['card_number']
         card['is_valid'] = models['valid_card'].is_valid(num)
         card['tds_cooldown'] = models['card_state'].in_tds_cooldown(num)
         card['rate_cooldown'] = models['recharge_log'].success_count_since(num, 24) >= 2
         card['bound_email'] = models['valid_card'].get_bound_email(num)
+        _attach_recharge_counts(card, recharge_counts)
 
     buckets = models['card_pool'].count_buckets(group_id)
     return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size,
@@ -835,8 +847,10 @@ def get_valid_cards():
         page=page, page_size=page_size,
         source_type=source_type, keyword=keyword,
     )
+    recharge_counts = models['recharge_log'].count_success_by_last4()
     for c in cards:
         _valid_card_status(models, c)
+        _attach_recharge_counts(c, recharge_counts)
     summary = models['valid_card'].get_summary()
     return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size, "summary": summary})
 
@@ -857,13 +871,15 @@ def export_valid_cards():
     headers = ['卡号', '有效期(月)', '有效期(年)', '安全码CVC', '名', '姓',
                '国家', '地址', '地址2', '城市', '州', '邮编', '公司',
                '来源', '关联CF账号', 'CF登录密码', '邮箱密码', '账号状态',
-               '卡状态', '验证时间']
+               '卡状态', '累计充值次数', '当日充值次数', '验证时间']
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = '有效卡'
     ws.append(headers)
+    recharge_counts = models['recharge_log'].count_success_by_last4()
     for c in cards:
         _valid_card_status(models, c)
+        _attach_recharge_counts(c, recharge_counts)
         email = c.get('source_email', '') or ''
         acct = acct_map.get(email, {})
         ws.append([
@@ -873,7 +889,8 @@ def export_valid_cards():
             c.get('city', ''), c.get('state', ''), c.get('zip', ''), c.get('company', ''),
             ('绑定' if c.get('source_type') == 'bind' else '支付'),
             email, acct.get('cf_password', ''), acct.get('email_password', ''),
-            acct.get('status', ''), c.get('status_text', ''), c.get('validated_at', ''),
+            acct.get('status', ''), c.get('status_text', ''),
+            c.get('recharge_total', 0), c.get('recharge_today', 0), c.get('validated_at', ''),
         ])
 
     # 列宽自适应（按每列最长内容估算，含表头）

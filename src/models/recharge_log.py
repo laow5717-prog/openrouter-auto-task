@@ -85,6 +85,26 @@ class RechargeLogModel:
         )
         return row['cnt'] if row else 0
 
+    def count_success_by_last4(self):
+        """一次聚合出「每张卡的成功充值次数 / 当日成功充值次数」，返回 {last4: {'total': n, 'today': n}}。
+
+        card_display 的写入格式不统一（可能是完整卡号，也可能是脱敏的 '•••• 1234'，见 app.py
+        的 _match_full_card 回退分支），所以这里统一按去空格后的末 4 位聚合，两种格式都能命中。
+        列表页按卡号取末 4 位查表即可，避免每张卡一次子查询的 N+1。
+        """
+        rows = self.db.fetchall(
+            "SELECT substr(replace(card_display,' ',''), -4) AS last4, "
+            "COUNT(*) AS total, "
+            "SUM(CASE WHEN DATE(created_at)=DATE('now','localtime') THEN 1 ELSE 0 END) AS today "
+            "FROM recharge_logs "
+            "WHERE status='success' AND card_display IS NOT NULL AND card_display != '' "
+            "GROUP BY last4"
+        )
+        return {
+            r['last4']: {'total': r['total'] or 0, 'today': r['today'] or 0}
+            for r in rows if r['last4']
+        }
+
     def last_success_at(self, card_number):
         """该卡号最近一次成功支付时间（localtime 字符串），无则 None。"""
         if not card_number:
