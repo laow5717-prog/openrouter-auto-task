@@ -364,11 +364,6 @@ const validLoading = ref(false)
 const validSummary = reactive({ total: 0, bind_count: 0, payment_count: 0 })
 const validFilters = reactive({ keyword: '', source_type: '' })
 
-function maskCard(num) {
-  if (!num || num.length < 8) return num
-  return num.slice(0, 4) + ' **** **** ' + num.slice(-4)
-}
-
 async function loadGroups() {
   try {
     groups.value = await getCardGroups()

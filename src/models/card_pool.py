@@ -334,6 +334,18 @@ class CardPoolModel:
         row = self.db.fetchone("SELECT COUNT(*) as cnt FROM card_pool WHERE group_id=?", (group_id,))
         return row['cnt'] if row else 0
 
+    def find_number_by_last4(self, last4):
+        """按末 4 位在整个卡池反查完整卡号；命中 0 张或多张（撞号）时返回 None。
+        用于充值记账时把页面上只能读到的后四位还原成完整卡号。"""
+        if not last4 or len(last4) != 4:
+            return None
+        rows = self.db.fetchall(
+            "SELECT DISTINCT card_number FROM card_pool WHERE card_number LIKE ?",
+            (f'%{last4}',),
+        )
+        nums = [r['card_number'] for r in rows if r['card_number'].endswith(last4)]
+        return nums[0] if len(nums) == 1 else None
+
     def get_locations_by_number(self, card_number):
         """返回该卡号当前在卡池中的位置列表：[{group_id, group_name, status}]。
         通常 0 或 1 条（add_cards 阻止跨组同号）；用于有效卡弹窗展示"池内分组/状态"。"""

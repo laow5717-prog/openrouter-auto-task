@@ -135,13 +135,13 @@ def export_report(records, save_path=None):
     ws = wb.active
     ws.title = "BindReport"
 
-    headers = ["#", "Card (last 4)", "Status", "Bound To", "Error", "Time"]
+    headers = ["#", "Card", "Status", "Bound To", "Error", "Time"]
     for col_idx, h in enumerate(headers, 1):
         ws.cell(row=1, column=col_idx, value=h)
 
     for row_idx, r in enumerate(records, 2):
         ws.cell(row=row_idx, column=1, value=r.get("id", row_idx - 1))
-        ws.cell(row=row_idx, column=2, value=f"****{r.get('card_display', '????')}")
+        ws.cell(row=row_idx, column=2, value=r.get('card_display', ''))
         ws.cell(row=row_idx, column=3, value=r.get("status", ""))
         ws.cell(row=row_idx, column=4, value=r.get("bound_to_email", ""))
         ws.cell(row=row_idx, column=5, value=r.get("error", ""))

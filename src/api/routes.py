@@ -211,7 +211,7 @@ def export_card_history():
     ws = wb.active
     ws.title = "绑卡记录"
 
-    headers = ["序号", "卡号(后4位)", "状态", "绑定账号", "错误信息", "处理时间", "任务批次",
+    headers = ["序号", "卡号", "状态", "绑定账号", "错误信息", "处理时间", "任务批次",
                "完整卡号", "有效期", "CVC", "持卡人",
                "国家", "地址1", "地址2", "城市", "州/省", "邮编", "公司"]
     header_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
@@ -230,7 +230,8 @@ def export_card_history():
                 pass
 
         ws.cell(row=row_idx, column=1, value=r['id'])
-        ws.cell(row=row_idx, column=2, value=f"****{r['card_display']}")
+        # card_bindings.card_display 存的是后四位，优先用 card_data_json 里的完整卡号
+        ws.cell(row=row_idx, column=2, value=card.get('number') or r['card_display'])
         ws.cell(row=row_idx, column=3, value=r['status'])
         ws.cell(row=row_idx, column=4, value=r.get('bound_to_email') or '')
         ws.cell(row=row_idx, column=5, value=r.get('error') or '')

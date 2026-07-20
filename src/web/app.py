@@ -423,13 +423,18 @@ class AppState:
         log_id = models['recharge_log'].create(email, card_display='', amount=10)
 
         def _match_full_card(card_last4):
-            """页面后四位 → 完整卡号（用于 log 展示）。找不到则回退 •••• 后四位。"""
+            """页面后四位 → 完整卡号（写入 recharge_logs.card_display）。
+
+            先在该账号已绑定的卡里找；找不到再到全局卡池按末 4 位反查（唯一命中才采信）。
+            两级都落空时返回裸后四位——绝不写脱敏串，否则 card_display 会混入 '•••• '
+            前缀，导致按完整卡号等值匹配的统计/冷却判定（如 success_count_since）静默失效。
+            """
             if not card_last4:
                 return ''
             for c in cards:
                 if c.get('card_number', '').endswith(card_last4):
                     return c['card_number']
-            return f'•••• {card_last4}'
+            return models['card_pool'].find_number_by_last4(card_last4) or card_last4
 
         try:
             result = registration.recharge_account(
