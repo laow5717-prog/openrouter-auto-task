@@ -501,6 +501,22 @@ def get_recharge_logs():
     return jsonify({"data": logs, "total": total, "page": page, "page_size": page_size})
 
 
+@api.route('/api/card-recharge-logs')
+def get_recharge_logs_by_card():
+    """某张卡的充值记录明细，供卡池/有效卡列表点开查看。
+
+    路径特意不挂在 /api/recharge-logs/ 下——那里的 <email> 动态段会吞掉同级路径。
+    """
+    models = get_models()
+    card_number = request.args.get('card_number', '')
+    if not card_number:
+        return jsonify({"error": "缺少 card_number"}), 400
+    logs = models['recharge_log'].get_by_card(card_number)
+    success = sum(1 for l in logs if l.get('status') == 'success')
+    return jsonify({"data": logs, "total": len(logs), "success_total": success,
+                    "card_number": card_number})
+
+
 @api.route('/api/recharge-logs/<email>')
 def get_recharge_logs_by_email(email):
     models = get_models()

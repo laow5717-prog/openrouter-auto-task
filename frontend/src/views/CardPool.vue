@@ -120,7 +120,12 @@
             <td>{{ card.cvc }}</td>
             <td>{{ card.first_name }} {{ card.last_name }}</td>
             <td>{{ card.country }}</td>
-            <td>{{ card.recharge_total || 0 }}</td>
+            <td>
+              <button v-if="card.recharge_total" class="link-btn" @click="showCardRecharge(card.card_number)">
+                {{ card.recharge_total }}
+              </button>
+              <span v-else>0</span>
+            </td>
             <td :style="{ color: card.recharge_today ? '#059669' : 'inherit' }">{{ card.recharge_today || 0 }}</td>
             <td>
               <span v-if="card.status === 'expired'" class="status-tag fail">已过期</span>
@@ -303,7 +308,12 @@
               <template v-if="c.pool_group">{{ c.pool_group }} · {{ c.pool_status }}</template>
               <span v-else style="color:var(--text-sub)">{{ c.pool_status || '不在卡池' }}</span>
             </td>
-            <td>{{ c.recharge_total || 0 }}</td>
+            <td>
+              <button v-if="c.recharge_total" class="link-btn" @click="showCardRecharge(c.card_number)">
+                {{ c.recharge_total }}
+              </button>
+              <span v-else>0</span>
+            </td>
             <td :style="{ color: c.recharge_today ? '#059669' : 'inherit' }">{{ c.recharge_today || 0 }}</td>
             <td>
               <span class="status-tag" :class="(c.tds_cooldown || c.rate_cooldown) ? 'fail' : 'success'">
@@ -318,6 +328,47 @@
     <Pagination :total="validTotal" :page="validPage" :page-size="20"
       @change="p => { validPage = p; loadValidCards() }" />
   </Modal>
+
+  <!-- 单卡充值记录明细 -->
+  <Modal :visible="rechargeVisible" :title="`充值记录 · ${rechargeCard}`" wide
+    @close="rechargeVisible = false">
+    <div v-if="rechargeLoading" class="table-loading">加载中...</div>
+    <template v-else>
+      <div style="font-size:12px;color:var(--text-sub);margin-bottom:8px">
+        共 {{ rechargeLogs.length }} 条记录，其中成功 {{ rechargeSuccess }} 次。
+        按卡号末 4 位匹配，最多显示最近 200 条。
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>账号邮箱</th>
+              <th>金额</th>
+              <th>状态</th>
+              <th>错误信息</th>
+              <th style="white-space:nowrap">时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="rechargeLogs.length === 0">
+              <td colspan="5" class="table-empty">该卡暂无充值记录</td>
+            </tr>
+            <tr v-for="log in rechargeLogs" :key="log.id">
+              <td>{{ log.email }}</td>
+              <td style="font-family:monospace">${{ log.amount }}</td>
+              <td>
+                <span class="status-tag" :class="rechargeStatusClass(log.status)">
+                  {{ rechargeStatusText(log.status) }}
+                </span>
+              </td>
+              <td style="font-size:12px;max-width:280px">{{ log.error || '-' }}</td>
+              <td style="white-space:nowrap;font-size:12px">{{ log.created_at }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </template>
+  </Modal>
 </template>
 
 <script setup>
@@ -326,6 +377,7 @@ import {
   getCardGroups, createCardGroup, updateCardGroup, deleteCardGroup,
   getCardPool, uploadCardPool, deletePoolCard, clearCardPool,
   getValidCards, mergeCardPools, deleteInvalidCards, moveCardsToGroup,
+  getRechargeLogsByCard,
 } from '../api'
 import FilterBar from '../components/FilterBar.vue'
 import Pagination from '../components/Pagination.vue'
@@ -363,6 +415,36 @@ const validPage = ref(1)
 const validLoading = ref(false)
 const validSummary = reactive({ total: 0, bind_count: 0, payment_count: 0 })
 const validFilters = reactive({ keyword: '', source_type: '' })
+
+// 单卡充值记录弹窗
+const rechargeVisible = ref(false)
+const rechargeLoading = ref(false)
+const rechargeCard = ref('')
+const rechargeLogs = ref([])
+const rechargeSuccess = ref(0)
+
+async function showCardRecharge(cardNumber) {
+  rechargeCard.value = cardNumber
+  rechargeLogs.value = []
+  rechargeSuccess.value = 0
+  rechargeVisible.value = true
+  rechargeLoading.value = true
+  try {
+    const res = await getRechargeLogsByCard(cardNumber)
+    rechargeLogs.value = res.data || []
+    rechargeSuccess.value = res.success_total || 0
+  } finally {
+    rechargeLoading.value = false
+  }
+}
+
+function rechargeStatusText(s) {
+  return { success: '成功', failed: '失败', pending: '进行中' }[s] || s
+}
+
+function rechargeStatusClass(s) {
+  return { success: 'success', failed: 'fail' }[s] || ''
+}
 
 async function loadGroups() {
   try {
@@ -654,4 +736,16 @@ onMounted(() => {
 .stat-card.small .stat-label { font-size: 11px; }
 .stat-card.small .stat-value { font-size: 18px; }
 .expired-cell { color: #991b1b; text-decoration: line-through; }
+
+/* 充值次数入口：看起来像链接的数字，点开该卡的充值记录明细 */
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--primary, #2563eb);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.link-btn:hover { opacity: 0.75; }
 </style>

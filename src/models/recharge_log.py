@@ -105,6 +105,23 @@ class RechargeLogModel:
             for r in rows if r['last4']
         }
 
+    def get_by_card(self, card_number, limit=200):
+        """某张卡的全部充值记录（含失败），最近的在前。
+
+        与 count_success_by_last4 保持同一匹配口径——按去空格后的末 4 位，
+        以兼容历史上写入格式不一致的 card_display。
+        """
+        last4 = (card_number or '').replace(' ', '')[-4:]
+        if len(last4) != 4:
+            return []
+        rows = self.db.fetchall(
+            "SELECT * FROM recharge_logs "
+            "WHERE substr(replace(card_display,' ',''), -4)=? "
+            "ORDER BY id DESC LIMIT ?",
+            (last4, limit),
+        )
+        return [dict(r) for r in rows]
+
     def last_success_at(self, card_number):
         """该卡号最近一次成功支付时间（localtime 字符串），无则 None。"""
         if not card_number:

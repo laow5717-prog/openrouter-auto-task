@@ -64,6 +64,7 @@ export const getOpenBrowsers = () => get('/api/accounts/open-browsers')
 // Recharge logs
 export const getRechargeLogs = (params) => get('/api/recharge-logs', params)
 export const getRechargeLogsByEmail = (email) => get(`/api/recharge-logs/${encodeURIComponent(email)}`)
+export const getRechargeLogsByCard = (cardNumber) => get('/api/card-recharge-logs', { card_number: cardNumber })
 
 // Card history
 export const getCardHistory = (params) => get('/api/card/history', params)
