@@ -208,6 +208,64 @@ def wait_for_login_code(token: str, since_ts, timeout: int = None):
     return None
 
 
+def wait_for_github_launch_code(token: str, since_ts, timeout: int = None):
+    """等待并提取 GitHub 注册验证邮件里的 launch code（8 位数字）。
+
+    与 wait_for_login_code 同构（按 createdAt 过滤 + 只提码不认链接），区别只在
+    发件人/主题过滤词换成 GitHub。GitHub 注册确认邮件发件人为 noreply@github.com，
+    主题形如 "Your GitHub launch code" 或 "[GitHub] Please verify your device"，
+    正文/主题含 8 位数字码。
+
+    参数:
+        token: mail.tm 访问 token
+        since_ts: aware datetime，只接受严格晚于它的邮件（调用方须在「点提交/触发发信之前」取值）
+        timeout: 秒，默认取 cfg.email.wait_timeout
+    返回:
+        str | None: 验证码；超时未收到返回 None
+    """
+    if timeout is None:
+        timeout = cfg.email.wait_timeout
+
+    print(f"等待 GitHub 验证码邮件 (最长 {timeout} 秒，只认 {since_ts} 之后的邮件)...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        messages = fetch_emails(token) or []
+
+        for msg in messages:
+            created = _parse_created_at(msg.get('createdAt'))
+            if created is None or created <= since_ts:
+                continue  # 旧邮件或时间不可信，一律跳过
+
+            sender = str(msg.get('from', {}).get('address', '')).lower()
+            subject = _to_str(msg.get('subject', ''))
+            if 'github' not in sender and 'github' not in subject.lower():
+                continue
+
+            # launch code 常直接出现在主题里（Your GitHub launch code: 12345678）
+            code = extract_verification_code(subject)
+            if not code:
+                detail = get_email_detail(token, msg.get('id', '')) or {}
+                for content in (_to_str(detail.get('text')),
+                                _to_str(detail.get('html')),
+                                _to_str(detail.get('intro'))):
+                    if content:
+                        code = extract_verification_code(content)
+                        if code:
+                            break
+
+            if code:
+                print(f"\n收到 GitHub 验证码: {code} (邮件时间 {created})")
+                return code
+
+        elapsed = int(time.time() - start_time)
+        print(f"  等待中... ({elapsed}秒)", end='\r')
+        time.sleep(cfg.email.poll_interval)
+
+    print("\n等待 GitHub 验证码邮件超时")
+    return None
+
+
 def fetch_emails(token: str):
     headers = {"Authorization": f"Bearer {token}"}
 
