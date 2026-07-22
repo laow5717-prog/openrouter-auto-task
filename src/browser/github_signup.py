@@ -9,7 +9,9 @@
 GitHub signup 为**单页全字段**表单（email/password/username/country/checkbox 一开始即可见），
 非逐字段揭示；Create account 按钮初始 disabled，三字段校验通过后才 enabled。
 """
+import re
 import time
+from urllib.parse import urlparse
 
 from src.browser.driver import _safe_goto, _wait_visible
 
@@ -34,6 +36,7 @@ STAGE_SUBMITTED = "submitted"
 
 # 终态常量
 TERM_CAPTCHA = "reached_captcha"
+TERM_VERIFY_EMAIL = "verify_email"   # 未出验证码，GitHub 直接进「输入 launch code」邮箱验证页
 TERM_REJECTED = "rejected_by_github"
 TERM_UNKNOWN = "unknown"
 
@@ -159,16 +162,55 @@ def submit(session, wait_button_timeout=15000):
         return False
 
 
+def _on_verify_email_page(session):
+    """判定当前是否已进入「输入邮箱 launch code」验证页。
+
+    信号（任一命中）：URL 含 verify/verification/launch/account_verification；
+    或页面出现 launch code 输入框（_CODE_INPUT_CANDIDATES 任一可见）；
+    或正文含「launch code / verification code / verify your email / enter the code」等提示。
+    """
+    page = session.page
+    try:
+        url = (session.current_url or "").lower()
+    except Exception:
+        url = ""
+    if any(k in url for k in ("account_verification", "/verify", "verification", "launch_code")):
+        return True
+
+    # 输入框信号
+    for sel in _CODE_INPUT_CANDIDATES:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                return True
+        except Exception:
+            continue
+
+    # 正文提示信号
+    try:
+        hit = page.evaluate(
+            r"""() => {
+              const t = (document.body.innerText || '').toLowerCase();
+              return /launch code|verification code|verify your email|enter the code|we sent|check your email/.test(t);
+            }""")
+        if hit:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def detect_terminal_state(session, timeout=40):
-    """提交后判定终态：出现验证码 / 被拒 / 未知。
+    """提交后判定终态：验证码 / 直接进邮箱验证页 / 被拒 / 未知。
 
     轮询直到命中或超时：
       - Arkose 验证码容器内出现可见 iframe → TERM_CAPTCHA
+      - 进入「输入 launch code」验证页 → TERM_VERIFY_EMAIL（未出验证码，可全自动收码回填）
       - #email-err / #login-err 出现可见文本 → TERM_REJECTED
     返回 dict：{"terminal": <TERM_*>, "detail": str}
     """
     page = session.page
-    print(f"等待终态（最长 {timeout}s）：验证码 / 拒绝 ...")
+    print(f"等待终态（最长 {timeout}s）：验证码 / 邮箱验证页 / 拒绝 ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         # 验证码：captcha 容器内出现可见 iframe（Arkose challenge 已加载）
@@ -180,6 +222,11 @@ def detect_terminal_state(session, timeout=40):
         except Exception:
             pass
 
+        # 直接进邮箱验证页（未出验证码）
+        if _on_verify_email_page(session):
+            return {"terminal": TERM_VERIFY_EMAIL,
+                    "detail": f"已进入邮箱验证页（输入 launch code），当前 URL: {session.current_url}"}
+
         # 拒绝：字段错误
         for sel in (SEL_EMAIL_ERR, SEL_USERNAME_ERR):
             err = _field_error(page, sel)
@@ -189,7 +236,7 @@ def detect_terminal_state(session, timeout=40):
         time.sleep(1)
 
     return {"terminal": TERM_UNKNOWN,
-            "detail": f"{timeout}s 内未检测到验证码或明确拒绝，当前 URL: {session.current_url}"}
+            "detail": f"{timeout}s 内未检测到验证码/验证页/拒绝，当前 URL: {session.current_url}"}
 
 
 # —————————————————————————————————————————————————————————————
@@ -284,8 +331,13 @@ def dump_verification_dom(session):
                 "url": getattr(session, "current_url", None)}
 
 
-# 验证页 launch code 输入框候选选择器（优先级从高到低；均为推断，待真实 DOM 收敛）
+# 验证页 launch code 输入框候选选择器（优先级从高到低）。
+# 首项为 2026-07-22 真实到达 github.com/account_verifications 侦察确认：
+# 8 个 <input id="launch-code-N" name="launch_code[]" type="number" maxlength="1">（分格 OTP）。
+# 其余为跨版本兜底启发式。
 _CODE_INPUT_CANDIDATES = [
+    'input[name="launch_code[]"]',
+    'input[id^="launch-code-"]',
     'input[autocomplete="one-time-code"]',
     'input[name*="otp" i]',
     'input[id*="otp" i]',
@@ -297,13 +349,33 @@ _CODE_INPUT_CANDIDATES = [
     'input[inputmode="numeric"]',
 ]
 
-# 提交按钮候选（很多 OTP 页填满自动提交，无按钮时填完即视为已提交）
-_CODE_SUBMIT_CANDIDATES = [
-    'button[type="submit"]',
-    'button:has-text("Verify")',
-    'button:has-text("Continue")',
-    'button:has-text("Submit")',
-]
+def _find_verify_submit_button(page):
+    """定位验证页的提交按钮，**避开** "Continue with Google/Apple" 社交登录按钮。
+
+    优先级：
+      1) launch_code 输入所在 <form> 内的 submit 按钮（最可靠，社交按钮在别的 form）；
+      2) 文本严格等于 Continue/Verify/Submit 的按钮（社交按钮文本是 "Continue with X"，不匹配）。
+    找不到返回 None。
+    """
+    # 1) OTP 输入所在 form 内的 submit
+    try:
+        code_input = page.locator('input[name="launch_code[]"], input[id^="launch-code-"]').first
+        if code_input.count() > 0:
+            form = code_input.locator("xpath=ancestor::form[1]")
+            btn = form.locator('button[type="submit"], input[type="submit"]')
+            if btn.count() > 0:
+                return btn.first
+    except Exception:
+        pass
+    # 2) 文本严格匹配（排除社交登录的 "Continue with Google" 等）
+    for word in ("Continue", "Verify", "Submit"):
+        try:
+            btn = page.get_by_role("button", name=re.compile(rf"^\s*{word}\s*$", re.I))
+            if btn.count() > 0:
+                return btn.first
+        except Exception:
+            continue
+    return None
 
 
 def submit_email_code(session, code):
@@ -347,11 +419,12 @@ def submit_email_code(session, code):
     try:
         loc = page.locator(matched_sel)
         if matched_count >= len(code):
-            # 分格 OTP：每格填一位
-            for i, ch in enumerate(code):
-                box = loc.nth(i)
-                box.click(timeout=10000)
-                box.press_sequentially(ch, delay=90)
+            # 分格 OTP：聚焦第一格后逐字符敲整串——GitHub 会自动逐格进焦，
+            # 这样按原生 keydown/input 事件推进，受控组件才会识别到「已满」并启用 Continue。
+            # （逐格 fill 只设 value 不派发完整事件，Continue 会保持 disabled。）
+            first = loc.first
+            first.click(timeout=10000)
+            first.press_sequentially(code, delay=110)
         else:
             # 单个输入框：逐字符敲整串
             _human_type(page, matched_sel, code)
@@ -359,30 +432,143 @@ def submit_email_code(session, code):
         print(f"  ❌ 填入验证码失败: {str(e)[:160]}")
         return False
 
-    # 尝试点提交（无按钮/点不动则视为自动提交型，填满即已提交）
-    for sel in _CODE_SUBMIT_CANDIDATES:
+    # 提交：轮询等 OTP 表单的提交按钮 enabled 后点击（GitHub 填满 8 位才启用 Continue）。
+    # 用 form 内定位，避免误点 "Continue with Google" 社交登录按钮跳到 Google OAuth。
+    deadline = time.time() + 12
+    clicked = False
+    while time.time() < deadline and not clicked:
+        btn = _find_verify_submit_button(page)
+        if btn is not None:
+            try:
+                if btn.is_visible() and btn.is_enabled():
+                    print("  点击 OTP 表单提交按钮（form 内 Continue）")
+                    btn.click(timeout=10000)
+                    session.capture_frame()
+                    clicked = True
+                    break
+            except Exception:
+                pass
+        time.sleep(0.5)
+
+    if not clicked:
+        # 兜底：在验证码输入框上按 Enter（很多 OTP 页回车即提交），不用键盘全局 Enter 以免焦点跑偏
+        print("  未等到可点提交按钮，尝试在输入框按 Enter 提交")
         try:
-            btn = page.locator(sel)
-            if btn.count() > 0 and btn.first.is_visible() and btn.first.is_enabled():
-                print(f"  点击提交按钮: {sel}")
-                btn.first.click(timeout=10000)
-                session.capture_frame()
-                break
+            page.locator(matched_sel).last.press("Enter")
         except Exception:
-            continue
-    else:
-        print("  （未见可点提交按钮，按自动提交型处理）")
+            pass
 
     session.capture_frame()
     return True
 
 
-def detect_signup_complete(session, timeout=20):
-    """判定是否已完成注册进入已登录区域。
+def detect_account_created(session, timeout=15):
+    """判定 launch code 提交后账号是否已创建。
+
+    GitHub 邮箱验证通过后会**创建账号并跳到登录页**，顶部绿条
+    "Your account was created successfully! Please sign in to continue."。
+    信号（任一命中）：正文含该提示；或 host=github.com 且 path 以 /login 开头。
+    返回 {"created": bool, "url": str}。
+    """
+    page = session.page
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            url = session.current_url
+        except Exception:
+            url = ""
+        try:
+            host = (urlparse(url).hostname or "").lower()
+            path = (urlparse(url).path or "").lower()
+        except Exception:
+            host, path = "", ""
+
+        banner = False
+        try:
+            banner = bool(page.evaluate(
+                r"""() => /your account was created successfully/i.test(document.body.innerText || '')"""))
+        except Exception:
+            banner = False
+
+        if banner or (host.endswith("github.com") and path.startswith("/login")):
+            return {"created": True, "url": url}
+        time.sleep(1)
+
+    try:
+        url = session.current_url
+    except Exception:
+        url = ""
+    return {"created": False, "url": url}
+
+
+# GitHub 登录页选择器
+SEL_LOGIN_FIELD = "#login_field"          # 用户名或邮箱
+SEL_LOGIN_PASSWORD = "#password"
+SEL_LOGIN_SUBMIT = 'input[name="commit"], button[type="submit"]'
+
+
+def login_after_signup(session, login_id, password):
+    """在「账号已创建，请登录」页用用户名/密码登录（best-effort）。
+
+    登录后可能：直接进已登录区 / 触发新设备邮箱二次验证（github.com/sessions/verified-device，
+    仍是 8 位邮箱码）/ 回到登录页报错。
+    返回 dict：{"ok": bool, "needs_device_verification": bool, "url": str, "detail": str}
+    """
+    page = session.page
+    out = {"ok": False, "needs_device_verification": False, "suspended": False,
+           "url": "", "detail": ""}
+
+    if not _wait_visible(page.locator(SEL_LOGIN_FIELD), timeout=15000):
+        out["detail"] = "登录页用户名输入框未出现"
+        out["url"] = session.current_url
+        return out
+
+    print(f"  用新凭据登录: {login_id}")
+    _human_type(page, SEL_LOGIN_FIELD, login_id)
+    _human_type(page, SEL_LOGIN_PASSWORD, password)
+    try:
+        page.locator(SEL_LOGIN_SUBMIT).first.click(timeout=10000)
+        session.capture_frame()
+    except Exception as e:
+        out["detail"] = f"点击 Sign in 失败: {str(e)[:120]}"
+        out["url"] = session.current_url
+        return out
+
+    # 等页面转移
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        url = session.current_url
+        low = url.lower()
+        if "/suspended" in low:
+            out["suspended"] = True
+            out["url"] = url
+            out["detail"] = "账号登录后被 GitHub 反滥用立即挂起（/suspended）"
+            return out
+        if "verified-device" in low or "two-factor" in low or "device" in low:
+            out["needs_device_verification"] = True
+            out["url"] = url
+            out["detail"] = "登录触发新设备邮箱验证"
+            return out
+        done = detect_signup_complete(session, timeout=1)
+        if done["complete"]:
+            out["ok"] = True
+            out["url"] = done["url"]
+            out["detail"] = "登录成功，已进入已登录区域"
+            return out
+        time.sleep(1)
+
+    out["url"] = session.current_url
+    out["detail"] = f"登录后 20s 内未确认状态，停在 {out['url']}"
+    return out
+
+
+def detect_signup_complete(session, timeout=25):
+    """判定是否已完成注册进入已登录/onboarding 区域。
 
     间接信号（任一命中即视为完成）：
-      - URL 跳到 github.com 主区，且不再含 /signup 或 verify/session 路径；
-      - 存在已登录导航标记：meta[name="user-login"] 有值、dashboard 区域、头像/侧栏菜单。
+      - URL 已离开注册验证流程（github.com 主区，且不含 signup/verif/session/login 片段）；
+      - 存在已登录标记：meta[name="user-login"] 有值、dashboard 区域、头像/侧栏菜单。
+    仍停在 account_verifications（含 "verif" 片段）一律判未完成，避免把「码没提交成功」误报为完成。
     轮询到 timeout。返回 {"complete": bool, "url": str}。
     """
     page = session.page
@@ -393,10 +579,20 @@ def detect_signup_complete(session, timeout=20):
         except Exception:
             url = ""
 
-        url_ok = ("github.com" in url
-                  and "/signup" not in url
-                  and "verify" not in url
-                  and "/session" not in url)
+        # 按真实 host 判断，不能用子串——OAuth 回跳 URL 的 query 里常编码有 github.com，
+        # 子串匹配会把 accounts.google.com 误判成 GitHub 页。
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            path = (parsed.path or "").lower()
+        except Exception:
+            host, path = "", ""
+        url_ok = (host.endswith("github.com")
+                  and "signup" not in path
+                  and "verif" not in path       # 覆盖 verify / account_verifications
+                  and "/session" not in path
+                  and "/login" not in path
+                  and "/suspended" not in path)  # 被反滥用挂起，不算成功
 
         nav_ok = False
         try:
