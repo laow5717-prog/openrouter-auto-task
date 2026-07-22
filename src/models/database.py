@@ -13,7 +13,7 @@ _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT UNIQUE NOT NULL,
-    cf_password TEXT,
+    login_password TEXT,
     email_password TEXT,
     status TEXT DEFAULT 'registered',
     created_at TEXT DEFAULT (datetime('now','localtime')),
@@ -196,7 +196,7 @@ class Database:
             base = os.path.dirname(sys.executable)
         else:
             base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        return os.path.join(base, "data", "cloudflare_auto.db")
+        return os.path.join(base, "data", "openrouter_auto.db")
 
     def _migrate(self):
         current = self._conn.execute("PRAGMA user_version").fetchone()[0]
@@ -231,13 +231,13 @@ class Database:
                     parts = line.strip().split('----')
                     if len(parts) >= 2:
                         email = parts[0].strip()
-                        cf_pw = parts[1].strip() if len(parts) > 1 else None
+                        login_pw = parts[1].strip() if len(parts) > 1 else None
                         ts = parts[2].strip() if len(parts) > 2 else None
                         status = parts[3].strip() if len(parts) > 3 else 'registered'
                         email_pw = parts[4].strip() if len(parts) > 4 else None
                         self._conn.execute(
-                            "INSERT OR IGNORE INTO accounts (email, cf_password, email_password, status, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (email, cf_pw, email_pw, status, ts),
+                            "INSERT OR IGNORE INTO accounts (email, login_password, email_password, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (email, login_pw, email_pw, status, ts),
                         )
                         imported += 1
             self._conn.commit()

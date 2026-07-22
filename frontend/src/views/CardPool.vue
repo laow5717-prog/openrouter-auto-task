@@ -2,7 +2,7 @@
   <!-- 说明区 -->
   <div class="info-banner">
     <strong>卡片分组说明：</strong>
-    <span class="info-tag bind">绑定卡</span> 用于注册账号后绑定信用卡到 Cloudflare 账号，
+    <span class="info-tag bind">绑定卡</span> 用于注册账号后绑定信用卡到 OpenRouter 账号，
     <span class="info-tag payment">在线支付卡</span> 用于通过账单记录的 PDF 跳转在线支付页面时使用。
     每天可上传多批卡片数据作为底料，同一分组内按卡号自动去重。
   </div>

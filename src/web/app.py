@@ -199,7 +199,7 @@ class AppState:
     # 旧名保留：内部调用点众多，且语义等价（未绑定 worker 时行为与从前一致）
     _hooked_print = dispatch_print
 
-    def run_batch_task(self, count, card_info_list, cf_password, max_bindable_cards, captcha_api_key):
+    def run_batch_task(self, count, card_info_list, login_password, max_bindable_cards, captcha_api_key):
         self.is_running = True
         self.stop_requested = False
         self.success_count = 0
@@ -230,7 +230,7 @@ class AppState:
                         db=self.db,
                         account_model=self.models['account'],
                         card_info_list=card_info_list,
-                        cf_password=cf_password,
+                        login_password=login_password,
                         monitor_callback=self._monitor,
                         max_bindable_cards=max_bindable_cards,
                         captcha_api_key=captcha_api_key,
@@ -266,7 +266,7 @@ class AppState:
             self.models['task'].finish(task_id, 'completed' if not self.stop_requested else 'stopped')
             self._hooked_print("任务完成")
 
-    def _register_bind_loop(self, task_id, cf_password, max_bindable_cards, captcha_api_key,
+    def _register_bind_loop(self, task_id, login_password, max_bindable_cards, captcha_api_key,
                             pool=None):
         """注册新号 + 逐张绑卡。
 
@@ -319,7 +319,7 @@ class AppState:
                     card_binding_model=card_binding_model,
                     task_id=task_id,
                     batch_records=batch,
-                    cf_password=cf_password,
+                    login_password=login_password,
                     max_bindable_cards=max_bindable_cards,
                     captcha_api_key=captcha_api_key,
                     monitor_callback=worker.make_monitor(self),
@@ -384,7 +384,7 @@ class AppState:
         elif not self.stop_requested:
             self._hooked_print("所有卡已处理完毕！")
 
-    def _recharge_one_account(self, email, cf_password, payment_group_id=None,
+    def _recharge_one_account(self, email, login_password, payment_group_id=None,
                               single_step=False, invoice_daily_cap=None, worker=None):
         """充值单个账号并记账，返回 (result, err, info)。
 
@@ -438,7 +438,7 @@ class AppState:
 
         try:
             result = registration.recharge_account(
-                email, cf_password,
+                email, login_password,
                 recharge_log_model=models['recharge_log'],
                 monitor_callback=monitor,
                 skip_invoice=skip_invoice,
@@ -542,7 +542,7 @@ class AppState:
             self.add_log(f"充值异常: {e}")
             return "failed", str(e), {}
 
-    def run_daily_pipeline(self, bind_group_id, payment_group_id, cf_password,
+    def run_daily_pipeline(self, bind_group_id, payment_group_id, login_password,
                            max_bindable_cards, captcha_api_key, mode='full'):
         """每日一键流水线：补绑已有账号 → 注册新号 → 批量充值，串行跑在单个后台线程。
 
@@ -670,13 +670,13 @@ class AppState:
 
                 candidates = [
                     a for a in accts
-                    if a.get('cf_password')
+                    if a.get('login_password')
                     and (a.get('status') or '') != 'banned'
                     and _known_bound(a) < max_bindable_cards
                 ]
                 skipped_full = sum(
                     1 for a in accts
-                    if a.get('cf_password') and (a.get('status') or '') != 'banned'
+                    if a.get('login_password') and (a.get('status') or '') != 'banned'
                     and _known_bound(a) >= max_bindable_cards)
                 self._hooked_print(
                     f"补绑候选账号 {len(candidates)} 个"
@@ -713,7 +713,7 @@ class AppState:
                             card_binding_model=card_binding_model,
                             task_id=task_id,
                             email=email,
-                            cf_password=acct['cf_password'],
+                            login_password=acct['login_password'],
                             batch_records=claimed,
                             max_bindable_cards=max_bindable_cards,
                             captcha_api_key=captcha_api_key,
@@ -768,7 +768,7 @@ class AppState:
                 remaining = card_binding_model.get_summary(task_id)['pending']
                 if remaining:
                     self._hooked_print(f"\n{'=' * 50}\n阶段1b：注册新号（剩余 {remaining} 张卡）\n{'=' * 50}")
-                    self._register_bind_loop(task_id, cf_password, max_bindable_cards,
+                    self._register_bind_loop(task_id, login_password, max_bindable_cards,
                                              captcha_api_key, pool=pool)
                 else:
                     self._hooked_print("阶段1b：卡池已被补绑消耗完，无需注册新号")
@@ -787,7 +787,7 @@ class AppState:
                 # 放行所有绑卡≥1 的账号（今日已充过的也进入，由 recharge_account 内部决定是否补生成账单）
                 recharge_targets = [
                     a for a in accts_after
-                    if a.get('cf_password')
+                    if a.get('login_password')
                     and counts_after.get(a['email'], 0) >= 1
                 ]
                 self._hooked_print(f"充值候选账号 {len(recharge_targets)} 个")
@@ -830,7 +830,7 @@ class AppState:
                             try:
                                 self.set_action(worker, f"轮次{round_num} 充值账号 {email}")
                                 result, _err, info = self._recharge_one_account(
-                                    email, acct['cf_password'], payment_group_id,
+                                    email, acct['login_password'], payment_group_id,
                                     single_step=True, invoice_daily_cap=INVOICE_DAILY_CAP,
                                     worker=worker)
 
@@ -914,7 +914,7 @@ class AppState:
                         try:
                             self.set_action(worker, f"充值账号 {email}")
                             result, _err, _info = self._recharge_one_account(
-                                email, acct['cf_password'], payment_group_id, worker=worker)
+                                email, acct['login_password'], payment_group_id, worker=worker)
                             with topup_lock:
                                 if result == "success":
                                     topup['success'] += 1
@@ -1070,7 +1070,7 @@ def create_app(db_path=None):
 
     # 初始化数据库（路径独立于程序目录，升级版本不丢数据）
     if db_path is None:
-        db_path = str(get_data_dir() / "cloudflare_auto.db")
+        db_path = str(get_data_dir() / "openrouter_auto.db")
     db = Database(db_path)
 
     # 创建模型

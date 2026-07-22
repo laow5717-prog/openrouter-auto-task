@@ -51,8 +51,8 @@
 
       <div class="settings-row">
         <div class="setting-item">
-          <label class="setting-label">Cloudflare 统一密码</label>
-          <input type="text" v-model="settings.cfPassword" class="ctrl-input"
+          <label class="setting-label">OpenRouter 统一密码</label>
+          <input type="text" v-model="settings.loginPassword" class="ctrl-input"
                  placeholder="留空则新号随机生成" :disabled="appStore.isRunning">
         </div>
         <div class="setting-item" v-if="needsBindGroup">
@@ -152,7 +152,7 @@ const MODES = [
   { value: 'bind_only', label: '仅绑卡',
     hint: '只跑补绑与注册新号两段，跑完即结束，不执行任何充值。适合先囤号、之后再统一充。' },
   { value: 'recharge_only', label: '仅充值',
-    hint: '跳过卡池准备与全部绑卡动作，直接对已有账号执行充值。候选口径：已设置 Cloudflare 密码且已成功绑卡 ≥1 张的账号。' },
+    hint: '跳过卡池准备与全部绑卡动作，直接对已有账号执行充值。候选口径：已设置登录密码且已成功绑卡 ≥1 张的账号。' },
 ]
 
 const needsBindGroup = computed(() => settings.dailyMode !== 'recharge_only')
@@ -211,7 +211,7 @@ async function handleStart() {
   if (needsRecharge.value && settings.dailyPaymentGroupId) {
     body.payment_group_id = settings.dailyPaymentGroupId
   }
-  if (settings.cfPassword) body.cf_password = settings.cfPassword
+  if (settings.loginPassword) body.login_password = settings.loginPassword
 
   try {
     const result = await startDailyPipeline(body)

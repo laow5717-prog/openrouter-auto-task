@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
 export const useSettingsStore = defineStore('settings', () => {
-  const cfPassword = ref(localStorage.getItem('cfPassword') || '')
+  const loginPassword = ref(localStorage.getItem('loginPassword') || '')
   const captchaApiKey = ref(localStorage.getItem('captchaApiKey') || '')
   const dailyBindGroupId = ref(localStorage.getItem('dailyBindGroupId') || '')
   const dailyPaymentGroupId = ref(localStorage.getItem('dailyPaymentGroupId') || '')
@@ -12,12 +12,12 @@ export const useSettingsStore = defineStore('settings', () => {
 
   function save() {
     localStorage.setItem('dailyMode', dailyMode.value || 'full')
-    localStorage.setItem('cfPassword', cfPassword.value || '')
+    localStorage.setItem('loginPassword', loginPassword.value || '')
     localStorage.setItem('captchaApiKey', captchaApiKey.value || '')
     localStorage.setItem('dailyBindGroupId', dailyBindGroupId.value || '')
     localStorage.setItem('dailyPaymentGroupId', dailyPaymentGroupId.value || '')
     localStorage.setItem('maxBindableCards', String(maxBindableCards.value || 2))
   }
 
-  return { cfPassword, captchaApiKey, dailyBindGroupId, dailyPaymentGroupId, maxBindableCards, dailyMode, save }
+  return { loginPassword, captchaApiKey, dailyBindGroupId, dailyPaymentGroupId, maxBindableCards, dailyMode, save }
 })

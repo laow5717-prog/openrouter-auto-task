@@ -14,10 +14,10 @@ jobs:
         include:
           - os: macos-latest
             name: macOS
-            artifact: CloudflareAutoTask-macOS
+            artifact: OpenRouterAutoTask-macOS
           - os: windows-latest
             name: Windows
-            artifact: CloudflareAutoTask-Windows
+            artifact: OpenRouterAutoTask-Windows
 
     runs-on: ${{ matrix.os }}
     name: Build ${{ matrix.name }}
@@ -42,11 +42,11 @@ jobs:
 
       - name: Compress (macOS)
         if: runner.os == 'macOS'
-        run: cd dist && zip -r ../${{ matrix.artifact }}.zip CloudflareAutoTask/
+        run: cd dist && zip -r ../${{ matrix.artifact }}.zip OpenRouterAutoTask/
 
       - name: Compress (Windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path dist\CloudflareAutoTask\* -DestinationPath ${{ matrix.artifact }}.zip
+        run: Compress-Archive -Path dist\OpenRouterAutoTask\* -DestinationPath ${{ matrix.artifact }}.zip
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/')

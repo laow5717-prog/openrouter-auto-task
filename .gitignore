@@ -13,10 +13,10 @@ release/
 *.spec
 .wdm/
 .DS_Store
-data/cloudflare_auto.db
-data/cloudflare_auto.db-shm
-data/cloudflare_auto.db-wal
-data/cloudflare_auto.db.bak-*
+data/openrouter_auto.db
+data/openrouter_auto.db-shm
+data/openrouter_auto.db-wal
+data/openrouter_auto.db.bak-*
 data/profiles/
 data/uploads/
 registered_accounts.txt.migrated

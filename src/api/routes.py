@@ -93,14 +93,14 @@ def start_task():
     data = request.json or {}
     count = data.get('count', 1)
     card_info_list = data.get('card_info_list', None)
-    cf_password = data.get('cf_password', None)
+    login_password = data.get('login_password', None)
     max_bindable_cards = data.get('max_bindable_cards', 2)
     captcha_api_key = data.get('captcha_api_key', None)
 
     import threading
     threading.Thread(
         target=state.run_batch_task,
-        args=(count, card_info_list, cf_password, max_bindable_cards, captcha_api_key),
+        args=(count, card_info_list, login_password, max_bindable_cards, captcha_api_key),
         daemon=True,
     ).start()
 
@@ -293,7 +293,7 @@ def get_accounts():
     for acc in accounts:
         data.append({
             "email": acc['email'],
-            "password": acc.get('cf_password') or '',
+            "password": acc.get('login_password') or '',
             "status": acc.get('status') or '',
             "time": acc.get('created_at') or '',
             "email_password": acc.get('email_password') or '',
@@ -360,8 +360,8 @@ def recharge_account():
     if not account:
         return jsonify({"error": "账号不存在"}), 404
 
-    cf_password = account.get('cf_password')
-    if not cf_password:
+    login_password = account.get('login_password')
+    if not login_password:
         return jsonify({"error": "该账号没有保存 CF 密码"}), 400
 
     status = account.get('status', '')
@@ -377,7 +377,7 @@ def recharge_account():
 
     def _do_recharge():
         try:
-            state._recharge_one_account(email, cf_password, payment_group_id)
+            state._recharge_one_account(email, login_password, payment_group_id)
         except InterruptedError:
             state.add_log("充值已中断")
         except Exception as e:
@@ -393,7 +393,7 @@ def recharge_account():
 
 @api.route('/api/accounts/open-browser', methods=['POST'])
 def open_account_browser():
-    """打开浏览器查看账号的 Cloudflare 控制台，按账号独立，不阻塞全局任务"""
+    """打开浏览器查看账号（OpenRouter 控制台），按账号独立，不阻塞全局任务"""
     state = get_app_state()
     models = get_models()
 
@@ -412,8 +412,8 @@ def open_account_browser():
     if not account:
         return jsonify({"error": "账号不存在"}), 404
 
-    cf_password = account.get('cf_password')
-    if not cf_password:
+    login_password = account.get('login_password')
+    if not login_password:
         return jsonify({"error": "该账号没有保存 CF 密码"}), 400
 
     # 预约 profile：与任务 worker 的账号占用共用一把锁，避免同一 Chrome profile
@@ -427,19 +427,14 @@ def open_account_browser():
     import threading
 
     def _do_open():
-        from src.browser.driver import create_driver, login_cloudflare, close_driver
+        from src.browser.driver import create_driver, close_driver
         driver = None
         try:
             driver = create_driver(headless=False, profile_id=email)
-            account_id = login_cloudflare(
-                driver, email, cf_password, account.get('email_password'))
-            if account_id:
-                state.add_log(f"{email} 浏览器已打开")
-            elif getattr(driver, 'account_banned', False):
-                models['account'].update_status(email, 'banned')
-                state.add_log(f"{email} 账号已被 Cloudflare 封禁，已在数据库标记为 banned")
-            else:
-                state.add_log(f"{email} 打开浏览器登录失败")
+            # TODO(openrouter): 站点自动登录流程待接入。原 Cloudflare 自动登录逻辑
+            # （login_cloudflare + 封禁检测 + 余额监听）已随站点重定向移除，当前仅打开
+            # 浏览器供手动操作，不自动登录、不自动读取余额。
+            state.add_log(f"{email} 浏览器已打开（OpenRouter 自动登录待接入，请手动登录）")
 
             # 等待用户手动关闭浏览器；期间被动监听 credit-balance 接口：
             # 用户手动进入 AI Gateway credits 页时，页面会自请求该接口，响应经
@@ -576,7 +571,7 @@ def export_accounts():
 
         def write_acc_cols(r):
             ws.cell(row=r, column=1, value=email)
-            ws.cell(row=r, column=2, value=acc.get('cf_password') or '')
+            ws.cell(row=r, column=2, value=acc.get('login_password') or '')
             ws.cell(row=r, column=3, value=acc.get('email_password') or '')
             ws.cell(row=r, column=4, value=acc.get('status') or '')
             ws.cell(row=r, column=5, value=acc.get('created_at') or '')
@@ -874,7 +869,7 @@ def get_valid_cards():
 
 @api.route('/api/valid-cards/export')
 def export_valid_cards():
-    """导出全部有效卡为 xlsx：中文表头 + 关联 Cloudflare 账号信息 + 完整信用卡信息（不脱敏）。"""
+    """导出全部有效卡为 xlsx：中文表头 + 关联账号信息 + 完整信用卡信息（不脱敏）。"""
     import openpyxl
     from openpyxl.utils import get_column_letter
     from datetime import datetime
@@ -882,7 +877,7 @@ def export_valid_cards():
     source_type = request.args.get('source_type', '')
     cards = models['valid_card'].get_all_for_export(source_type)
 
-    # 关联账号信息：source_email -> {cf_password, email_password, status}
+    # 关联账号信息：source_email -> {login_password, email_password, status}
     acct_map = {a['email']: a for a in models['account'].get_all(order_desc=False)}
 
     headers = ['卡号', '有效期(月)', '有效期(年)', '安全码CVC', '名', '姓',
@@ -905,7 +900,7 @@ def export_valid_cards():
             c.get('country', ''), c.get('address', ''), c.get('address2', ''),
             c.get('city', ''), c.get('state', ''), c.get('zip', ''), c.get('company', ''),
             ('绑定' if c.get('source_type') == 'bind' else '支付'),
-            email, acct.get('cf_password', ''), acct.get('email_password', ''),
+            email, acct.get('login_password', ''), acct.get('email_password', ''),
             acct.get('status', ''), c.get('status_text', ''),
             c.get('recharge_total', 0), c.get('recharge_today', 0), c.get('validated_at', ''),
         ])
@@ -958,18 +953,18 @@ def start_daily_pipeline():
         if not group:
             return jsonify({"error": "绑卡分组不存在"}), 404
 
-    cf_password = data.get('cf_password')
+    login_password = data.get('login_password')
     payment_group_id = data.get('payment_group_id') or None
     max_bindable_cards = data.get('max_bindable_cards', 2)
     captcha_api_key = data.get('captcha_api_key')
 
     def _has_rechargeable():
         """是否存在可充值账号——口径必须与流水线阶段2 一致（app.py:_recharge 候选筛选）：
-        cf_password 非空 且 card_bindings 里成功绑卡数≥1。不能用 has_today_record 排除
+        login_password 非空 且 card_bindings 里成功绑卡数≥1。不能用 has_today_record 排除
         今日已充账号：阶段2 会放行它们去做账单支付/复查，启动门更严会误拦。"""
         accts = models['account'].get_all(order_desc=False)
         counts = models['card_binding'].count_by_emails([a['email'] for a in accts])
-        return any(a.get('cf_password') and counts.get(a['email'], 0) >= 1 for a in accts)
+        return any(a.get('login_password') and counts.get(a['email'], 0) >= 1 for a in accts)
 
     cards, unusable = [], []
     if mode == 'recharge_only':
@@ -988,7 +983,7 @@ def start_daily_pipeline():
     import threading
     threading.Thread(
         target=state.run_daily_pipeline,
-        args=(bind_group_id, payment_group_id, cf_password,
+        args=(bind_group_id, payment_group_id, login_password,
               max_bindable_cards, captcha_api_key, mode),
         daemon=True,
     ).start()

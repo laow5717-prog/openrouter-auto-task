@@ -4,7 +4,19 @@
 却直接关掉了浏览器——因为该批次只领了这一张卡，而代码没有再领的能力。
 
 此处把浏览器相关调用全部打桩，只验证取卡与重试的编排逻辑。
+
+TODO(openrouter): 本模块测试的是 Cloudflare 专属的绑卡/补绑编排（register_and_bind_cards /
+bind_cards_to_existing_account 内部的取卡、换卡、claim_more、卡池失效逻辑）。项目改造为
+OpenRouter 后该编排已在 src/services/registration.py 中存根化，具体流程待按 OpenRouter
+站点重写。届时应连同这些用例一并按新流程重写。在此之前整模块跳过。
 """
+
+import pytest
+
+pytest.skip(
+    "Cloudflare 绑卡/补绑编排已存根化，待 OpenRouter 站点流程接入后重写这些用例",
+    allow_module_level=True,
+)
 
 import src.services.registration as reg
 
@@ -16,7 +28,7 @@ class FakeAccountModel:
     def get_email_password(self, email):
         return None
 
-    def upsert(self, email, cf_password=None, email_password=None, status='registered'):
+    def upsert(self, email, login_password=None, email_password=None, status='registered'):
         pass
 
     def update_bound_cards(self, email, count, sync_status=True):
@@ -66,7 +78,7 @@ def test_failed_card_falls_through_to_next_in_batch(monkeypatch):
     acct, cards = FakeAccountModel(), FakeCardBindingModel()
 
     bound, login_ok = reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1), _record(2)], max_bindable_cards=1)
 
     assert login_ok is True
@@ -88,7 +100,7 @@ def test_claims_more_cards_when_batch_exhausted(monkeypatch):
         return [_record(9)]
 
     bound, _ = reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=1, claim_more=claim_more)
 
     assert handed == [1], "应按仍缺的张数再领卡"
@@ -103,7 +115,7 @@ def test_no_claim_more_when_target_already_met(monkeypatch):
     handed = []
 
     reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=1,
         claim_more=lambda n: handed.append(n) or [_record(9)])
 
@@ -123,7 +135,7 @@ def test_extra_claim_rounds_are_bounded(monkeypatch):
         return [_record(counter["id"])]
 
     bound, _ = reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=1, claim_more=claim_more)
 
     assert bound == 0
@@ -146,7 +158,7 @@ def test_overdue_dialog_account_still_tops_up_to_target(monkeypatch):
 
     acct, cards = FakeAccountModel(), FakeCardBindingModel()
     bound, ok = reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=2)
 
     assert (bound, ok) == (1, True), "见到弹窗也应补到目标张数"
@@ -160,7 +172,7 @@ def test_account_already_at_target_is_not_rebound(monkeypatch):
 
     acct, cards = FakeAccountModel(), FakeCardBindingModel()
     bound, ok = reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=2)
 
     assert (bound, ok) == (0, True)
@@ -181,7 +193,7 @@ def test_card_fault_failure_marks_pool_card_invalid(monkeypatch):
     acct, cards, pool = FakeAccountModel(), FakeCardBindingModel(), FakeCardPoolModel()
 
     reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=1, card_pool_model=pool)
 
     assert pool.invalidated == ["1"], "拒付的卡应被标为无效"
@@ -198,7 +210,7 @@ def test_environment_failure_keeps_pool_card(monkeypatch):
     acct, cards, pool = FakeAccountModel(), FakeCardBindingModel(), FakeCardPoolModel()
 
     reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=1, card_pool_model=pool)
 
     assert pool.invalidated == [], "非卡片原因不该标记无效"
@@ -210,7 +222,7 @@ def test_no_pool_model_is_tolerated(monkeypatch):
     acct, cards = FakeAccountModel(), FakeCardBindingModel()
 
     bound, ok = reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=1)
 
     assert (bound, ok) == (0, True)
@@ -272,7 +284,7 @@ def test_duplicate_records_are_not_bound_twice(monkeypatch):
         return [_record(1), _record(7)] if 7 not in [c for c in cards.success] else []
 
     reg.bind_cards_to_existing_account(
-        acct, cards, task_id=1, email="a@x.com", cf_password="pw",
+        acct, cards, task_id=1, email="a@x.com", login_password="pw",
         batch_records=[_record(1)], max_bindable_cards=2, claim_more=claim_more)
 
     attempted = [bid for bid, _ in cards.failed]

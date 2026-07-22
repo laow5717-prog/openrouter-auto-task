@@ -67,7 +67,7 @@ class _Stub:
     # **kwargs 吸收 claim_more 等新增可选参数：这些替身验证的是流水线编排，
     # 不该因被测函数新增可选形参而失败
     def bind_existing(self, account_model, card_binding_model, task_id, email,
-                      cf_password, batch_records, max_bindable_cards=2,
+                      login_password, batch_records, max_bindable_cards=2,
                       captcha_api_key=None, monitor_callback=None, **kwargs):
         self._enter(email)
         try:
@@ -81,7 +81,7 @@ class _Stub:
             self._exit(email)
 
     def register(self, db, account_model, card_binding_model, task_id, batch_records,
-                 cf_password=None, max_bindable_cards=2, captcha_api_key=None,
+                 login_password=None, max_bindable_cards=2, captcha_api_key=None,
                  monitor_callback=None, **kwargs):
         with self.lock:
             self.n += 1
@@ -98,7 +98,7 @@ class _Stub:
         finally:
             self._exit(email)
 
-    def recharge(self, email, cf_password, **kw):
+    def recharge(self, email, login_password, **kw):
         self._enter(email)
         try:
             threading.Event().wait(self.delay)
@@ -140,7 +140,7 @@ def _run_pipeline(workers, stub_ref, n_cards=16, n_accounts=3):
     gid = models['card_group'].create('bind-group', 'bind')
     models['card_pool'].add_cards(gid, _full_cards(n_cards))
     for i in range(n_accounts):
-        db.execute("INSERT INTO accounts (email, cf_password, status) VALUES (?,?,?)",
+        db.execute("INSERT INTO accounts (email, login_password, status) VALUES (?,?,?)",
                    (f'existing{i}@example.com', 'pw', 'registered'))
 
     state = AppState(db, models)
@@ -148,7 +148,7 @@ def _run_pipeline(workers, stub_ref, n_cards=16, n_accounts=3):
     cfg.concurrency.max_workers = workers
     try:
         state.run_daily_pipeline(bind_group_id=gid, payment_group_id=None,
-                                 cf_password='pw', max_bindable_cards=2,
+                                 login_password='pw', max_bindable_cards=2,
                                  captcha_api_key=None)
     finally:
         cfg.concurrency.max_workers = original

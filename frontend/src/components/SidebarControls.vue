@@ -8,8 +8,8 @@
     </div>
 
     <div class="ctrl-row">
-      <label class="ctrl-label">Cloudflare 统一密码</label>
-      <input type="text" v-model="settings.cfPassword" class="ctrl-input" placeholder="留空则每个账号随机生成">
+      <label class="ctrl-label">OpenRouter 统一密码</label>
+      <input type="text" v-model="settings.loginPassword" class="ctrl-input" placeholder="留空则每个账号随机生成">
       <div class="hint">设置后所有账号使用同一密码</div>
     </div>
 
@@ -92,7 +92,7 @@ async function handleStart() {
   settings.save()
 
   const body = { count: targetCount.value }
-  if (settings.cfPassword) body.cf_password = settings.cfPassword
+  if (settings.loginPassword) body.login_password = settings.loginPassword
   if (settings.captchaApiKey) body.captcha_api_key = settings.captchaApiKey
   if (cardInfoList) body.card_info_list = cardInfoList
 

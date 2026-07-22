@@ -8,6 +8,14 @@
 
 This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
 
+> **改造说明（OpenRouter reframe）**：本项目由 Cloudflare 自动化项目改造而来。
+> 站点无关的基建指南（Database / Concurrency / Browser Profile 的 profile 卫生部分）
+> 依然有效。以下指南描述的是 **Cloudflare 专属流程**，改造后相关站点编排已在
+> `src/services/registration.py` 存根化、`src/browser/driver.py` 内标记为
+> `LEGACY Cloudflare-specific`，**待按 OpenRouter 站点重写**，届时同步更新这些文档：
+> Captcha（Turnstile 部分）、Email Verification（Cloudflare 登录码/2FA）、
+> Stripe Payment Element、Browser Profile 中 `dash.cloudflare.com` 相关的 SPA 白屏说明。
+
 ---
 
 ## Guidelines Index

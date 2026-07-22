@@ -16,9 +16,10 @@ except ImportError:
 
 
 # === 充值/账单相关常量 ===
-# 每个 CF 账号「当日」最多创建的账单（invoice）数硬上限。
+# 每个账号「当日」最多创建的账单（invoice）数硬上限。
 # 每日流水线充值阶段轮询式补生成账单，达到该上限即不再对该账号发起 Top-up。
-# 计数以 Cloudflare invoice-history 接口实时返回为权威（按本地当日过滤，paid+open 全计）。
+# 计数以站点 invoice-history 接口实时返回为权威（按本地当日过滤，paid+open 全计）。
+# TODO(openrouter): 账单/充值语义待按 OpenRouter 站点重新定义。
 INVOICE_DAILY_CAP = 30
 # 单次 Top-up 金额（美元）。每次 Top-up 生成一张「Manual Top-up: AI Gateway Credits」账单。
 TOPUP_AMOUNT = 10
@@ -28,7 +29,7 @@ TOPUP_AMOUNT = 10
 # 单个持久化 profile 的缓存类目录（Cache / Code Cache / Service Worker / GPUCache 等）
 # 合计上限（MB），超限则在浏览器启动前整体清理。这些目录不含登录态
 # （Cookies / Login Data / Local Storage / Local State 均不在其中），清理后仍保持登录。
-# 缓存腐坏——尤其 Service Worker——会让 dash.cloudflare.com 的导航请求拿到空响应，
+# 缓存腐坏——尤其 Service Worker——会让站点导航请求拿到空响应，
 # 表现为「地址栏 URL 正常但页面全白」，且 Chrome 不会自愈。
 PROFILE_CACHE_LIMIT_MB = 200
 
@@ -83,7 +84,7 @@ class CaptchaConfig:
 
 @dataclass
 class DatabaseConfig:
-    path: str = "data/cloudflare_auto.db"
+    path: str = "data/openrouter_auto.db"
 
 
 @dataclass
@@ -155,7 +156,7 @@ def get_data_dir() -> Path:
     开发时使用项目根目录下的 data/ 目录。
     """
     if getattr(sys, 'frozen', False):
-        data_dir = Path.home() / ".cloudflare-auto-task"
+        data_dir = Path.home() / ".openrouter-auto-task"
     else:
         data_dir = get_base_dir() / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -283,7 +284,7 @@ class ConfigLoader:
         if 'database' in self.raw_config:
             database = self.raw_config['database']
             self.config.database = DatabaseConfig(
-                path=database.get('path', 'data/cloudflare_auto.db'),
+                path=database.get('path', 'data/openrouter_auto.db'),
             )
 
         if 'files' in self.raw_config:

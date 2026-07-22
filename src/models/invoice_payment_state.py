@@ -4,7 +4,7 @@
 承载「账单已无法在 Stripe 支付」的冷却/永久标记：
 - 支付页出现 "This invoice can no longer be paid on Stripe..." → 标 24h 冷却，
   冷却期内的后续充值直接跳过该发票、转去支付新账单，避免每次都白白重开支付页；
-  到期自动恢复（now >= unpayable_until 即视为可再试），以防 Cloudflare 之后重新签发同号账单。
+  到期自动恢复（now >= unpayable_until 即视为可再试），以防站点之后重新签发同号账单。
 - 支付页被重定向到 Stripe Dashboard 登录页（订单已彻底无效）→ 标 10 年（hours 传大值），
   等同永久跳过、以后不再对该发票发起支付。
 """

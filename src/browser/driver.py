@@ -1,7 +1,22 @@
 """
 浏览器自动化模块
-使用 Patchright（Playwright 反检测 fork）实现 Cloudflare 注册、
-账单页面导航及信用卡添加流程
+使用 Patchright（Playwright 反检测 fork）驱动有头 Chrome。
+
+分两类：
+  1) 站点无关的浏览器基建（保留复用）：create_driver / close_driver / profile 卫生
+     （进程清理、缓存修剪）、_safe_goto/_safe_click/_safe_fill、语言/下载目录设置等。
+  2) LEGACY Cloudflare-specific（待 OpenRouter 重写）：以下方法群紧耦合 Cloudflare
+     dash 站点与其内嵌 Stripe/Turnstile，项目改造为 OpenRouter 后已从编排层
+     （services/registration.py）剥离、不再被调用，暂保留作接入参考：
+       - 登录/账号：login_cloudflare、_detect_account_banned、_extract_account_id、
+         navigate_to_ai_credits、fetch_today_invoice_count、read_credits_balance
+       - Turnstile 质询：check_and_handle_cf_challenge、_is_challenge_page、
+         _try_click_turnstile、_click_turnstile_via_cdp、_handle_inline_turnstile 等
+       - Stripe 绑卡/账单：stripe_card_frame、_expand_stripe_card_accordion、
+         _wait_for_stripe_fields_ready、_wait_for_billing_form_ready 等
+       - 注册/绑卡/充值流程：fill_signup_form、handle_email_verification、
+         navigate_to_billing、add_credit_card、fill_topup_and_confirm 等
+     接入 OpenRouter 时按其实际页面替换上述实现，再在 registration.py 填充编排。
 """
 
 import os
@@ -598,7 +613,7 @@ def create_driver(headless=False, profile_id=None):
         os.makedirs(user_data_dir, exist_ok=True)
         print(f"  🔒 使用持久化 profile: {safe_name}")
     else:
-        user_data_dir = tempfile.mkdtemp(prefix="cf_chrome_")
+        user_data_dir = tempfile.mkdtemp(prefix="openrouter_chrome_")
         print(f"  🔄 使用全新浏览器 profile: ...{os.path.basename(user_data_dir)}")
 
     # 下载目录（用于 invoice PDF 下载等）

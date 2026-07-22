@@ -31,7 +31,7 @@ def clean():
         if p.exists():
             shutil.rmtree(p)
             print(f"  已清理 {d}/")
-    spec = BASE_DIR / 'CloudflareAutoTask.spec'
+    spec = BASE_DIR / 'OpenRouterAutoTask.spec'
     if spec.exists():
         spec.unlink()
 
@@ -50,7 +50,7 @@ def build():
     # PyInstaller 参数
     args = [
         sys.executable, '-m', 'PyInstaller',
-        '--name', 'CloudflareAutoTask',
+        '--name', 'OpenRouterAutoTask',
         '--onedir',
         '--console',
         # 添加静态资源
@@ -101,7 +101,7 @@ def build():
         sys.exit(1)
 
     # 复制配置文件模板到输出目录
-    dist_dir = BASE_DIR / 'dist' / 'CloudflareAutoTask'
+    dist_dir = BASE_DIR / 'dist' / 'OpenRouterAutoTask'
     if dist_dir.exists():
         shutil.copy2(
             BASE_DIR / 'config.example.yaml',
@@ -119,7 +119,7 @@ def build():
     print("打包成功!")
     print(f"输出目录: {dist_dir}")
     print()
-    print("交付方式: 将 dist/CloudflareAutoTask 文件夹压缩为 zip 发送给客户")
+    print("交付方式: 将 dist/OpenRouterAutoTask 文件夹压缩为 zip 发送给客户")
     if system == 'Darwin':
         print("客户双击 '启动.command' 即可运行")
     else:
@@ -144,18 +144,18 @@ if [ ! -d "/Applications/Google Chrome.app" ]; then
 fi
 
 echo "============================================"
-echo "   Cloudflare Auto Task"
+echo "   OpenRouter Auto Task"
 echo "   正在启动..."
 echo ""
 echo "   浏览器将自动打开控制台"
 echo "   如未打开请访问: http://localhost:5000"
 echo ""
-echo "   配置文件位置: ~/.cloudflare-auto-task/config.yaml"
+echo "   配置文件位置: ~/.openrouter-auto-task/config.yaml"
 echo "   关闭此窗口即可停止程序"
 echo "============================================"
 
 (sleep 2 && open "http://localhost:5000") &
-./CloudflareAutoTask
+./OpenRouterAutoTask
 """, encoding='utf-8')
     launcher.chmod(0o755)
     print(f"  已创建启动器: {launcher.name}")
@@ -166,22 +166,22 @@ def _create_win_launcher(dist_dir):
     launcher.write_text("""\
 @echo off
 chcp 65001 >nul 2>&1
-title Cloudflare Auto Task
+title OpenRouter Auto Task
 cd /d "%~dp0"
 
 echo ============================================
-echo    Cloudflare Auto Task
+echo    OpenRouter Auto Task
 echo    正在启动...
 echo.
 echo    浏览器将自动打开控制台
 echo    如未打开请访问: http://localhost:5000
 echo.
-echo    配置文件位置: %USERPROFILE%\\.cloudflare-auto-task\\config.yaml
+echo    配置文件位置: %USERPROFILE%\\.openrouter-auto-task\\config.yaml
 echo    关闭此窗口即可停止程序
 echo ============================================
 
 start "" cmd /c "timeout /t 2 /nobreak >nul & start http://localhost:5000"
-CloudflareAutoTask.exe
+OpenRouterAutoTask.exe
 
 echo.
 echo 程序已停止

@@ -2,7 +2,7 @@
 # 一键发版：打 tag → 推送触发 Actions → 等待 Release 生成 → 自动下载到 release/
 set -e
 
-REPO="laow5717-prog/cloudflare-auto-task"
+REPO="laow5717-prog/openrouter-auto-task"
 TAG=${1:-}
 if [ -z "$TAG" ]; then
     echo "用法: ./release.sh v0.1.7"

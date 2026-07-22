@@ -6,7 +6,7 @@
 
 ## Overview
 
-- Database: SQLite at `data/cloudflare_auto.db`
+- Database: SQLite at `data/openrouter_auto.db`（frozen 模式 `~/.openrouter-auto-task/`）
 - Wrapper: `src/db/database.py` provides `execute()`, `fetchone()`, `fetchall()`
 - All rows returned as `sqlite3.Row` (dict-like); convert with `dict(r)`
 - Models: `src/models/account.py` (`AccountModel`), `src/models/card_binding.py` (`CardBindingModel`)
@@ -18,7 +18,7 @@
 |--------|------|-------|
 | id | INTEGER | Primary key |
 | email | TEXT | Unique |
-| cf_password | TEXT | Cloudflare password |
+| login_password | TEXT | 站点登录密码（原 `cf_password`，改造 OpenRouter 时更名） |
 | email_password | TEXT | mail.tm password |
 | status | TEXT | registered, bound, failed, error |
 | created_at | TEXT | datetime string |

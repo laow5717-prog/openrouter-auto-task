@@ -1,6 +1,6 @@
 """pytest 共享夹具。
 
-所有测试都在临时数据库上运行，绝不触碰 data/cloudflare_auto.db。
+所有测试都在临时数据库上运行，绝不触碰 data/openrouter_auto.db。
 """
 
 import os

@@ -181,11 +181,12 @@ def extract_verification_link(content: str):
     if not content:
         return None
 
+    # TODO(openrouter): 验证链接匹配为占位规则，接入时按 OpenRouter 实际验证邮件的
+    # 域名与链接格式（verify/confirm 路径）调整。原 Cloudflare 规则见 git 历史。
     patterns = [
-        r'(https?://dash\.cloudflare\.com/[^\s"<>]+verify[^\s"<>]*)',
-        r'(https?://[^\s"<>]*cloudflare[^\s"<>]*verify[^\s"<>]*)',
-        r'(https?://[^\s"<>]*cloudflare[^\s"<>]*confirm[^\s"<>]*)',
-        r'href="(https?://[^\s"<>]*cloudflare[^\s"<>]*)"',
+        r'(https?://[^\s"<>]*openrouter[^\s"<>]*verify[^\s"<>]*)',
+        r'(https?://[^\s"<>]*openrouter[^\s"<>]*confirm[^\s"<>]*)',
+        r'href="(https?://[^\s"<>]*openrouter[^\s"<>]*)"',
     ]
 
     for pattern in patterns:

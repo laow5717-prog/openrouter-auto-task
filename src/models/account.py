@@ -7,19 +7,19 @@ class AccountModel:
     def __init__(self, db):
         self.db = db
 
-    def upsert(self, email, cf_password=None, email_password=None, status='registered'):
-        existing = self.db.fetchone("SELECT id, cf_password, email_password FROM accounts WHERE email = ?", (email,))
+    def upsert(self, email, login_password=None, email_password=None, status='registered'):
+        existing = self.db.fetchone("SELECT id, login_password, email_password FROM accounts WHERE email = ?", (email,))
         if existing:
-            final_pw = cf_password if cf_password else existing['cf_password']
+            final_pw = login_password if login_password else existing['login_password']
             final_ep = email_password if email_password else existing['email_password']
             self.db.execute(
-                "UPDATE accounts SET cf_password=?, email_password=?, status=?, updated_at=datetime('now','localtime') WHERE email=?",
+                "UPDATE accounts SET login_password=?, email_password=?, status=?, updated_at=datetime('now','localtime') WHERE email=?",
                 (final_pw, final_ep, status, email),
             )
         else:
             self.db.execute(
-                "INSERT INTO accounts (email, cf_password, email_password, status) VALUES (?, ?, ?, ?)",
-                (email, cf_password, email_password, status),
+                "INSERT INTO accounts (email, login_password, email_password, status) VALUES (?, ?, ?, ?)",
+                (email, login_password, email_password, status),
             )
 
     def update_status(self, email, status):

@@ -65,7 +65,7 @@ class RechargeLogModel:
 
     def get_success_card_numbers(self, email):
         """返回该账号所有『成功支付』记录里出现过的不同卡号集合。
-        用于统计一个 Cloudflare 账号已处于支付成功状态的卡数量（上限 20）。"""
+        用于统计一个账号已处于支付成功状态的卡数量（上限 20）。"""
         rows = self.db.fetchall(
             "SELECT DISTINCT card_display FROM recharge_logs "
             "WHERE email=? AND status='success' AND card_display IS NOT NULL AND card_display != ''",

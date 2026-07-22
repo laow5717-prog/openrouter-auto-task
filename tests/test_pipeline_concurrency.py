@@ -28,7 +28,7 @@ class _Recorder:
         self._active = 0
 
     def register_and_bind_cards(self, db, account_model, card_binding_model, task_id,
-                                batch_records, cf_password=None, max_bindable_cards=2,
+                                batch_records, login_password=None, max_bindable_cards=2,
                                 captcha_api_key=None, monitor_callback=None,
                                 **kwargs):
         # **kwargs 吸收 claim_more 等新增可选参数：本替身只验证卡的领取/归还编排，
