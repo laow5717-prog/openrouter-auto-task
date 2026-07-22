@@ -146,13 +146,13 @@ def _parse_created_at(value):
 
 
 def wait_for_login_code(token: str, since_ts, timeout: int = None):
-    """等待并提取 OpenRouter 登录二次验证码（two-factor）。
+    """等待并提取 opencode 登录二次验证码（two-factor）。
 
     与 wait_for_verification_email 的区别，二者不可互换：
       1. 只认验证码，不认验证链接；
       2. 按 createdAt 过滤，只接受 since_ts 之后到达的邮件。
 
-    第 2 点是关键：账号收件箱通常已积压多封历史 "Your OpenRouter login token"
+    第 2 点是关键：账号收件箱通常已积压多封历史 "Your opencode login token"
     邮件，不做时间过滤会立刻返回一个早已过期的码。
 
     参数:
@@ -179,12 +179,12 @@ def wait_for_login_code(token: str, since_ts, timeout: int = None):
 
             sender = str(msg.get('from', {}).get('address', '')).lower()
             subject = _to_str(msg.get('subject', ''))
-            # TODO(openrouter): 过滤词 'openrouter' 为占位，接入时按 OpenRouter 实际
-            # 验证邮件的发件人域名/主题核对调整。
-            if 'openrouter' not in sender and 'openrouter' not in subject.lower():
+            # TODO(opencode): 目标站点为 https://opencode.ai。过滤词 'opencode' 为占位，
+            # 接入时按 opencode.ai 实际验证邮件的发件人域名/主题核对调整。
+            if 'opencode' not in sender and 'opencode' not in subject.lower():
                 continue
 
-            # 登录码通常直接在主题里（Your OpenRouter login token: 1234567）
+            # 登录码通常直接在主题里（Your opencode login token: 1234567）
             code = extract_verification_code(subject)
             if not code:
                 detail = get_email_detail(token, msg.get('id', '')) or {}
@@ -285,8 +285,8 @@ def wait_for_verification_email(token: str, timeout: int = None):
                 sender = str(msg.get('from', {}).get('address', '')).lower()
                 subject = _to_str(msg.get('subject', ''))
 
-                if 'openrouter' in sender or 'openrouter' in subject.lower():
-                    print(f"\n收到 OpenRouter 验证邮件！")
+                if 'opencode' in sender or 'opencode' in subject.lower():
+                    print(f"\n收到 opencode 验证邮件！")
                     print(f"   主题: {subject}")
 
                     message_id = msg.get('id', '')

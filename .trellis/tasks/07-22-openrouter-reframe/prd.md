@@ -4,7 +4,7 @@
 把现有 Cloudflare 自动化项目（Python + Flask + Vue + SQLite + Patchright 浏览器自动化）在**当前目录 `openrouter-auto-task` 就地改造**为面向 OpenRouter 的全新项目。本轮范围限定为**框架搭建先跑通**：完成数据隔离、全局改名去 Cloudflare、把 Cloudflare 专属站点流程存根化，使 Web 服务能以 OpenRouter 专属的数据路径干净启动。OpenRouter 站点的实际注册/绑卡/充值流程本轮不实现，留作后续接入。
 
 ## Background
-本目录是从 cloudflare-auto-task 复制而来（git remote 已改为 openrouter-auto-task），代码与 `data/` 内数据全是 Cloudflare 的。原 Cloudflare 项目在别的目录、独立运行、不受本次改造影响。通用基础设施（临时邮箱、验证码框架、SQLite DAO、并发调度 WorkerPool、Web 管理界面、卡池/Excel）站点无关，予以保留复用；Cloudflare 专属的注册/绑卡/充值编排与 Turnstile/Stripe DOM 操作予以存根化，作为 OpenRouter 后续重写的接入面。
+本目录是从 cloudflare-auto-task 复制而来（git remote 已改为 openrouter-auto-task），代码与 `data/` 内数据全是 Cloudflare 的。**项目名为 `openrouter-auto-task`，目标自动化站点为 https://opencode.ai**（项目品牌名与目标站点不同名：品牌保留 openrouter，站点流程接入时对准 opencode.ai）。原 Cloudflare 项目在别的目录、独立运行、不受本次改造影响。通用基础设施（临时邮箱、验证码框架、SQLite DAO、并发调度 WorkerPool、Web 管理界面、卡池/Excel）站点无关，予以保留复用；Cloudflare 专属的注册/绑卡/充值编排与 Turnstile/Stripe DOM 操作予以存根化，作为 OpenRouter 后续重写的接入面。
 
 ## Confirmed Facts（勘查锚点）
 

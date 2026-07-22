@@ -5,7 +5,7 @@
 分两类：
   1) 站点无关的浏览器基建（保留复用）：create_driver / close_driver / profile 卫生
      （进程清理、缓存修剪）、_safe_goto/_safe_click/_safe_fill、语言/下载目录设置等。
-  2) LEGACY Cloudflare-specific（待 OpenRouter 重写）：以下方法群紧耦合 Cloudflare
+  2) LEGACY Cloudflare-specific（待 opencode.ai 重写）：以下方法群紧耦合 Cloudflare
      dash 站点与其内嵌 Stripe/Turnstile，项目改造为 OpenRouter 后已从编排层
      （services/registration.py）剥离、不再被调用，暂保留作接入参考：
        - 登录/账号：login_cloudflare、_detect_account_banned、_extract_account_id、
@@ -16,7 +16,7 @@
          _wait_for_stripe_fields_ready、_wait_for_billing_form_ready 等
        - 注册/绑卡/充值流程：fill_signup_form、handle_email_verification、
          navigate_to_billing、add_credit_card、fill_topup_and_confirm 等
-     接入 OpenRouter 时按其实际页面替换上述实现，再在 registration.py 填充编排。
+     接入目标站点 https://opencode.ai 时按其实际页面替换上述实现，再在 registration.py 填充编排。
 """
 
 import os

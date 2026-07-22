@@ -1,19 +1,19 @@
 """
-OpenRouter 注册 & 绑卡 / 充值核心业务逻辑 —— 站点流程存根（占位）。
+注册 & 绑卡 / 充值核心业务逻辑 —— 站点流程存根（占位）。
 
-本模块原为 Cloudflare 站点的注册/绑卡/充值编排。项目改造为 OpenRouter 后，
-Cloudflare 专属的页面流程（注册页、Turnstile、Stripe 绑卡、AI Gateway 充值等）
-已从编排层剥离。以下 4 个公共函数保留原有签名与返回契约说明，供 app.py / routes.py
-的上层编排与并发调度继续 import 与调用；函数体统一抛 NotImplementedError，等待
-按 OpenRouter 站点实际流程逐个接入。
+项目名为 openrouter-auto-task，**目标自动化站点为 https://opencode.ai**。
+本模块原为 Cloudflare 站点的注册/绑卡/充值编排。改造后 Cloudflare 专属的页面流程
+（注册页、Turnstile、Stripe 绑卡、AI Gateway 充值等）已从编排层剥离。以下 4 个公共
+函数保留原有签名与返回契约说明，供 app.py / routes.py 的上层编排与并发调度继续
+import 与调用；函数体统一抛 NotImplementedError，等待按 opencode.ai 实际流程逐个接入。
 
 接入时对照 design.md / prd.md 的站点耦合面，把 driver.py 中标记为
-`LEGACY Cloudflare-specific` 的浏览器方法替换为 OpenRouter 版实现，再在此填充编排。
+`LEGACY Cloudflare-specific` 的浏览器方法替换为 opencode.ai 版实现，再在此填充编排。
 原 Cloudflare 实现保留在本文件的 git 历史中，可作为接入参考。
 """
 
 _NOT_IMPLEMENTED = (
-    "OpenRouter 站点流程待接入：{name}。当前为框架存根，尚未实现 OpenRouter 的"
+    "opencode.ai 站点流程待接入：{name}。当前为框架存根，尚未实现 opencode.ai 的"
     "注册/绑卡/充值页面自动化。"
 )
 

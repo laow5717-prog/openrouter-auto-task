@@ -431,10 +431,10 @@ def open_account_browser():
         driver = None
         try:
             driver = create_driver(headless=False, profile_id=email)
-            # TODO(openrouter): 站点自动登录流程待接入。原 Cloudflare 自动登录逻辑
-            # （login_cloudflare + 封禁检测 + 余额监听）已随站点重定向移除，当前仅打开
-            # 浏览器供手动操作，不自动登录、不自动读取余额。
-            state.add_log(f"{email} 浏览器已打开（OpenRouter 自动登录待接入，请手动登录）")
+            # TODO(opencode): 目标站点 https://opencode.ai 的自动登录流程待接入。原
+            # Cloudflare 自动登录逻辑（login_cloudflare + 封禁检测 + 余额监听）已随站点
+            # 重定向移除，当前仅打开浏览器供手动操作，不自动登录、不自动读取余额。
+            state.add_log(f"{email} 浏览器已打开（opencode.ai 自动登录待接入，请手动登录）")
 
             # 等待用户手动关闭浏览器；期间被动监听 credit-balance 接口：
             # 用户手动进入 AI Gateway credits 页时，页面会自请求该接口，响应经
