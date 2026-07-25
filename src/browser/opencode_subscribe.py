@@ -217,6 +217,27 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
         except Exception:
             return ""
 
+    def _decline_snippet():
+        """逐帧扫描可见文本找拒付/认证失败文案——错误可能渲染在主 checkout 帧或其支付子帧，
+        只读主帧会漏判导致空等到超时。命中返回文案片段，否则 None。
+
+        ⚠️ 排除 hCaptcha 自身报错的误命中：hCaptcha 帧常出现「sitekey for this hcaptcha is
+        incorrect」等文案，含 "incorrect" 会被 _DECLINE_HINTS 误判成卡拒付、错误地把好卡标废。
+        故命中片段若提到 hcaptcha/sitekey 则跳过——那是人机验证问题、不是卡的问题。"""
+        for fr in session.page.frames:
+            try:
+                body = (fr.inner_text("body", timeout=1200) or "").lower()
+            except Exception:
+                continue
+            for h in _DECLINE_HINTS:
+                idx = body.find(h)
+                if idx >= 0:
+                    seg = body[max(0, idx - 45):idx + 80]
+                    if "hcaptcha" in seg or "sitekey" in seg or "site key" in seg:
+                        continue   # hCaptcha 报错，非卡拒付，跳过
+                    return body[max(0, idx - 30):idx + 60].strip()
+        return None
+
     while time.time() < deadline:
         cur = _cur()
         stripe_fr = _stripe_fr()
@@ -227,26 +248,19 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
             return {"outcome": "success",
                     "detail": f"离开 checkout 回落 {cur[:100]}（成功信号待标定）"}
 
+        # 拒付/认证失败文案：逐帧扫描（错误可能在子帧），命中即刻 failed → 换下一张卡，绝不空等
+        snip = _decline_snippet()
+        if snip:
+            return {"outcome": "failed", "detail": f"拒付/认证失败: {snip[:120]}"}
+
         if stripe_fr is not None:
             # 3DS 结果弹窗「Payment failed」→ 明确失败
             fmfr, fmsg = _threeds_failure_modal(session)
             if fmfr is not None:
                 _close_threeds_modal(fmfr, session, monitor)
                 return {"outcome": "failed", "detail": f"3DS 认证失败: {fmsg[:150]}"}
-            # 拒付/认证失败文案
-            try:
-                body = (stripe_fr.inner_text("body", timeout=1500) or "").lower()
-                if any(h in body for h in _DECLINE_HINTS):
-                    snippet = ""
-                    for h in _DECLINE_HINTS:
-                        idx = body.find(h)
-                        if idx >= 0:
-                            snippet = body[max(0, idx - 30):idx + 60].strip()
-                            break
-                    return {"outcome": "failed", "detail": f"拒付/认证失败: {snippet[:120]}"}
-            except Exception:
-                pass
-            # hCaptcha 人机验证：优先 2captcha 自动解，未配置/多次失败再等人工
+            # hCaptcha 人机验证：2captcha 自动解，最多 3 次；3 次仍未过即提前返回 needs_captcha，
+            # 不空等满 timeout（避免一直停在支付页）。
             if _captcha_challenge_present(session) is not None:
                 if not saw_captcha:
                     saw_captcha = True
@@ -260,6 +274,12 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
                             time.sleep(4)
                     except Exception as e:
                         print(f"  2captcha 解题异常: {str(e)[:120]}", flush=True)
+                elif captcha_solver.is_available() and captcha_tries >= 3:
+                    # 解了 3 次仍卡在 hCaptcha（token 被拒/账号级风控）——提前收手换下一张卡
+                    if _decline_snippet() is None:
+                        _step(monitor, session, "hCaptcha 解 3 次仍未过，提前收手（换下一张卡）")
+                        return {"outcome": "needs_captcha",
+                                "detail": "hCaptcha 解 3 次仍未通过（token 被拒/账号级风控）"}
                 elif not captcha_solver.is_available():
                     _step(monitor, session, "未配置 2captcha，请在浏览器手动点 Verify…")
             # 3DS 交互挑战：等待加载，不立即失败

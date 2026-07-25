@@ -711,12 +711,13 @@ class AppState:
             if not cards:
                 return "registered_only", "无可选卡"
             cards = cards[:self.SUBSCRIBE_MAX_CARDS_PER_ACCOUNT]   # 单次卡数上限，避免坏卡卡死
-            for card in cards:
+            for i, card in enumerate(cards, 1):
                 if self.stop_requested:
                     raise InterruptedError("用户请求停止")
                 num = card.get('number', '')
                 last4 = str(num)[-4:]
                 self.set_action(worker, f"{email} 订阅试卡 ****{last4}")
+                self.add_log(f"{email} 订阅试卡 ****{last4}（第 {i}/{len(cards)} 张）")
                 log_id = models['recharge_log'].create(email, num, amount=5)
                 res = subscribe_via_stripe(session, card, wid, monitor=monitor,
                                            should_stop=lambda: self.stop_requested, dry=False)
@@ -737,13 +738,15 @@ class AppState:
                                                        api_response={"result": res})
                     self.add_log(f"{email} 卡 ****{last4} 拒付，标 invalid，换下一张")
                 elif oc == 'needs_captcha':
+                    # hCaptcha 未过：非卡问题，不标卡无效，换下一张（换次提交 token 可能就过）
                     models['recharge_log'].mark_failed(log_id, error='hCaptcha 未过',
                                                        api_response={"result": res})
-                    self.set_action(worker, f"{email} hCaptcha 未过，本轮止")
-                    return "failed", "hCaptcha 未过"
+                    self.add_log(f"{email} 卡 ****{last4} hCaptcha 未过，换下一张")
                 else:  # error / unknown：不耗卡，换下一张
                     models['recharge_log'].mark_failed(log_id, error=res.get('err', '') or oc,
                                                        api_response={"result": res})
+                    self.add_log(f"{email} 卡 ****{last4} 未定案({oc}): "
+                                 f"{(res.get('err') or '')[:90]}，换下一张")
             return "registered_only", "账号内可选卡试尽未成功"
         except InterruptedError:
             raise

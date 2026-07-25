@@ -217,20 +217,50 @@ def solve_turnstile(driver, max_retries=2):
     return False
 
 
+def _extract_hcaptcha_params(driver):
+    """提取**配对的** (sitekey, rqdata)。
+
+    Stripe 结账页同时挂两个 hCaptcha sitekey：普通的（无 rqdata）与 enterprise 的（带 rqdata，
+    才是提交时真正要过的那个）。若把普通 sitekey 配上 enterprise 的 rqdata 去 2captcha 求解，
+    hCaptcha 会报「sitekey for this hcaptcha is incorrect」而拒收。故必须**从同一个含 rqdata 的
+    enterprise hcaptcha iframe src 里取同 src 的 sitekey**，保证配对；取不到再退回各自单独提取。
+    """
+    import re as _re
+    import urllib.parse
+    ent_key = ent_rq = None
+    try:
+        for src in _collect_iframe_srcs(driver.page):
+            if 'hcaptcha' not in src.lower():
+                continue
+            mr = _re.search(r'[#&?]rqdata=([^&]+)', src)
+            if not mr:
+                continue
+            ent_rq = urllib.parse.unquote(mr.group(1))
+            mk = _re.search(r'[#&?]sitekey=([a-f0-9-]{36,})', src, _re.I)
+            if mk:
+                ent_key = mk.group(1)
+                break   # 同 src 同时有 sitekey+rqdata → enterprise 配对，最可靠
+    except Exception:
+        pass
+    sitekey = ent_key or _extract_hcaptcha_sitekey(driver)
+    rqdata = ent_rq if ent_rq is not None else _extract_hcaptcha_rqdata(driver)
+    return sitekey, rqdata
+
+
 def solve_hcaptcha(driver, max_retries=2):
     if not is_available():
         print("  2Captcha solver not initialized")
         return False
 
-    sitekey = _extract_hcaptcha_sitekey(driver)
+    # 配对提取（enterprise sitekey+rqdata 同源），避免 sitekey/rqdata 不匹配导致
+    # 「sitekey for this hcaptcha is incorrect」。
+    sitekey, rqdata = _extract_hcaptcha_params(driver)
     if not sitekey:
         print("  Cannot extract hCaptcha sitekey")
         return False
 
-    rqdata = _extract_hcaptcha_rqdata(driver)
-
     page_url = driver.current_url
-    print(f"  hCaptcha sitekey: {sitekey[:20]}...")
+    print(f"  hCaptcha sitekey: {sitekey[:20]}... ({'enterprise+rqdata' if rqdata else 'no rqdata'})")
     if rqdata:
         print(f"  hCaptcha rqdata found (length: {len(rqdata)})")
     print(f"  Page URL: {page_url}")

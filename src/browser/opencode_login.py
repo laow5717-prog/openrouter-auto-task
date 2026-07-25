@@ -92,18 +92,17 @@ def _click_authorize_if_present(session):
 
 
 def _account_flagged(session):
-    """检测 GitHub 授权页是否报「This account is flagged ... cannot authorize a third party
-    application」。新注册账号常被 GitHub 反滥用 flag，无法授权 opencode OAuth。"""
+    """检测「This account is flagged … cannot authorize a third party application」。
+    新注册账号常被 GitHub 反滥用 flag。文案在 github 授权页/dashboard 出现——**不限定域名**匹配
+    （授权后页面可能已跳离 github），命中即快速返回，供上层立刻标记跳过、不空等。"""
     try:
-        if "github.com" not in _cur_url(session):
-            return False
-        body = (session.page.inner_text("body", timeout=2000) or "").lower()
-        return "flagged" in body and "authorize" in body
+        body = (session.page.inner_text("body", timeout=1500) or "").lower()
     except Exception:
         return False
+    return "account is flagged" in body or ("flagged" in body and "authorize" in body)
 
 
-def login_and_open_own_go(session, monitor=None, timeout=150):
+def login_and_open_own_go(session, monitor=None, timeout=240):
     """登录 opencode 并进入该账号自己的 /go 页。
 
     返回 dict:
@@ -145,30 +144,36 @@ def login_and_open_own_go(session, monitor=None, timeout=150):
                 _step(monitor, session, result["detail"])
                 return result
             _click_authorize_if_present(session)
-            url = _wait_until(session, lambda u: u and "github.com" not in u,
-                              timeout=max(10, int(deadline - time.time())))
-            # 点 Authorize 后仍可能停在 github 并显示 flagged
+            # 点 Authorize 后最可能立刻出现 flag——先短等再查，命中即刻返回，绝不进后面的长等待
+            time.sleep(2)
             if _account_flagged(session):
                 result["flagged"] = True
                 result["detail"] = "GitHub 账号被 flagged，无法授权第三方应用（opencode OAuth）"
                 _step(monitor, session, result["detail"])
                 return result
+            url = _wait_until(session, lambda u: u and "github.com" not in u,
+                              timeout=max(8, int(deadline - time.time())))
 
-    # 4) 等回落到 opencode workspace，取自己的 wid
-    url = _wait_until(
-        session,
-        lambda u: _extract_wid(u) is not None,
-        timeout=max(10, int(deadline - time.time())),
-    )
+    # 4) 等回落到 opencode workspace，取自己的 wid（首等缩短，provision 延迟交给下面重试循环）
+    url = _wait_until(session, lambda u: _extract_wid(u) is not None,
+                      timeout=min(15, max(6, int(deadline - time.time()))))
     wid = _extract_wid(url)
-    # 全新账号首次授权后，opencode 自动创建的 workspace 有**瞬态 provision 延迟**——
-    # 授权成功却一时落不到 /workspace/{wid}。实测重试即好（见 07-25 task 第五轮：leilao40）。
-    # 故兜底改为重试轮询：反复访问 /auth 让其 provision 完成后重定向到默认 workspace。
+    # 全新账号首次授权后 workspace 有瞬态 provision 延迟（重试即好，见 leilao40）；
+    # 但被 flag 的新号永远拿不到 wid——**每轮先查 flag，命中立刻标记返回，不空等 provision**。
     if not wid:
-        _step(monitor, session, "授权已过但未落到 workspace，等待新号 workspace provision（重试中）…")
-        for _ in range(8):
+        _step(monitor, session, "未落到 workspace，检查是否被 flag / 等待 provision（重试中）…")
+        for _ in range(15):
             if time.time() > deadline:
                 break
+            # 每轮先查当前 url——provision 可能刚完成、wid 已出现（避免误判失败）
+            wid = _extract_wid(_cur_url(session))
+            if wid:
+                break
+            if _account_flagged(session):
+                result["flagged"] = True
+                result["detail"] = "GitHub 账号被 flagged，无法授权第三方应用（opencode OAuth）"
+                _step(monitor, session, result["detail"])
+                return result
             try:
                 session.get("https://opencode.ai/auth")
             except Exception:
@@ -178,7 +183,15 @@ def login_and_open_own_go(session, monitor=None, timeout=150):
             wid = _extract_wid(u)
             if wid:
                 break
+    # 末次兜底：再从当前 url 取一次 wid（provision 可能在最后一刻才完成）
     if not wid:
+        wid = _extract_wid(_cur_url(session))
+    if not wid:
+        # 仍无 wid：查 flag（多半被 flag），否则如实报未取到 workspace
+        if _account_flagged(session):
+            result["flagged"] = True
+            result["detail"] = "GitHub 账号被 flagged，无法授权第三方应用（opencode OAuth）"
+            return result
         result["detail"] = f"登录后未能取到自己的 workspace id，停在 {_cur_url(session)[:120]}"
         return result
 
