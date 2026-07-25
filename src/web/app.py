@@ -12,7 +12,7 @@ from datetime import datetime
 
 from flask import Flask, send_from_directory, Response
 
-from src.config import cfg, get_base_dir, get_data_dir, INVOICE_DAILY_CAP
+from src.config import cfg, get_base_dir, get_data_dir
 from src.models.database import Database
 from src.models.account import AccountModel
 from src.models.task import TaskModel
@@ -384,571 +384,215 @@ class AppState:
         elif not self.stop_requested:
             self._hooked_print("所有卡已处理完毕！")
 
+    def _eligible_cards(self, group_id):
+        """返回该分组当前「可选」的卡，有序：新卡优先，再复用好卡。
+
+        可选 = get_usable_cards_as_list（已排除 expired/invalid/bound）且不处于临时冷却
+        （3DS / 「曾成功卡本次被拒」的速率冷却）中。排序：
+          - 新卡（从未成功付款过）优先，先把卡池的新卡消耗掉；
+          - 之后才复用已成功过的好卡（paid 卡可反复支付）。
+        成功卡不被永久消耗，只有被拒（好卡→冷却，坏卡→无效）或过期才退出可选集。"""
+        models = self.models
+        usable, _ = models['card_pool'].get_usable_cards_as_list(group_id)
+        cooldown_map = {}
+        try:
+            cooldown_map = models['card_state'].get_state_map()
+        except Exception:
+            cooldown_map = {}
+        try:
+            success_nums = models['recharge_log'].all_success_card_numbers()
+        except Exception:
+            success_nums = set()
+        fresh, good = [], []
+        for c in usable:
+            num = c.get('number', '')
+            if cooldown_map.get(num, {}).get('in_cooldown'):
+                continue
+            # success_nums 已去空格（all_success_card_numbers 内 replace），此处比对键同样
+            # 去空格，保证「新卡/好卡」分类与记账口径一致（卡号含内部空格时也不误判）。
+            (good if num.replace(' ', '') in success_nums else fresh).append(c)
+        return fresh + good
+
     def _recharge_one_account(self, email, login_password, payment_group_id=None,
-                              single_step=False, invoice_daily_cap=None, worker=None):
-        """充值单个账号并记账，返回 (result, err, info)。
+                              worker=None):
+        """为单个账号执行一次充值访问，返回 (result, err)，result ∈ {"success", "failed"}。
 
-        全量模式（single_step=False，现状）result 取值：
-          - "success"      实际 Top-up 成功
-          - "invoice_only" 未充值（今日已充），仅检查/处理了账单，预建 log 已删除，不计充值
-          - "failed"       充值失败或异常
-        单步模式（single_step=True，每日流水线轮询用）result 取值：
-          - "cap_reached"  当日账单已达上限，未做 Top-up，预建 log 已删除
-          - "stepped"      做了 1 次 Top-up 生成账单 + 至多付 1 张（info 含 today_count/generated/paid）
-          - "failed"       失败或异常
-        info: 单步模式为 registration 返回的 dict（含 today_count 等）；全量模式为 {}。
+        用 payment_group_id 指定分组的可选卡（_eligible_cards：新卡优先，再复用好卡；已排除
+        无效/过期/冷却）逐张尝试，付成一张即 success。逐卡的卡状态标记（paid/invalid/冷却）
+        与 recharge_logs 记账都在 registration.recharge_account 内部完成，本方法只负责取卡、
+        调度、把结果转成计数用的 (result, err)。
 
-        只负责一个账号的一次操作 + 记账，不管理 is_running / 截图收尾（由调用方负责）。
-        InterruptedError 向上抛出，供批量循环感知停止。
+        只负责一个账号的一次操作，不管理 is_running / 截图收尾（由调用方负责）。
+        InterruptedError 向上抛出，供轮转循环感知停止。
 
-        worker: 执行本次操作的 WorkerState。并行时必须传入，使截图与活跃 driver
-        落到该 worker 自己的状态上；为 None 时用主 worker（串行路径）。"""
+        worker: 执行本次操作的 WorkerState；为 None 时用主 worker（串行路径）。"""
         models = self.models
         worker = worker or self.primary_worker
         monitor = worker.make_monitor(self)
 
-        # 是否有支付卡分组 → 决定是否处理 Unpaid invoices
-        skip_invoice = not payment_group_id
-        payment_cards = []
-        if payment_group_id:
-            payment_cards, unusable = models['card_pool'].get_usable_cards_as_list(payment_group_id)
-            if unusable:
-                self.add_log(f"支付卡分组已跳过 {len(unusable)} 张无效卡（过期/被拒）")
-            if not payment_cards:
-                self.add_log("支付卡分组无可用卡片数据，将仅执行 Top-up Credits")
-                skip_invoice = True
-
-        # 该账号绑定的卡片列表，用于按页面后四位匹配完整卡号
-        cards = models['card_binding'].get_by_email(email)
-        log_id = models['recharge_log'].create(email, card_display='', amount=10)
-
-        def _match_full_card(card_last4):
-            """页面后四位 → 完整卡号（写入 recharge_logs.card_display）。
-
-            先在该账号已绑定的卡里找；找不到再到全局卡池按末 4 位反查（唯一命中才采信）。
-            两级都落空时返回裸后四位——绝不写脱敏串，否则 card_display 会混入 '•••• '
-            前缀，导致按完整卡号等值匹配的统计/冷却判定（如 success_count_since）静默失效。
-            """
-            if not card_last4:
-                return ''
-            for c in cards:
-                if c.get('card_number', '').endswith(card_last4):
-                    return c['card_number']
-            return models['card_pool'].find_number_by_last4(card_last4) or card_last4
+        payment_cards = self._eligible_cards(payment_group_id) if payment_group_id else []
+        if not payment_cards:
+            self.set_action(worker, f"{email} 无可选卡（全部无效/过期或冷却中）")
+            return "failed", "无可选卡"
 
         try:
-            result = registration.recharge_account(
+            success, err, responses, card_last4, outcome = registration.recharge_account(
                 email, login_password,
                 recharge_log_model=models['recharge_log'],
                 monitor_callback=monitor,
-                skip_invoice=skip_invoice,
                 payment_cards=payment_cards,
                 valid_card_model=models['valid_card'],
                 card_pool_model=models['card_pool'],
                 account_model=models['account'],
                 should_stop=lambda: self.stop_requested,
-                card_binding_model=models['card_binding'],
                 card_state_model=models['card_state'],
-                invoice_state_model=models['invoice_state'],
-                invoice_daily_cap=(invoice_daily_cap if single_step else None),
                 payment_registry=self.payment_registry,
             )
 
-            # ===== 单步（round-robin）模式 =====
-            if single_step:
-                success, err, responses, card_last4, outcome, info = result
-                info = info or {}
-                matched_card = _match_full_card(card_last4)
-                if matched_card:
-                    models['recharge_log'].update_card(log_id, matched_card)
-
-                if outcome == "cap_reached":
-                    # 未做 Top-up：删除预建占位 log
-                    models['recharge_log'].delete(log_id)
-                    tc = info.get('today_count')
-                    self.set_action(worker, f"{email} 当日账单已达上限（{tc}）")
-                    self.add_log(f"{email} 当日账单数 {tc} 已达上限，跳过 Top-up")
-                    return "cap_reached", '', info
-
-                if outcome == "stepped":
-                    # Top-up 本身是否真扣款成功由 registration（Stripe confirm 权威）判定；
-                    # 常态是 bound 卡 $0 被拒 → 留 open invoice 交卡池卡付（付款记账已在 registration 内完成）。
-                    if info.get('topup_ok'):
-                        models['recharge_log'].mark_success(log_id, api_response={'responses': responses})
-                    else:
-                        models['recharge_log'].mark_failed(
-                            log_id, error=(err or 'Top-up 未成功')[:200],
-                            api_response={'responses': responses})
-                    paid = info.get('paid', 0)
-                    gen = info.get('generated')
-                    tc = info.get('today_count')
-                    self.set_action(worker, f"{email} 单步：当日账单 {tc}，付成 {paid} 张")
-                    self.add_log(f"{email} 单步完成：当日账单 {tc}，"
-                                 f"生成{'成功' if gen else '未增长'}，付成 {paid} 张")
-                    return "stepped", '', info
-
-                # outcome == "failed"
-                models['recharge_log'].mark_failed(
-                    log_id, error=(err or 'recharge failed')[:200],
-                    api_response={'responses': responses})
-                self.set_action(worker, f"{email} 单步失败: {err}")
-                self.add_log(f"{email} 单步失败: {err}")
-                return "failed", err or 'recharge failed', info
-
-            # ===== 全量模式（现状，行为不变）=====
-            success, err, responses, card_last4, outcome = result
-
-            # 仅处理/检查了账单、未实际 Top-up：删除预建占位 log，避免误记为 $10 充值成功。
-            # 账单支付本身的记账已由 recharge_account 内部（_on_invoice_paid/_on_invoice_failed）完成。
-            if outcome == "invoice_only":
-                models['recharge_log'].delete(log_id)
-                self.set_action(worker, f"{email} 未重复充值（已检查/处理账单）")
-                self.add_log(f"{email} 今日已充值，已执行账单支付检查，未重复 Top-up")
-                return "invoice_only", '', {}
-
-            # 用页面提取的后四位匹配完整卡号（用于 log 展示与有效卡记录）
-            matched_card = _match_full_card(card_last4)
-            if matched_card:
-                models['recharge_log'].update_card(log_id, matched_card)
-
-            # 收尾完全信任 registration 给出的 outcome——其内部以 Stripe payment_intents/confirm
-            # 为权威、confirm 未捕获时用余额兜底判定。不再从 CF topup 200/success 推断成功
-            # （那只代表已创建支付意图，非实际扣款成功）。
             if outcome == "topup":
-                models['recharge_log'].mark_success(log_id, api_response={'responses': responses})
-                self.set_action(worker, f"{email} 充值成功")
-                self.add_log(f"{email} AI Credits 充值 $10 成功")
-                if card_last4:
-                    for c in cards:
-                        if c.get('card_number', '').endswith(card_last4):
-                            models['valid_card'].record(
-                                c, source_type='payment', source_email=email,
-                            )
-                            break
-                return "success", '', {}
-            else:
-                # outcome == "failed"：err 带拒付/未到账原因；拒付卡的失效标记已在 registration 内完成
-                models['recharge_log'].mark_failed(log_id, error=err or 'Top-up 未成功',
-                                                   api_response={'responses': responses})
-                self.set_action(worker, f"{email} 充值失败: {err}")
-                self.add_log(f"{email} 充值失败: {err}")
-                return "failed", err or 'recharge failed', {}
+                self.set_action(worker, f"{email} 充值成功（卡 {card_last4}）")
+                self.add_log(f"{email} AI Credits 充值 $20 成功（卡 {card_last4}）")
+                return "success", ''
+
+            # outcome == "failed"：逐卡的失效标记与记账已在 registration 内完成
+            self.set_action(worker, f"{email} 本次未付成: {err}")
+            self.add_log(f"{email} 本次未付成: {err}")
+            return "failed", err or 'recharge failed'
         except InterruptedError:
-            models['recharge_log'].mark_failed(log_id, error='用户中断')
             raise
         except Exception as e:
-            models['recharge_log'].mark_failed(log_id, error=str(e))
             self.set_action(worker, f"充值异常: {e}")
             self.add_log(f"充值异常: {e}")
-            return "failed", str(e), {}
+            return "failed", str(e)
 
-    def run_daily_pipeline(self, bind_group_id, payment_group_id, login_password,
-                           max_bindable_cards, captcha_api_key, mode='full'):
-        """每日一键流水线：补绑已有账号 → 注册新号 → 批量充值，串行跑在单个后台线程。
+    def run_daily_pipeline(self, group_id, login_password=None, captcha_api_key=None):
+        """每日充值任务：卡池驱动的账号轮转充值，串行跑在单个后台线程。
 
-        三段共享同一个 daily task 的 pending 卡池（消耗顺序：补绑 → 注册）。全程持有
-        is_running 锁，复用现有日志/截图/停止机制。补绑与充值均设连续失败阈值兜底。
+        选定一个卡池分组，用账号列表逐账号轮转充值：一个账号在其会话内充成 1 张卡后即轮转
+        到下一个账号；所有账号轮完一遍后若还有可选卡，回到第一个账号继续下一轮，直到无可选
+        卡 / 用户停止 / 整轮零进展兜底。
 
-        mode 控制跑哪几段：
-          full          绑卡 + 充值（阶段0/1a/1b/2，默认，与历史行为一致）
-          bind_only     仅绑卡（跳过阶段2）
-          recharge_only 仅充值（跳过阶段0/1a/1b，此时 bind_group_id 可为 None）
+        选卡资格（见 _eligible_cards）：新卡优先，付款成功过的好卡可反复复用；只有从未成功
+        的坏卡被拒（判无效）、好卡被拒（24h 速率冷却）或过期，才退出可选集。逐卡的卡状态
+        标记与 recharge_logs 记账在 recharge_account 内部完成；本方法只负责取可选卡、轮转
+        账号、计数与收尾。
 
-        recharge_only 下不建 daily task 记录，task_id 恒为 None——阶段1a/1b 与收尾的
-        卡池清理/报告导出都以 task_id 为门，故无需在这些地方再判 mode。"""
+        login_password 可选，用于覆盖账号自身密码（一般留空，用各账号 accounts.login_password）。
+        并发度固定为 1（串行）：WorkerPool 的 is_serial 分支走同线程，保留截图/停止集成。"""
         self.is_running = True
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
-        self.current_action = "每日流水线启动中"
+        self.current_action = "每日充值任务启动中"
         self.update_frame(None)
 
         self._patch_prints()
 
         account_model = self.models['account']
-        card_binding_model = self.models['card_binding']
-        recharge_log_model = self.models['recharge_log']
 
-        task_id = None
-        bind_success_total = 0
-        recharge_success_total = 0
-        recharge_fail_total = 0
-        recharge_invoice_only_total = 0
+        paid_total = 0            # 成功付款次数
+        fail_total = 0            # 账号访问未付成次数
 
-        # 并发执行器。max_workers=1 时走同线程分支，行为与串行实现等价。
-        pool = WorkerPool(self, cfg.concurrency.max_workers)
-        if not pool.is_serial:
-            self._hooked_print(f"并发模式：{pool.max_workers} 个浏览器 worker")
-
-        # 跨 worker 共享的计数器。并发下"连续失败"的语义由"某线程连续失败 N 次"
-        # 变为"全局连续失败 N 次"——任一 worker 成功即清零。
-        totals_lock = threading.Lock()
-
-        def _bump(name, delta=1):
-            """自增并返回自增后的值——调用方要打印计数时必须用返回值，
-            事后再读会拿到别的 worker 又推高的数字。"""
-            with totals_lock:
-                counters[name] = counters.get(name, 0) + delta
-                return counters[name]
-
-        counters = {}
+        # 并发度固定为 1（串行）。WorkerPool.is_serial 走同线程分支，行为与直接调用等价。
+        pool = WorkerPool(self, 1)
 
         try:
-            # ===== 阶段0：准备卡池 =====
-            mode_label = {'full': '绑卡 + 充值', 'bind_only': '仅绑卡',
-                          'recharge_only': '仅充值'}.get(mode, mode)
             self._hooked_print(f"\n{'#' * 50}")
-            self._hooked_print(f"每日流水线开始（模式：{mode_label}）")
+            self._hooked_print("每日充值任务开始（卡池驱动 + 账号轮转）")
             self._hooked_print(f"{'#' * 50}")
 
-            # 仅充值模式不碰卡池：cards 留空后续过滤/建 task 自然全部空转，
-            # task_id 保持 None，阶段1a/1b 与收尾的卡池清理都以它为门，无需再判 mode
-            if mode == 'recharge_only':
-                cards, unusable = [], []
-            else:
-                cards, unusable = self.models['card_pool'].get_usable_cards_as_list(bind_group_id)
-            if unusable:
-                self._hooked_print(f"绑卡分组已跳过 {len(unusable)} 张无效卡（过期/被拒）")
+            # 可充值账号：有登录密码且未被封，按 id 升序（轮转顺序稳定）
+            accts = account_model.get_all(order_desc=False)
+            accounts = [
+                a for a in accts
+                if (login_password or a.get('login_password'))
+                and (a.get('status') or '') != 'banned'
+            ]
+            if not accounts:
+                self._hooked_print("无可充值账号（需有登录密码且未封禁），任务结束")
+                return
 
-            # 过滤已成功绑定过的卡、Stripe 字段错误的卡，以及 Top-up 拒付被标记失效的卡
-            # （数据无效或卡已失效，重试无意义）
-            already_bound_numbers = card_binding_model.get_successfully_bound_card_numbers()
-            stripe_error_numbers = card_binding_model.get_stripe_field_error_card_numbers()
-            declined_numbers = card_binding_model.get_declined_card_numbers()
-            filtered_cards = []
-            skipped = 0
-            skipped_stripe_err = 0
-            skipped_declined = 0
-            for c in cards:
-                if c.get('number') in already_bound_numbers:
-                    skipped += 1
-                elif c.get('number') in stripe_error_numbers:
-                    skipped_stripe_err += 1
-                elif c.get('number') in declined_numbers:
-                    skipped_declined += 1
-                else:
-                    filtered_cards.append(c)
-            if skipped > 0:
-                self._hooked_print(f"跳过 {skipped} 张已绑定的卡")
-            if skipped_stripe_err > 0:
-                self._hooked_print(f"跳过 {skipped_stripe_err} 张 Stripe 字段错误的卡")
-            if skipped_declined > 0:
-                self._hooked_print(f"跳过 {skipped_declined} 张 Top-up 拒付已失效的卡")
+            eligible = len(self._eligible_cards(group_id))
+            self._hooked_print(f"可用账号 {len(accounts)} 个，分组可选卡 {eligible} 张")
+            if not eligible:
+                self._hooked_print("分组内无可选卡（全部无效/过期或冷却中），无事可做")
+                return
 
-            if filtered_cards:
-                task_id = self.models['task'].create('daily', config={
-                    'bind_group_id': bind_group_id,
-                    'payment_group_id': payment_group_id,
-                    'total_cards': len(filtered_cards),
-                    'max_bindable': max_bindable_cards,
-                })
-                self.current_card_task_id = task_id
-                card_binding_model.create_batch(task_id, filtered_cards)
-                self._hooked_print(f"阶段0：共 {len(filtered_cards)} 张卡待绑定")
-            elif mode == 'recharge_only':
-                self._hooked_print("阶段0：仅充值模式，跳过卡池准备与绑卡阶段")
-            elif mode == 'bind_only':
-                self._hooked_print("阶段0：无可用卡，仅绑卡模式无事可做")
-            else:
-                self._hooked_print("阶段0：无可用卡，跳过补绑/注册，仅执行充值阶段")
+            # 单轮账号访问结果计数（跨 worker 共享；串行下也用同一把锁保持结构一致）
+            round_lock = threading.Lock()
 
-            # ===== 阶段1a：补绑已有账号 =====
-            if task_id and not self.stop_requested:
-                self._hooked_print(f"\n{'=' * 50}\n阶段1a：补绑已有账号\n{'=' * 50}")
-                accts = account_model.get_all(order_desc=False)  # 按创建顺序（id 升序）
-                emails = [a['email'] for a in accts]
-                counts = card_binding_model.count_by_emails(emails)
+            MAX_ROUNDS = len(accounts) * 50 + 5   # 兜底上限，正常由无可选卡/零进展先收敛
+            round_num = 0
+            while round_num < MAX_ROUNDS:
+                if self.stop_requested:
+                    self._hooked_print("用户停止了任务")
+                    break
+                remaining = len(self._eligible_cards(group_id))
+                if not remaining:
+                    self._hooked_print("已无可选卡（全部无效/过期或冷却中），任务结束")
+                    break
+                round_num += 1
+                round_stats = {'paid': 0, 'failed': 0}
+                self._hooked_print(f"\n{'=' * 50}\n充值轮次 {round_num}（当前可选卡 {remaining} 张）\n{'=' * 50}")
 
-                def _known_bound(a):
-                    """该账号已知的绑卡数：取库内成功数与账单页实测数的较大者。
-
-                    只看库内数会漏掉「卡不在卡池、由外部绑定」的情况——那类账号
-                    库内恒为 0，于是每轮任务都要重新登录一次才发现已绑过，纯属浪费。
-                    bound_card_count 是登录后从账单页读到的真实值（可能为 None）。
-                    """
-                    return max(counts.get(a['email'], 0), a.get('bound_card_count') or 0)
-
-                candidates = [
-                    a for a in accts
-                    if a.get('login_password')
-                    and (a.get('status') or '') != 'banned'
-                    and _known_bound(a) < max_bindable_cards
-                ]
-                skipped_full = sum(
-                    1 for a in accts
-                    if a.get('login_password') and (a.get('status') or '') != 'banned'
-                    and _known_bound(a) >= max_bindable_cards)
-                self._hooked_print(
-                    f"补绑候选账号 {len(candidates)} 个"
-                    + (f"（已满 {skipped_full} 个，跳过）" if skipped_full else ""))
-
-                max_consecutive_failures = 3
-                counters['bind_fail_streak'] = 0
-
-                def _bind_one(worker, acct):
-                    """补绑单个账号。跑在 worker 线程内，全程独占该账号与其领取的卡。"""
+                def _recharge_one(worker, acct):
+                    """本轮推进单个账号一次访问。跑在 worker 线程内。"""
                     email = acct['email']
                     if self.stop_requested:
                         return
-                    if counters.get('bind_fail_streak', 0) >= max_consecutive_failures:
+                    # 可选卡已在别的账号访问中被耗尽则提前收手
+                    if not self._eligible_cards(group_id):
                         return
 
-                    # 账号排他：同一 Chrome profile 不能被两个 worker 同时使用
+                    # 账号排他：同一 Chrome profile 不可并发（串行下恒成功）
                     if not self.account_registry.claim(email):
-                        self._hooked_print(f"{email} 正被占用，跳过")
+                        self._hooked_print(f"{email} 正被占用，本轮跳过")
                         return
 
                     try:
-                        # 领定额而非全量：并发下必须先占位，否则两个 worker 会绑同一批卡
-                        claimed = card_binding_model.claim_batch(
-                            task_id, worker.worker_id, max_bindable_cards)
-                        if not claimed:
-                            return
-
-                        self.set_action(worker, f"补绑账号 {email}（{len(claimed)} 张卡）")
-                        self._hooked_print(f"\n补绑账号: {email}")
-
-                        bound_count, login_ok = registration.bind_cards_to_existing_account(
-                            account_model=account_model,
-                            card_binding_model=card_binding_model,
-                            task_id=task_id,
-                            email=email,
-                            login_password=acct['login_password'],
-                            batch_records=claimed,
-                            max_bindable_cards=max_bindable_cards,
-                            captcha_api_key=captcha_api_key,
-                            monitor_callback=worker.make_monitor(self),
-                            # 卡都试完仍未补够时再领一批，复用已登录的浏览器。
-                            # 仍走 claim_batch，保持并发下的占位语义不变。
-                            claim_more=lambda n: card_binding_model.claim_batch(
-                                task_id, worker.worker_id, n),
-                            card_pool_model=self.models.get('card_pool'),
-                        )
-                        if bound_count > 0:
-                            with totals_lock:
-                                self.success_count += bound_count
-                                counters['bind_success'] = counters.get('bind_success', 0) + bound_count
-                                counters['bind_fail_streak'] = 0
-                            self._hooked_print(f"{email} 补绑了 {bound_count} 张卡")
-                        elif not login_ok:
-                            # 取 _bump 返回的自增后值，而非事后再读——并发下事后读会
-                            # 拿到别的 worker 又推高的数字，日志里出现跳号
-                            streak = _bump('bind_fail_streak')
-                            self._hooked_print(
-                                f"{email} 登录失败"
-                                f"（{streak}/{max_consecutive_failures}），"
-                                f"卡退回卡池待下个账号")
-                        else:
-                            self._hooked_print(f"{email} 无需补绑或账单页异常")
+                        self.set_action(worker, f"轮次{round_num} 充值账号 {email}")
+                        self._hooked_print(f"\n充值账号: {email}")
+                        result, err = self._recharge_one_account(
+                            email, login_password or acct.get('login_password'),
+                            payment_group_id=group_id, worker=worker)
+                        with round_lock:
+                            if result == "success":
+                                round_stats['paid'] += 1
+                                self.success_count += 1
+                            else:
+                                round_stats['failed'] += 1
+                                self.fail_count += 1
                     except InterruptedError:
-                        self._hooked_print("补绑被中断")
+                        self._hooked_print("充值阶段被中断")
                         raise
                     except Exception as e:
-                        _bump('bind_fail_streak')
-                        self._hooked_print(f"补绑 {email} 出错: {e}")
+                        with round_lock:
+                            round_stats['failed'] += 1
+                            self.fail_count += 1
+                        self._hooked_print(f"充值 {email} 出错: {e}")
                     finally:
-                        # 未用掉的卡退回 pending，供后续账号消费。
-                        # 无条件调用：claim_batch 是「先 UPDATE 占位、再 SELECT 回读」，
-                        # 若回读阶段抛异常，卡已占位但局部变量为空，加条件判断反而会漏放。
-                        card_binding_model.release_unused(task_id, worker.worker_id)
                         self.account_registry.release(email)
 
-                if not pool.is_serial:
-                    self.current_action = f"阶段1a 并发补绑（{len(candidates)} 个账号 / {pool.max_workers} worker）"
-                pool.map(candidates, _bind_one)
-                bind_success_total += counters.get('bind_success', 0)
-                if counters.get('bind_fail_streak', 0) >= max_consecutive_failures:
-                    self._hooked_print(f"补绑连续失败达到 {max_consecutive_failures} 次，已结束补绑阶段")
+                # map 是 barrier：本轮所有账号都访问完才进入下一轮
+                pool.map(accounts, _recharge_one)
+                paid_total += round_stats['paid']
+                fail_total += round_stats['failed']
 
-            # ===== 阶段1b：注册新号消耗剩余卡 =====
-            if task_id and not self.stop_requested:
-                # 按「未完成」口径（pending + processing）判断，与 get_summary 一致。
-                # 若只看 pending，阶段1a 万一有卡泄漏在 processing，这里会误判为
-                # 卡池已空而整个跳过注册阶段，那批卡要等 20 分钟回收时早已收尾。
-                remaining = card_binding_model.get_summary(task_id)['pending']
-                if remaining:
-                    self._hooked_print(f"\n{'=' * 50}\n阶段1b：注册新号（剩余 {remaining} 张卡）\n{'=' * 50}")
-                    self._register_bind_loop(task_id, login_password, max_bindable_cards,
-                                             captcha_api_key, pool=pool)
-                else:
-                    self._hooked_print("阶段1b：卡池已被补绑消耗完，无需注册新号")
-
-            # ===== 阶段2：轮询式充值（生成账单 + 逐张支付）=====
-            # 防封控：每个账号每轮只「生成 1 张账单 + 用掉 1 张」，随即切下一个账号；
-            # 一整轮跑完所有账号后从头再来，直到每个账号当日账单数达 INVOICE_DAILY_CAP
-            # 或触发停止条件。当日账单数以 CF invoice-history 接口为权威（recharge_account 内读取）。
-            if mode == 'bind_only':
-                self._hooked_print("\n阶段2：仅绑卡模式，跳过充值阶段")
-            elif not self.stop_requested:
-                self._hooked_print(f"\n{'=' * 50}\n阶段2：轮询式充值（每账号当日上限 {INVOICE_DAILY_CAP} 张账单）\n{'=' * 50}")
-                accts_after = account_model.get_all(order_desc=False)
-                emails_after = [a['email'] for a in accts_after]
-                counts_after = card_binding_model.count_by_emails(emails_after)
-                # 放行所有绑卡≥1 的账号（今日已充过的也进入，由 recharge_account 内部决定是否补生成账单）
-                recharge_targets = [
-                    a for a in accts_after
-                    if a.get('login_password')
-                    and counts_after.get(a['email'], 0) >= 1
-                ]
-                self._hooked_print(f"充值候选账号 {len(recharge_targets)} 个")
-
-                if payment_group_id:
-                    # === 有支付卡分组：轮询式补生成账单 + 逐张支付 ===
-                    done = {}                       # email -> 完成原因（cap_reached / abandoned）
-                    no_progress = {}                # email -> 连续无进展次数
-                    MAX_NOPROG = 3                  # 单账号连续无进展阈值 → 本次流水线内放弃该账号
-                    MAX_ROUNDS = INVOICE_DAILY_CAP + 2   # 兜底：正常每轮每账号 +1 张，30 轮内必达上限
-
-                    round_num = 0
-                    while round_num < MAX_ROUNDS:
-                        if self.stop_requested:
-                            self._hooked_print("用户停止了任务")
-                            break
-                        if all(a['email'] in done for a in recharge_targets):
-                            self._hooked_print("所有账号当日账单均已达上限，充值阶段结束")
-                            break
-                        round_num += 1
-                        round_stats = {'progressed': False, 'paid': 0, 'failed': 0}
-                        round_lock = threading.Lock()
-                        self._hooked_print(f"\n--- 充值轮次 {round_num} ---")
-
-                        def _recharge_one(worker, acct):
-                            """本轮推进单个账号一步。跑在 worker 线程内。
-
-                            并行只让**不同账号**同时推进；单个账号在一轮内仍只被
-                            推进一次——这是 map 的 barrier 语义保证的，也是原有
-                            "每账号每轮只生成 1 张账单"反封控设计的要求。"""
-                            email = acct['email']
-                            if self.stop_requested or email in done:
-                                return
-
-                            # 账号排他：同一 profile 不可并发
-                            if not self.account_registry.claim(email):
-                                self._hooked_print(f"{email} 正被占用，本轮跳过")
-                                return
-
-                            try:
-                                self.set_action(worker, f"轮次{round_num} 充值账号 {email}")
-                                result, _err, info = self._recharge_one_account(
-                                    email, acct['login_password'], payment_group_id,
-                                    single_step=True, invoice_daily_cap=INVOICE_DAILY_CAP,
-                                    worker=worker)
-
-                                today_count = info.get('today_count')
-                                if result == "cap_reached" or (
-                                        today_count is not None and today_count >= INVOICE_DAILY_CAP):
-                                    done[email] = 'cap_reached'
-                                    return
-
-                                # 支付卡池耗尽：再生成账单也无卡可付 → 放弃该账号
-                                # （卡池跨账号共享，其它账号也将陆续耗尽并整体收束）
-                                if info.get('cards_exhausted'):
-                                    done[email] = 'no_cards'
-                                    self._hooked_print(f"{email} 支付卡池已耗尽，停止对该账号补生成账单")
-                                    if info.get('paid', 0) > 0:
-                                        with round_lock:
-                                            round_stats['paid'] += info.get('paid', 0)
-                                            round_stats['progressed'] = True
-                                    return
-
-                                if result == "stepped":
-                                    # 有进展：生成了新账单 或 付成了至少 1 张
-                                    made_progress = bool(info.get('generated')) or (info.get('paid', 0) > 0)
-                                    with round_lock:
-                                        if info.get('paid', 0) > 0:
-                                            round_stats['paid'] += info.get('paid', 0)
-                                        if made_progress:
-                                            no_progress[email] = 0
-                                            round_stats['progressed'] = True
-                                        else:
-                                            no_progress[email] = no_progress.get(email, 0) + 1
-                                else:
-                                    with round_lock:
-                                        round_stats['failed'] += 1
-                                        no_progress[email] = no_progress.get(email, 0) + 1
-
-                                if no_progress.get(email, 0) >= MAX_NOPROG:
-                                    done[email] = 'abandoned'
-                                    self._hooked_print(f"{email} 连续 {MAX_NOPROG} 次无进展，本次流水线内放弃该账号")
-                            except InterruptedError:
-                                self._hooked_print("充值阶段被中断")
-                                raise
-                            except Exception as e:
-                                with round_lock:
-                                    round_stats['failed'] += 1
-                                    no_progress[email] = no_progress.get(email, 0) + 1
-                                if no_progress.get(email, 0) >= MAX_NOPROG:
-                                    done[email] = 'abandoned'
-                                self._hooked_print(f"充值 {email} 出错: {e}")
-                            finally:
-                                self.account_registry.release(email)
-
-                        # map 是 barrier：本轮所有账号都推进完才进入下一轮
-                        pending_targets = [a for a in recharge_targets if a['email'] not in done]
-                        if not pool.is_serial:
-                            self.current_action = f"阶段2 轮次{round_num} 并发充值（{len(pending_targets)} 个账号）"
-                        pool.map(pending_targets, _recharge_one)
-                        recharge_success_total += round_stats['paid']
-                        recharge_fail_total += round_stats['failed']
-
-                        if not round_stats['progressed'] and not self.stop_requested:
-                            self._hooked_print("整轮无任何账号取得进展，结束充值阶段（兜底防死循环）")
-                            break
-                else:
-                    # === 无支付卡分组：无账单可付，轮询无意义 → 每账号仅 Top-up 一次（全量模式单遍）===
-                    self._hooked_print("未选择支付卡分组，仅对每个账号执行一次 Top-up（不补生成账单）")
-                    max_consecutive_failures = 3
-                    topup = {'streak': 0, 'success': 0, 'invoice_only': 0, 'failed': 0}
-                    topup_lock = threading.Lock()
-
-                    def _topup_one(worker, acct):
-                        email = acct['email']
-                        if self.stop_requested:
-                            return
-                        with topup_lock:
-                            if topup['streak'] >= max_consecutive_failures:
-                                return
-                        if not self.account_registry.claim(email):
-                            self._hooked_print(f"{email} 正被占用，跳过")
-                            return
-                        try:
-                            self.set_action(worker, f"充值账号 {email}")
-                            result, _err, _info = self._recharge_one_account(
-                                email, acct['login_password'], payment_group_id, worker=worker)
-                            with topup_lock:
-                                if result == "success":
-                                    topup['success'] += 1
-                                    topup['streak'] = 0
-                                elif result == "invoice_only":
-                                    topup['invoice_only'] += 1
-                                    topup['streak'] = 0
-                                else:
-                                    topup['failed'] += 1
-                                    topup['streak'] += 1
-                        except InterruptedError:
-                            self._hooked_print("充值阶段被中断")
-                            raise
-                        except Exception as e:
-                            with topup_lock:
-                                topup['failed'] += 1
-                                topup['streak'] += 1
-                            self._hooked_print(f"充值 {email} 出错: {e}")
-                        finally:
-                            self.account_registry.release(email)
-
-                    if not pool.is_serial:
-                        self.current_action = f"阶段2 并发充值（{len(recharge_targets)} 个账号 / {pool.max_workers} worker）"
-                    pool.map(recharge_targets, _topup_one)
-                    recharge_success_total += topup['success']
-                    recharge_invoice_only_total += topup['invoice_only']
-                    recharge_fail_total += topup['failed']
-                    if topup['streak'] >= max_consecutive_failures:
-                        self._hooked_print(f"充值连续失败达到 {max_consecutive_failures} 次，已停止充值阶段")
+                # 进展 = 本轮有成功付款，或可选卡数减少（坏卡判无效 / 好卡进冷却 / 过期）。
+                # 只要还有进展就继续轮转；整轮零成功且可选卡数没减少（全部账号 login 失败 /
+                # hCaptcha 拦截等，一张卡都没定案）才兜底结束防死循环，需人工介入。
+                # 说明：好卡持续成功时可选卡数不减、但计为进展，会一直复用直到好卡被风控
+                # 陆续冷却而收敛；MAX_ROUNDS 是极端不收敛下的最终兜底。
+                after = len(self._eligible_cards(group_id))
+                progressed = round_stats['paid'] > 0 or after < remaining
+                if not progressed and not self.stop_requested:
+                    self._hooked_print("整轮无成功付款且无卡被消耗/冷却，结束任务（兜底防死循环）")
+                    break
 
         except Exception as e:
             self._hooked_print(f"严重错误: {e}")
         finally:
-            # 收尾所有 worker（并行时不止主 worker），并释放全部运行时占用
+            # 收尾所有 worker，释放运行时占用
             for w in self.workers.values():
                 w.clear_active_driver()
                 w.stop_screenshot_loop()
@@ -959,65 +603,18 @@ class AppState:
             self.parallel_mode = False
             self.is_running = False
 
-            # 释放各 worker 残留的已领取卡（异常路径可能漏掉 release_unused）。
-            # 必须在下面 delete_pending_by_task 之前——否则残留的 processing
-            # 会被当成未处理记录一并删掉，语义上没错但日志会少算。
-            if task_id:
-                try:
-                    leaked = sum(card_binding_model.release_unused(task_id, w.worker_id)
-                                 for w in self.workers.values())
-                    if leaked:
-                        self._hooked_print(f"已释放 {leaked} 张残留的已领取卡")
-                except Exception as e:
-                    self._hooked_print(f"释放残留卡失败: {e}")
-
-            # 记录有效卡（本任务绑定成功的卡）+ 导出报告 + 结束任务记录
-            if task_id:
-                try:
-                    success_records = self.db.fetchall(
-                        "SELECT card_data_json, bound_to_email FROM card_bindings WHERE task_id=? AND status='success' AND card_data_json IS NOT NULL",
-                        (task_id,),
-                    )
-                    valid_count = 0
-                    for sr in success_records:
-                        card_data = json.loads(sr['card_data_json'])
-                        self.models['valid_card'].record(
-                            card_data, source_type='bind',
-                            source_email=sr['bound_to_email'] or '',
-                            source_group_id=bind_group_id,
-                        )
-                        valid_count += 1
-                    if valid_count > 0:
-                        self._hooked_print(f"已记录 {valid_count} 张有效卡")
-                except Exception as e:
-                    self._hooked_print(f"记录有效卡失败: {e}")
-
-                try:
-                    records = card_binding_model.get_all_by_task(task_id)
-                    report_path = card_service.export_report(records)
-                    self._hooked_print(f"报告已导出: {report_path}")
-                except Exception as e:
-                    self._hooked_print(f"报告导出失败: {e}")
-
-                try:
-                    deleted = card_binding_model.delete_pending_by_task(task_id)
-                    if deleted > 0:
-                        self._hooked_print(f"已清理 {deleted} 条未处理记录")
-                except Exception as e:
-                    self._hooked_print(f"清理 pending 记录失败: {e}")
-
-                final_summary = card_binding_model.get_summary(task_id)
-                self.models['task'].update_counts(task_id, final_summary['success'], final_summary['failed'])
-                self.models['task'].finish(task_id, 'completed' if not self.stop_requested else 'stopped')
-
+            try:
+                remaining = len(self._eligible_cards(group_id))
+            except Exception:
+                remaining = '?'
             self.current_action = (
-                f"每日流水线完成（补绑 {bind_success_total} 张 / "
-                f"充值成功 {recharge_success_total} / 充值失败 {recharge_fail_total} / "
-                f"仅账单处理 {recharge_invoice_only_total}）"
+                f"每日充值任务完成（成功付款 {paid_total} 次 / "
+                f"未付成 {fail_total} 次 / 剩余可选卡 {remaining} 张）"
             )
             self._hooked_print(f"\n{'#' * 50}")
             self._hooked_print(self.current_action)
             self._hooked_print(f"{'#' * 50}")
+
 
     def _patch_prints(self):
         """劫持相关模块的 print 函数以捕获日志"""

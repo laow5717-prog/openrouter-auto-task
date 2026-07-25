@@ -271,6 +271,8 @@ class WorkerState:
         下游 registration.* 无需任何改动：它拿到的仍是一个 callable(driver, step)，
         只是现在闭包绑定到本 worker，截图与 driver 跟踪都落到本 worker 的状态上。
         """
+        _last_step = {"v": None}
+
         def _monitor(driver, step):
             if app_state.stop_requested:
                 app_state.dispatch_print("收到停止请求，正在中断...")
@@ -280,6 +282,13 @@ class WorkerState:
             # 不加这个判断会每步都重建线程。
             if self._screenshot_driver is not driver:
                 self.start_screenshot_loop(driver)
+            # 把步骤描述写入日志，让充值进度在 UI / 监控里可见（去重，避免同一步刷屏）
+            if step and step != _last_step["v"]:
+                _last_step["v"] = step
+                try:
+                    app_state.add_log(step)
+                except Exception:
+                    pass
         return _monitor
 
     def reset_for_run(self):

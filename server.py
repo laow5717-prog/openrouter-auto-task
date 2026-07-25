@@ -22,8 +22,9 @@ def main():
     app = create_app()
 
     from waitress import serve
-    print("Web server started: http://localhost:5000")
-    serve(app, host='0.0.0.0', port=5000, threads=6)
+    port = int(os.environ.get('PORT', '5000'))
+    print(f"Web server started: http://localhost:{port}")
+    serve(app, host='0.0.0.0', port=port, threads=6)
 
 
 if __name__ == '__main__':

@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from src.browser.driver import create_driver, close_driver
 from src.browser import github_signup as gh
 from src.services.email import create_temp_email, wait_for_github_launch_code
+from src.services.hotmail_inbox import wait_for_github_launch_code_ruoanzhu
+from src.browser.opencode_login import login_and_open_own_go
 
 _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -66,11 +68,12 @@ def _screenshot(session, email):
         return None
 
 
-def _collect_and_fill_code(session, token, since_ts, result):
+def _collect_and_fill_code(session, fetch_code, result):
     """已在邮箱验证页时的收尾：侦察验证页 DOM → 收 launch code → 回填 → 判定完成。
 
-    就地更新 result 的 outcome/reason/ok。since_ts 为收邮件的时间下界（取在提交前，
-    保证不漏掉提交后到达的验证邮件；mail.tm 为本次新建收件箱，无历史 GitHub 邮件干扰）。
+    就地更新 result 的 outcome/reason/ok。fetch_code 为零参可调用，返回验证码或 None——
+    mail.tm 路径闭包了 (token, since_ts)，hotmail 路径闭包了 ruoanzhu 收信链接；收尾逻辑
+    对邮箱源无感。收两次码（注册确认 + 新设备验证）都走同一 fetch_code。
     """
     # 1) 侦察验证页真实 DOM（该页选择器为推断，dump 一次便于收敛；即便回填失败也留下真实 DOM）
     dom = gh.dump_verification_dom(session)
@@ -78,7 +81,7 @@ def _collect_and_fill_code(session, token, since_ts, result):
 
     # 2) 收 GitHub 验证码邮件
     print("=== 收 GitHub 验证码邮件 ===")
-    code = wait_for_github_launch_code(token, since_ts)
+    code = fetch_code()
     if not code:
         result["outcome"] = "no_verification_email"
         result["reason"] = "未收到 GitHub 验证码邮件（可能 GitHub 未向临时邮箱发信）"
@@ -126,7 +129,7 @@ def _collect_and_fill_code(session, token, since_ts, result):
     elif login["needs_device_verification"]:
         # 新设备二次验证：仍是邮箱 8 位码，复用同一收码回填闭环
         print("  登录触发新设备邮箱验证，再收一次码回填...")
-        code2 = wait_for_github_launch_code(token, since_ts)
+        code2 = fetch_code()
         if code2 and gh.submit_email_code(session, code2):
             done = gh.detect_signup_complete(session)
             if done["complete"]:
@@ -143,26 +146,34 @@ def _collect_and_fill_code(session, token, since_ts, result):
         print(f"  ⚠️ {result['reason']}")
 
 
-def _finish_semi_auto(session, token, since_ts, result):
+def _finish_semi_auto(session, fetch_code, result):
     """验证码出现后的半自动收尾：先等人工手动过 Arkose，过码后走通用收码回填。"""
     if not gh.wait_for_captcha_cleared(session, timeout=300):
         result["outcome"] = "captcha_timeout"
         result["reason"] = "等待人工过验证码超时（5 分钟内未通过）"
         return
-    _collect_and_fill_code(session, token, since_ts, result)
+    _collect_and_fill_code(session, fetch_code, result)
 
 
-def signup_one(headless=False, semi_auto=False):
+def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
+               then_opencode=False):
     """执行一次 GitHub 注册。
 
     semi_auto=False：只跑到 Arkose 验证码出现为止（outcome=reached_captcha）。
-    semi_auto=True：跑到验证码后**暂停等人工手动过码**，通过后自动收 mail.tm 验证邮件、
+    semi_auto=True：跑到验证码后**暂停等人工手动过码**，通过后自动收验证邮件、
                     回填 launch code、判定注册是否完成。需有头模式且有人在场过码。
+    keep_open=True：流程跑完后**不关浏览器**，进程挂住（Ctrl-C 结束），供人肉眼查看最终页面。
+    account：可选 HotmailAccount（含 email/password/link）。
+             - None（默认）：走原 mail.tm 临时邮箱路径，收码走 mail.tm API。
+             - 提供时：用该 hotmail 邮箱注册，收码走 ruoanzhu 收信链接，浏览器用
+               以 email 命名的持久 profile（固定指纹环境，降挂起风险）。
+    then_opencode：注册成功（signup_complete）后，在同一浏览器 session 里续上 opencode
+             GitHub-OAuth 登录，并进入该账号自己的 /go 页。结果写入 result['opencode']。
 
     返回 dict：
       ok:             bool     半自动模式下 = 注册完成；默认模式下 = 推进到验证码
-      email:          str|None mail.tm 邮箱地址
-      email_password: str|None mail.tm 登录密码（供后续收注册验证邮件）
+      email:          str|None 注册邮箱（mail.tm 临时箱或 hotmail 地址）
+      email_password: str|None 邮箱登录密码（mail.tm 密码或 hotmail 密码）
       github_password:str|None 提交给 GitHub 的密码
       username:       str|None
       outcome:        "signup_complete" | "reached_captcha" | "reached_verify_email"
@@ -175,16 +186,26 @@ def signup_one(headless=False, semi_auto=False):
     result = {
         "ok": False, "email": None, "email_password": None, "github_password": None,
         "username": None, "outcome": "error", "reason": "", "screenshot": None,
-        "final_url": None,
+        "final_url": None, "opencode": None,
     }
 
-    # 1) 临时邮箱
-    print("=== 步骤 1/4：创建 mail.tm 临时邮箱 ===")
-    address, mail_pw, token = create_temp_email()
-    if not address:
-        result["reason"] = "创建 mail.tm 邮箱失败"
-        print(f"  ❌ {result['reason']}")
-        return result
+    use_hotmail = account is not None
+    # 1) 邮箱：hotmail 用现成账号，否则建 mail.tm 临时箱
+    if use_hotmail:
+        print("=== 步骤 1/4：使用 hotmail 邮箱（ruoanzhu 收码）===")
+        address, mail_pw = account.email, account.password
+        token = None
+        if not account.link:
+            result["reason"] = f"hotmail 账号 {address} 缺少 ruoanzhu 收信链接，无法收码"
+            print(f"  ❌ {result['reason']}")
+            return result
+    else:
+        print("=== 步骤 1/4：创建 mail.tm 临时邮箱 ===")
+        address, mail_pw, token = create_temp_email()
+        if not address:
+            result["reason"] = "创建 mail.tm 邮箱失败"
+            print(f"  ❌ {result['reason']}")
+            return result
     username = _gen_username()
     github_pw = _gen_password()
     result.update(email=address, email_password=mail_pw,
@@ -195,11 +216,20 @@ def signup_one(headless=False, semi_auto=False):
     # mail.tm 为本次新建收件箱，无历史 GitHub 邮件，故不会误取旧码。
     since_ts = datetime.now(timezone.utc)
 
+    # 收码闭包：两条路径都收敛到零参可调用，收尾逻辑对邮箱源无感。
+    if use_hotmail:
+        def fetch_code():
+            return wait_for_github_launch_code_ruoanzhu(account.link)
+    else:
+        def fetch_code():
+            return wait_for_github_launch_code(token, since_ts)
+
     session = None
     try:
-        # 2) 起浏览器 + 打开注册页
+        # 2) 起浏览器 + 打开注册页（hotmail 用以 email 命名的持久 profile）
         print("=== 步骤 2/4：打开 GitHub 注册页 ===")
-        session = create_driver(headless=headless)
+        session = create_driver(headless=headless,
+                                profile_id=(address if use_hotmail else None))
         if not gh.open_signup(session):
             result["reason"] = "GitHub 注册页加载失败（邮箱框未出现）"
             result["screenshot"] = _screenshot(session, address)
@@ -241,7 +271,7 @@ def signup_one(headless=False, semi_auto=False):
                 print(f"  ✅ 已推进到验证码：{term['detail']}")
                 return result
             # —— 半自动收尾：人工过码 → 收邮件 → 回填 → 判定完成 ——
-            _finish_semi_auto(session, token, since_ts, result)
+            _finish_semi_auto(session, fetch_code, result)
             result["final_url"] = session.current_url
             result["screenshot"] = _screenshot(session, address)
         elif term["terminal"] == gh.TERM_VERIFY_EMAIL:
@@ -253,7 +283,7 @@ def signup_one(headless=False, semi_auto=False):
                 print(f"  ✅ 已进入邮箱验证页：{term['detail']}")
                 return result
             print("  未出验证码，直接进入邮箱验证页，自动收码回填...")
-            _collect_and_fill_code(session, token, since_ts, result)
+            _collect_and_fill_code(session, fetch_code, result)
             result["final_url"] = session.current_url
             result["screenshot"] = _screenshot(session, address)
         elif term["terminal"] == gh.TERM_REJECTED:
@@ -264,6 +294,21 @@ def signup_one(headless=False, semi_auto=False):
             result["outcome"] = "error"
             result["reason"] = term["detail"]
             print(f"  ⚠️ 未知终态：{term['detail']}")
+
+        # 注册成功后可选：同一 session 续上 opencode 登录，进自己的 /go 页
+        if then_opencode and result["ok"] and result["outcome"] == "signup_complete":
+            print("=== 续接：登录 opencode 并进自己的 /go 页 ===")
+            try:
+                oc = login_and_open_own_go(session)
+                result["opencode"] = oc
+                if oc.get("ok"):
+                    result["final_url"] = session.current_url
+                    print(f"  ✅ opencode：{oc.get('detail')}")
+                else:
+                    print(f"  ⚠️ opencode 登录未完成：{oc.get('detail')}")
+            except Exception as e:
+                result["opencode"] = {"ok": False, "detail": f"opencode 登录异常: {type(e).__name__}: {str(e)[:150]}"}
+                print(f"  ⚠️ {result['opencode']['detail']}")
 
         return result
 
@@ -280,4 +325,22 @@ def signup_one(headless=False, semi_auto=False):
         return result
     finally:
         if session is not None:
+            if keep_open:
+                print("\n" + "=" * 50)
+                print("🔎 keep-open：浏览器保持打开，供你查看最终页面")
+                print(f"  outcome:   {result.get('outcome')}")
+                print(f"  reason:    {result.get('reason')}")
+                try:
+                    print(f"  final_url: {session.current_url}")
+                except Exception:
+                    print(f"  final_url: {result.get('final_url')}")
+                print(f"  email:     {result.get('email')}  /  pw: {result.get('email_password')}")
+                print(f"  username:  {result.get('username')}  /  gh_pw: {result.get('github_password')}")
+                print("  看完后按 Ctrl-C 结束进程即可关闭浏览器")
+                print("=" * 50)
+                try:
+                    while True:
+                        time.sleep(3600)
+                except KeyboardInterrupt:
+                    print("\n收到中断，关闭浏览器...")
             close_driver(session)

@@ -15,15 +15,6 @@ except ImportError:
     sys.exit(1)
 
 
-# === 充值/账单相关常量 ===
-# 每个账号「当日」最多创建的账单（invoice）数硬上限。
-# 每日流水线充值阶段轮询式补生成账单，达到该上限即不再对该账号发起 Top-up。
-# 计数以站点 invoice-history 接口实时返回为权威（按本地当日过滤，paid+open 全计）。
-# TODO(openrouter): 账单/充值语义待按 OpenRouter 站点重新定义。
-INVOICE_DAILY_CAP = 30
-# 单次 Top-up 金额（美元）。每次 Top-up 生成一张「Manual Top-up: AI Gateway Credits」账单。
-TOPUP_AMOUNT = 10
-
 
 # === 浏览器 profile 相关常量 ===
 # 单个持久化 profile 的缓存类目录（Cache / Code Cache / Service Worker / GPUCache 等）

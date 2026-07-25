@@ -362,11 +362,10 @@ def recharge_account():
 
     login_password = account.get('login_password')
     if not login_password:
-        return jsonify({"error": "该账号没有保存 CF 密码"}), 400
+        return jsonify({"error": "该账号没有保存登录密码"}), 400
 
-    status = account.get('status', '')
-    if 'bound' not in status:
-        return jsonify({"error": "该账号未绑定信用卡，无法充值"}), 400
+    # opencode 充值时直接在 Stripe Checkout 填卡，无需预先绑卡，故不再校验 bound 状态。
+    # 支付卡来自 payment_group_id 指定的卡池分组（见 _recharge_one_account → recharge_account）。
 
     # 标记为运行中，在后台线程执行充值
     state.is_running = True
@@ -414,7 +413,7 @@ def open_account_browser():
 
     login_password = account.get('login_password')
     if not login_password:
-        return jsonify({"error": "该账号没有保存 CF 密码"}), 400
+        return jsonify({"error": "该账号没有保存登录密码"}), 400
 
     # 预约 profile：与任务 worker 的账号占用共用一把锁，避免同一 Chrome profile
     # 被 worker 与手动会话同时使用（会互删 Singleton 锁导致浏览器崩溃）
@@ -428,29 +427,37 @@ def open_account_browser():
 
     def _do_open():
         from src.browser.driver import create_driver, close_driver
+        from src.browser import opencode_billing as ob
         driver = None
         try:
             driver = create_driver(headless=False, profile_id=email)
-            # TODO(opencode): 目标站点 https://opencode.ai 的自动登录流程待接入。原
-            # Cloudflare 自动登录逻辑（login_cloudflare + 封禁检测 + 余额监听）已随站点
-            # 重定向移除，当前仅打开浏览器供手动操作，不自动登录、不自动读取余额。
-            state.add_log(f"{email} 浏览器已打开（opencode.ai 自动登录待接入，请手动登录）")
 
-            # 等待用户手动关闭浏览器；期间被动监听 credit-balance 接口：
-            # 用户手动进入 AI Gateway credits 页时，页面会自请求该接口，响应经
-            # page.on("response") 捕获进 driver.credit_balance；这里轮询该值，
-            # 一旦变化即落库刷新余额（driver.title 调用会驱动 Playwright 事件派发）。
+            # 复用充值按钮的访问+登录流程：走 opencode.ai OAuth（GitHub），
+            # 与 registration.recharge_account 用的是同一套 ensure_opencode_session。
+            # 遇 GitHub 新设备验证等人工环节，该函数会保持浏览器打开等待人工完成。
+            def _monitor(_drv, step):
+                if step:
+                    state.add_log(f"{email}: {step}")
+
+            wid, detail = ob.ensure_opencode_session(driver, _monitor, login_password, email)
+            if wid:
+                state.add_log(f"{email} 已登录 opencode（{detail}），workspace={wid}")
+            else:
+                state.add_log(f"{email} 未能自动登录 opencode：{detail}，请在浏览器手动操作")
+
+            # 等待用户手动关闭浏览器；期间轮询 billing 页 Current Balance，
+            # 用户进入结算页时读到即落库刷新余额（driver.title 触发事件派发保活）。
             import time
             last_persisted = None
             while True:
                 try:
                     _ = driver.title
-                    bal = getattr(driver, 'credit_balance', None)
+                    bal = ob._read_balance(driver)
                     if bal is not None and bal != last_persisted:
                         try:
                             models['account'].update_balance(email, bal)
                             last_persisted = bal
-                            state.add_log(f"{email} 检测到 credits 页，余额已更新: ${bal:.2f}")
+                            state.add_log(f"{email} 检测到余额页，余额已更新: ${bal:.2f}")
                         except Exception as _e:
                             state.add_log(f"{email} 余额落库失败: {str(_e)[:80]}")
                     time.sleep(2)
@@ -639,9 +646,10 @@ def create_card_group():
     name = data.get('name', '').strip()
     if not name:
         return jsonify({"error": "分组名称不能为空"}), 400
-    group_type = data.get('type', 'bind')
+    # 已不区分分组类型，统一支付卡；type 仅为兼容保留，默认 payment
+    group_type = data.get('type') or 'payment'
     if group_type not in ('bind', 'payment'):
-        return jsonify({"error": "分组类型必须是 bind 或 payment"}), 400
+        group_type = 'payment'
     description = data.get('description', '')
     group_id = models['card_group'].create(name, group_type, description)
     return jsonify({"id": group_id, "name": name, "type": group_type})
@@ -708,13 +716,14 @@ def merge_card_pools():
     data = request.json or {}
     source_ids = data.get('source_group_ids') or []
     name = (data.get('name') or '').strip()
-    group_type = data.get('type') or 'bind'
+    # 已不区分分组类型，统一支付卡
+    group_type = data.get('type') or 'payment'
+    if group_type not in ('bind', 'payment'):
+        group_type = 'payment'
     if not source_ids:
         return jsonify({"error": "未选择源分组"}), 400
     if not name:
         return jsonify({"error": "未填写新分组名称"}), 400
-    if group_type not in ('bind', 'payment'):
-        return jsonify({"error": "分组类型无效"}), 400
     # 源分组存在性校验
     for gid in source_ids:
         if not models['card_group'].get_by_id(gid):
@@ -928,7 +937,7 @@ def export_valid_cards():
 
 @api.route('/api/daily/start', methods=['POST'])
 def start_daily_pipeline():
-    """启动每日一键流水线：补绑已有账号 → 注册新号 → 批量充值"""
+    """启动每日充值任务：选定卡池分组，逐账号轮转充值直到卡池消耗完。"""
     state = get_app_state()
     if state.is_running:
         return jsonify({"error": "有任务正在运行"}), 400
@@ -936,57 +945,35 @@ def start_daily_pipeline():
     models = get_models()
     data = request.json or {}
 
-    # mode：full=绑卡+充值（默认，历史行为）／bind_only=仅绑卡／recharge_only=仅充值
-    mode = data.get('mode') or 'full'
-    if mode not in ('full', 'bind_only', 'recharge_only'):
-        return jsonify({"error": f"未知运行模式: {mode}"}), 400
+    group_id = data.get('group_id')
+    if not group_id:
+        return jsonify({"error": "未指定卡池分组"}), 400
+    group = models['card_group'].get_by_id(group_id)
+    if not group:
+        return jsonify({"error": "卡池分组不存在"}), 404
 
-    bind_group_id = data.get('bind_group_id')
-    group = None
-    if mode == 'recharge_only':
-        # 仅充值不消耗卡池，绑卡分组无意义，一律忽略
-        bind_group_id = None
-    else:
-        if not bind_group_id:
-            return jsonify({"error": "未指定绑卡分组"}), 400
-        group = models['card_group'].get_by_id(bind_group_id)
-        if not group:
-            return jsonify({"error": "绑卡分组不存在"}), 404
-
-    login_password = data.get('login_password')
-    payment_group_id = data.get('payment_group_id') or None
-    max_bindable_cards = data.get('max_bindable_cards', 2)
+    login_password = data.get('login_password') or None
     captcha_api_key = data.get('captcha_api_key')
 
-    def _has_rechargeable():
-        """是否存在可充值账号——口径必须与流水线阶段2 一致（app.py:_recharge 候选筛选）：
-        login_password 非空 且 card_bindings 里成功绑卡数≥1。不能用 has_today_record 排除
-        今日已充账号：阶段2 会放行它们去做账单支付/复查，启动门更严会误拦。"""
-        accts = models['account'].get_all(order_desc=False)
-        counts = models['card_binding'].count_by_emails([a['email'] for a in accts])
-        return any(a.get('login_password') and counts.get(a['email'], 0) >= 1 for a in accts)
+    # 启动门：分组要有可选卡（排除无效/过期/冷却），且要有可充值账号（有登录密码且未封禁）
+    eligible = len(state._eligible_cards(group_id))
+    if not eligible:
+        return jsonify({"error": "该分组无可选卡（全部无效/过期或冷却中），无事可做"}), 400
 
-    cards, unusable = [], []
-    if mode == 'recharge_only':
-        if not _has_rechargeable():
-            return jsonify({"error": "无已绑卡账号可充值，无事可做"}), 400
-    else:
-        cards, unusable = models['card_pool'].get_usable_cards_as_list(bind_group_id)
-        if not cards:
-            suffix = f"绑卡分组 {len(unusable)} 张卡均已无效" if unusable else "绑卡分组无可用卡"
-            if mode == 'bind_only':
-                # 仅绑卡模式下没卡就彻底无事可做，不再看充值侧
-                return jsonify({"error": f"{suffix}，仅绑卡模式无事可做"}), 400
-            if not _has_rechargeable():
-                return jsonify({"error": f"{suffix}，且无已绑卡账号可充值，无事可做"}), 400
+    accts = models['account'].get_all(order_desc=False)
+    account_count = sum(
+        1 for a in accts
+        if (login_password or a.get('login_password')) and (a.get('status') or '') != 'banned'
+    )
+    if account_count == 0:
+        return jsonify({"error": "无可充值账号（需有登录密码且未封禁），无事可做"}), 400
 
     import threading
     threading.Thread(
         target=state.run_daily_pipeline,
-        args=(bind_group_id, payment_group_id, login_password,
-              max_bindable_cards, captcha_api_key, mode),
+        args=(group_id, login_password, captcha_api_key),
         daemon=True,
     ).start()
 
-    return jsonify({"status": "started", "mode": mode, "usable_cards": len(cards),
-                    "group_name": group['name'] if group else None})
+    return jsonify({"status": "started", "usable_cards": eligible,
+                    "accounts": account_count, "group_name": group['name']})

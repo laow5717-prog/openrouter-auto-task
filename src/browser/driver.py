@@ -589,7 +589,8 @@ def _prune_profile_cache(user_data_dir):
           f"{PROFILE_CACHE_LIMIT_MB}MB，已清理（登录态保留）")
 
 
-def create_driver(headless=False, profile_id=None):
+def create_driver(headless=False, profile_id=None, bypass_csp=False,
+                  disable_site_isolation=False):
     """
     创建带有反检测的 Chrome 浏览器会话（使用 Patchright）
 
@@ -597,6 +598,11 @@ def create_driver(headless=False, profile_id=None):
         headless: 是否使用无头模式
         profile_id: 持久化 profile 标识（如 email），传入后复用同一浏览器环境；
                     为 None 时使用全新临时 profile
+        bypass_csp: 关闭页面 CSP 强制。Patchright 把 add_init_script 作为**内联 <script>**
+                    重写进 HTML 响应注入，而 Stripe/hCaptcha 帧的严格 CSP 会拦掉内联脚本
+                    导致 hook 不执行。开启后（Page.setBypassCSP）内联注入才能在这些 OOPIF 帧
+                    生效——这是 2captcha token 交付进 Stripe enterprise hCaptcha 的前提。
+                    仅订阅付款流程需要，默认关闭以最小化对其它流程的检测面。
     返回:
         浏览器驱动实例
     """
@@ -637,6 +643,12 @@ def create_driver(headless=False, profile_id=None):
         f"--accept-lang={BROWSER_ACCEPT_LANG}",
         f"--window-size={w},{h}",
     ]
+    if disable_site_isolation:
+        # 关站点隔离：让跨域 iframe（Stripe/hCaptcha 的 OOPIF）变成同目标进程内子帧，
+        # 于是主目标一条 CDP Page.addScriptToEvaluateOnNewDocument 即可前置注入到 hcaptcha 帧
+        # （Patchright 的 add_init_script 在本构建失效，OOPIF 又抢不过 Playwright 的 resume）。
+        launch_args += ["--disable-site-isolation-trials",
+                        "--disable-features=IsolateOrigins,site-per-process"]
     if headless:
         print("  👻 使用伪无头模式 (Off-screen)...")
         launch_args.append("--window-position=-10000,-10000")
@@ -691,6 +703,7 @@ def create_driver(headless=False, profile_id=None):
                 channel="chrome",           # 用系统 Google Chrome（隐蔽性关键，非 bundled chromium）
                 headless=False,             # 永不真无头（用户确认仅 headed）
                 no_viewport=True,           # 用真实窗口尺寸（由 --window-size 控制）
+                bypass_csp=bypass_csp,      # 见 create_driver docstring：让内联 hook 注入不被 CSP 拦
                 args=launch_args,
             )
             break
@@ -755,6 +768,72 @@ def create_driver(headless=False, profile_id=None):
             pass
         if not is_persistent:
             shutil.rmtree(user_data_dir, ignore_errors=True)
+        raise
+
+
+def create_driver_vanilla(profile_id):
+    """用**原生 Playwright**（非 Patchright）创建持久 context + BrowserSession。
+
+    专用于 opencode 订阅付款：Patchright 为反检测**阉割了 add_init_script / CDP 脚本前置注入**，
+    导致无法在 Stripe enterprise hCaptcha 的跨域 OOPIF 帧脚本加载前 hook，2captcha token 交付不进去
+    （见 07-25 task design.md 第一~五轮）。原生 Playwright 作主调试器能暂停 OOPIF 并原生前置注入
+    add_init_script（第六轮实测：hcaptcha 帧 ec=2/rs=2，execute 被成功拦截）——故付款走原生栈。
+
+    代价：原生栈隐蔽性弱于 Patchright，仅用于付款这一步；注册/登录仍可用 Patchright 主栈。
+    profile 与 create_driver 同构（data/profiles/<safe>），复用已登录态。
+    """
+    from playwright.sync_api import sync_playwright as _vanilla_sync_playwright
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    safe_name = re.sub(r'[^\w@.\-]', '_', profile_id)
+    user_data_dir = os.path.join(root, 'data', 'profiles', safe_name)
+    os.makedirs(user_data_dir, exist_ok=True)
+    download_dir = os.path.join(user_data_dir, 'downloads')
+    os.makedirs(download_dir, exist_ok=True)
+    print(f"🌐 初始化浏览器 (原生 Playwright, profile: {safe_name})...")
+
+    # profile 清理（对齐 create_driver：回收孤儿 Chrome + 删 Singleton 锁 + 写语言）
+    _kill_chrome_for_profile(user_data_dir, f'vanilla {safe_name}')
+    for _name in ('SingletonLock', 'SingletonCookie', 'SingletonSocket'):
+        _p = os.path.join(user_data_dir, _name)
+        try:
+            if os.path.islink(_p) or os.path.exists(_p):
+                os.remove(_p)
+        except Exception:
+            pass
+    _write_profile_language(user_data_dir)
+
+    w, h = random.choice(_WINDOW_SIZES)
+    playwright = _vanilla_sync_playwright().start()
+    try:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            channel="chrome",
+            headless=False,
+            no_viewport=True,
+            args=["--no-first-run", "--no-default-browser-check",
+                  f"--lang={BROWSER_LANG}", f"--accept-lang={BROWSER_ACCEPT_LANG}",
+                  f"--window-size={w},{h}"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+        try:
+            context.set_extra_http_headers({"Accept-Language": BROWSER_ACCEPT_LANG_HEADER})
+        except Exception:
+            pass
+        session = BrowserSession(playwright, context, page, temp_profile=None,
+                                 download_dir=download_dir, user_data_dir=user_data_dir)
+        page.on("response", session._on_response)
+        print(f"  🖥️ 窗口: {w}x{h}")
+        print("✅ 浏览器初始化成功 (原生 Playwright)")
+        return session
+    except Exception:
+        print("  ❌ 原生浏览器初始化失败，正在清理...")
+        try:
+            playwright.stop()
+        except Exception:
+            pass
         raise
 
 

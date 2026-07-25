@@ -22,13 +22,16 @@ def main():
     parser.add_argument("--headless", action="store_true", help="使用伪无头模式")
     parser.add_argument("--semi-auto", action="store_true",
                         help="半自动：跑到验证码后暂停等人工手动过码，过码后自动收邮件回填验证码（需有头 + 人在场）")
+    parser.add_argument("--keep-open", action="store_true",
+                        help="流程跑完后不关浏览器，进程挂住供你查看最终页面（Ctrl-C 结束）")
     args = parser.parse_args()
 
     if args.semi_auto and args.headless:
         print("⚠️  --semi-auto 需要有头模式手动过码，已忽略 --headless")
         args.headless = False
 
-    result = signup_one(headless=args.headless, semi_auto=args.semi_auto)
+    result = signup_one(headless=args.headless, semi_auto=args.semi_auto,
+                        keep_open=args.keep_open)
 
     print("\n" + "=" * 50)
     print("结果:")

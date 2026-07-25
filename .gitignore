@@ -26,3 +26,7 @@ registered_accounts.txt.migrated
 *.log
 .pytest_cache/
 data/*.db.bak-*
+
+# 游离空库 + 调试截图（不入库）
+/openrouter_auto.db
+data/screenshots/

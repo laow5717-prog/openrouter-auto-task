@@ -91,7 +91,6 @@
                 @click="handleOpenBrowser(acc.email)"
               >{{ openBrowserEmails.has(acc.email) ? '查看中' : '查看' }}</button>
               <button
-                v-if="acc.status && acc.status.includes('bound')"
                 class="row-recharge-btn"
                 :disabled="rechargingEmail === acc.email || store.isRunning"
                 @click="handleRecharge(acc.email)"
@@ -149,18 +148,18 @@
   <Modal :visible="rechargeConfirmVisible" title="充值确认" @close="rechargeConfirmVisible = false">
     <div style="margin-bottom:16px">
       <div style="font-size:14px;margin-bottom:8px">账号: <strong>{{ rechargeTargetEmail }}</strong></div>
-      <div style="font-size:13px;color:var(--text-sub);margin-bottom:12px">充值 $10 AI Credits</div>
+      <div style="font-size:13px;color:var(--text-sub);margin-bottom:12px">在 opencode Zen 充值 $20 credits（Stripe 美元结算，含手续费约 $21.23）</div>
     </div>
     <div style="margin-bottom:16px">
       <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px;color:#555">
-        在线支付卡分组（可选）
+        支付卡分组
       </label>
       <select v-model="rechargeGroupId" class="ctrl-input" style="width:100%">
-        <option value="">不选择 - 仅执行 Top-up Credits</option>
+        <option value="">请选择支付卡分组</option>
         <option v-for="g in paymentGroups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.card_count }}张)</option>
       </select>
       <div style="font-size:11px;color:#999;margin-top:4px">
-        选择支付卡分组后，充值完成会自动处理账单的在线支付；不选择则只执行 Top-up Credits 充值。
+        将用该分组的卡在 Stripe 结算页自动填卡支付；遇 3DS 验证会记该卡冷却并自动换下一张卡。
       </div>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
@@ -351,19 +350,24 @@ async function handleDeleteOne(email) {
 async function handleRecharge(email) {
   rechargeTargetEmail.value = email
   rechargeGroupId.value = ''
-  // 加载支付卡分组
+  // 加载全部卡分组（已不区分类型，均为支付卡）
   try {
-    paymentGroups.value = await getCardGroups({ type: 'payment' })
+    paymentGroups.value = await getCardGroups()
   } catch { paymentGroups.value = [] }
   rechargeConfirmVisible.value = true
 }
 
 async function confirmRecharge() {
   const email = rechargeTargetEmail.value
+  // opencode 充值必须用卡在 Stripe 填卡付款，故分组必选
+  if (!rechargeGroupId.value) {
+    alert('请选择一个支付卡分组（充值需用卡在 Stripe 填卡支付）')
+    return
+  }
   rechargeConfirmVisible.value = false
   rechargingEmail.value = email
   try {
-    await rechargeAccount(email, rechargeGroupId.value || null)
+    await rechargeAccount(email, rechargeGroupId.value)
     alert(`已启动充值任务，请在 Dashboard 查看进度`)
   } catch (e) {
     alert('充值请求失败: ' + e.message)

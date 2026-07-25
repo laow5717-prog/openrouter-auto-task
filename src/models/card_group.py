@@ -7,7 +7,9 @@ class CardGroupModel:
     def __init__(self, db):
         self.db = db
 
-    def create(self, name, group_type='bind', description=''):
+    def create(self, name, group_type='payment', description=''):
+        # opencode 充值不再区分分组类型，所有分组统一为支付卡（'payment'）。
+        # 保留 type 字段仅为兼容旧数据与表结构。
         cursor = self.db.execute(
             "INSERT INTO card_groups (name, type, description) VALUES (?, ?, ?)",
             (name, group_type, description),

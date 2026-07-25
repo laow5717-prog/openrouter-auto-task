@@ -2,9 +2,7 @@
   <!-- 说明区 -->
   <div class="info-banner">
     <strong>卡片分组说明：</strong>
-    <span class="info-tag bind">绑定卡</span> 用于注册账号后绑定信用卡到 OpenRouter 账号，
-    <span class="info-tag payment">在线支付卡</span> 用于通过账单记录的 PDF 跳转在线支付页面时使用。
-    每天可上传多批卡片数据作为底料，同一分组内按卡号自动去重。
+    可按需创建多个分组管理支付卡。每天可上传多批卡片数据作为底料，同一分组内按卡号自动去重。
   </div>
 
   <!-- 统计 -->
@@ -12,14 +10,6 @@
     <div class="stat-card">
       <div class="stat-label">分组总数</div>
       <div class="stat-value">{{ groups.length }}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">绑定卡分组</div>
-      <div class="stat-value blue">{{ groups.filter(g => g.type === 'bind').length }}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">支付卡分组</div>
-      <div class="stat-value green">{{ groups.filter(g => g.type === 'payment').length }}</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">有效卡</div>
@@ -44,9 +34,8 @@
     </div>
 
     <div v-else class="group-grid">
-      <div v-for="g in groups" :key="g.id" class="group-card" :class="g.type" @click="selectGroup(g)">
+      <div v-for="g in groups" :key="g.id" class="group-card payment" @click="selectGroup(g)">
         <div class="group-card-header">
-          <span class="group-type-tag" :class="g.type">{{ g.type === 'bind' ? '绑定卡' : '支付卡' }}</span>
           <div class="group-actions">
             <button class="mini-btn" @click.stop="editGroup(g)">编辑</button>
             <button class="mini-btn danger" @click.stop="deleteGroup(g)">删除</button>
@@ -65,7 +54,6 @@
       <div class="panel-title">
         <span>&#128179;</span>
         {{ selectedGroup.name }}
-        <span class="group-type-tag small" :class="selectedGroup.type">{{ selectedGroup.type === 'bind' ? '绑定卡' : '支付卡' }}</span>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
         <input type="file" ref="fileInput" accept=".xlsx,.xls" style="font-size:12px;max-width:200px">
@@ -158,13 +146,6 @@
       <label class="form-label">分组名称</label>
       <input v-model="groupModal.name" class="ctrl-input" placeholder="如：日常绑定卡、支付专用卡">
     </div>
-    <div v-if="!groupModal.editing" class="form-group">
-      <label class="form-label">分组类型</label>
-      <select v-model="groupModal.type" class="ctrl-input">
-        <option value="bind">绑定卡 - 用于注册后绑卡到 CF 账号</option>
-        <option value="payment">在线支付卡 - 用于 PDF 在线支付</option>
-      </select>
-    </div>
     <div class="form-group">
       <label class="form-label">备注说明（可选）</label>
       <input v-model="groupModal.description" class="ctrl-input" placeholder="备注信息">
@@ -184,7 +165,6 @@
         <label v-for="g in groups" :key="g.id" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer">
           <input type="checkbox" :value="g.id" v-model="mergeModal.sourceIds">
           <span>{{ g.name }}</span>
-          <span class="group-type-tag small" :class="g.type">{{ g.type === 'bind' ? '绑定卡' : '支付卡' }}</span>
           <span style="color:var(--text-sub);font-size:12px">{{ g.card_count }} 张</span>
         </label>
       </div>
@@ -192,13 +172,6 @@
     <div class="form-group">
       <label class="form-label">新分组名称</label>
       <input v-model="mergeModal.name" class="ctrl-input" placeholder="如：7-15汇总可用卡">
-    </div>
-    <div class="form-group">
-      <label class="form-label">新分组类型</label>
-      <select v-model="mergeModal.type" class="ctrl-input">
-        <option value="bind">绑定卡</option>
-        <option value="payment">支付卡</option>
-      </select>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
       <button class="btn" style="width:auto;padding:8px 20px" @click="mergeModal.visible = false">取消</button>
@@ -213,7 +186,7 @@
       <select v-model="moveModal.targetId" class="ctrl-input">
         <option :value="null">请选择目标分组</option>
         <option v-for="g in moveTargets" :key="g.id" :value="g.id">
-          {{ g.name }}（{{ g.type === 'bind' ? '绑定卡' : '支付卡' }}，{{ g.card_count }} 张）
+          {{ g.name }}（{{ g.card_count }} 张）
         </option>
       </select>
     </div>
@@ -398,14 +371,14 @@ const poolBucket = ref('')  // ''=全部 / valid / unverified / invalid
 const poolBuckets = reactive({ total: 0, invalid: 0, valid: 0, unverified: 0 })
 
 // 归纳合并弹窗
-const mergeModal = reactive({ visible: false, sourceIds: [], name: '', type: 'bind' })
+const mergeModal = reactive({ visible: false, sourceIds: [], name: '', type: 'payment' })
 
 // 移动到分组弹窗
 const moveModal = reactive({ visible: false, targetId: null, bucket: 'unverified', limit: 100, busy: false })
 const moveTargets = computed(() => groups.value.filter(g => g.id !== selectedGroup.value?.id))
 
 // Group modal
-const groupModal = reactive({ visible: false, editing: false, id: null, name: '', type: 'bind', description: '' })
+const groupModal = reactive({ visible: false, editing: false, id: null, name: '', type: 'payment', description: '' })
 
 // Valid cards
 const validModal = reactive({ visible: false })
@@ -493,7 +466,7 @@ async function handleDeleteInvalid() {
 function showMerge() {
   mergeModal.sourceIds = []
   mergeModal.name = ''
-  mergeModal.type = 'bind'
+  mergeModal.type = 'payment'
   mergeModal.visible = true
 }
 
@@ -501,10 +474,10 @@ async function doMerge() {
   if (!mergeModal.sourceIds.length) { alert('请至少选择一个源分组'); return }
   if (!mergeModal.name.trim()) { alert('请输入新分组名称'); return }
   try {
-    const r = await mergeCardPools({
+      const r = await mergeCardPools({
       source_group_ids: mergeModal.sourceIds,
       name: mergeModal.name.trim(),
-      type: mergeModal.type,
+      type: 'payment',
     })
     alert(`已合并：移入 ${r.moved} 张，去重 ${r.deduped} 张 → 新分组已创建`)
     mergeModal.visible = false
@@ -544,7 +517,7 @@ function showCreateGroup() {
   groupModal.editing = false
   groupModal.id = null
   groupModal.name = ''
-  groupModal.type = 'bind'
+  groupModal.type = 'payment'
   groupModal.description = ''
   groupModal.visible = true
 }
@@ -553,7 +526,7 @@ function editGroup(g) {
   groupModal.editing = true
   groupModal.id = g.id
   groupModal.name = g.name
-  groupModal.type = g.type
+  groupModal.type = 'payment'
   groupModal.description = g.description || ''
   groupModal.visible = true
 }
@@ -564,7 +537,7 @@ async function saveGroup() {
     if (groupModal.editing) {
       await updateCardGroup(groupModal.id, { name: groupModal.name, description: groupModal.description })
     } else {
-      await createCardGroup({ name: groupModal.name, type: groupModal.type, description: groupModal.description })
+      await createCardGroup({ name: groupModal.name, type: 'payment', description: groupModal.description })
     }
     groupModal.visible = false
     await loadGroups()
@@ -670,16 +643,6 @@ onMounted(() => {
   color: #1e40af;
   line-height: 1.6;
 }
-.info-tag {
-  display: inline-block;
-  padding: 1px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 600;
-}
-.info-tag.bind { background: #dbeafe; color: #1e40af; }
-.info-tag.payment { background: #dcfce7; color: #166534; }
-
 .group-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -694,23 +657,11 @@ onMounted(() => {
   transition: all 0.15s;
 }
 .group-card:hover { border-color: var(--primary); box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-.group-card.bind { border-left: 3px solid #3b82f6; }
 .group-card.payment { border-left: 3px solid #22c55e; }
-.group-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.group-card-header { display: flex; justify-content: flex-end; align-items: center; margin-bottom: 8px; }
 .group-card-name { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
 .group-card-count { font-size: 13px; color: var(--text-sub); }
 .group-card-desc { font-size: 12px; color: #999; margin-top: 6px; }
-
-.group-type-tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 11px;
-  font-weight: 600;
-}
-.group-type-tag.bind { background: #dbeafe; color: #1e40af; }
-.group-type-tag.payment { background: #dcfce7; color: #166534; }
-.group-type-tag.small { font-size: 10px; padding: 1px 6px; margin-left: 6px; }
 
 .group-actions { display: flex; gap: 4px; }
 .mini-btn {

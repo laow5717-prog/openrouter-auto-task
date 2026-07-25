@@ -73,6 +73,18 @@ class RechargeLogModel:
         )
         return set(r['card_display'] for r in rows)
 
+    def all_success_card_numbers(self):
+        """全局「曾成功付款过」的完整卡号集合（用于选卡时区分新卡/好卡）。
+
+        card_display 写入为完整卡号（见 recharge_account._log_card_attempt），去空格后取用；
+        历史脱敏串（'•••• 1234'）无法还原完整号，天然落在集合外，不影响「新卡优先」判断。
+        """
+        rows = self.db.fetchall(
+            "SELECT DISTINCT replace(card_display,' ','') AS num FROM recharge_logs "
+            "WHERE status='success' AND card_display IS NOT NULL AND card_display != ''"
+        )
+        return {r['num'] for r in rows if r['num']}
+
     def success_count_since(self, card_number, hours=24):
         """该卡号在最近 hours 小时内的成功支付次数（R2 次数/冷却判定）。"""
         if not card_number:

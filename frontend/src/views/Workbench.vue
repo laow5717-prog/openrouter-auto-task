@@ -3,8 +3,8 @@
   <div class="info-banner">
     <Icon name="bolt" size="16" />
     <span>
-      <strong>每日一键流水线：</strong>
-      {{ modeHint }}
+      <strong>每日充值任务：</strong>
+      选定一个卡池分组，用账号列表逐账号轮转充值（一个账号充成一张即换下一个账号）。新卡优先、成功的好卡可复用；坏卡首拒判无效、好卡再拒进 24h 冷却，直到无可选卡为止。逐卡记录卡片状态与原因，并写入充值记录。
     </span>
   </div>
 
@@ -20,48 +20,22 @@
     <div style="padding:16px">
       <div class="settings-row">
         <div class="setting-item">
-          <label class="setting-label">运行模式</label>
-          <div class="mode-tabs">
-            <button v-for="m in MODES" :key="m.value" type="button"
-                    class="mode-tab" :class="{ active: settings.dailyMode === m.value }"
-                    :disabled="appStore.isRunning" :title="m.hint"
-                    @click="settings.dailyMode = m.value">
-              {{ m.label }}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div class="settings-row">
-        <div class="setting-item" v-if="needsBindGroup">
-          <label class="setting-label">绑卡分组（必选）</label>
-          <select v-model="settings.dailyBindGroupId" class="ctrl-input" :disabled="appStore.isRunning">
-            <option value="">选择绑定卡分组...</option>
-            <option v-for="g in bindGroups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.card_count }}张)</option>
-          </select>
-        </div>
-        <div class="setting-item" v-if="needsRecharge">
-          <label class="setting-label">支付卡分组（可选，用于处理欠费发票）</label>
-          <select v-model="settings.dailyPaymentGroupId" class="ctrl-input" :disabled="appStore.isRunning">
-            <option value="">不使用（仅 Top-up Credits）</option>
-            <option v-for="g in paymentGroups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.card_count }}张)</option>
+          <label class="setting-label">卡池分组（必选）</label>
+          <select v-model="settings.dailyGroupId" class="ctrl-input" :disabled="appStore.isRunning">
+            <option value="">选择卡池分组...</option>
+            <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.card_count }}张)</option>
           </select>
         </div>
       </div>
 
       <div class="settings-row">
         <div class="setting-item">
-          <label class="setting-label">OpenRouter 统一密码</label>
+          <label class="setting-label">登录密码（可选，覆盖账号自身密码）</label>
           <input type="text" v-model="settings.loginPassword" class="ctrl-input"
-                 placeholder="留空则新号随机生成" :disabled="appStore.isRunning">
+                 placeholder="留空则用各账号已保存的密码" :disabled="appStore.isRunning">
         </div>
-        <div class="setting-item" v-if="needsBindGroup">
-          <label class="setting-label">每账号最多绑卡数</label>
-          <input type="number" min="1" max="5" v-model.number="settings.maxBindableCards"
-                 class="ctrl-input" :disabled="appStore.isRunning">
-        </div>
-        <div class="setting-item" v-if="needsBindGroup">
-          <label class="setting-label">2Captcha API Key</label>
+        <div class="setting-item">
+          <label class="setting-label">2Captcha API Key（可选）</label>
           <input type="text" v-model="settings.captchaApiKey" class="ctrl-input"
                  placeholder="用于自动解决人机验证" :disabled="appStore.isRunning">
         </div>
@@ -69,7 +43,7 @@
 
       <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
         <button v-if="!appStore.isRunning" class="btn btn-primary" style="width:auto;padding:8px 24px"
-                :disabled="needsBindGroup && !settings.dailyBindGroupId" @click="handleStart">
+                :disabled="!settings.dailyGroupId" @click="handleStart">
           <Icon name="play" size="15" /> 开始运行
         </button>
         <button v-else class="btn btn-danger" style="width:auto;padding:8px 24px" @click="handleStop">
@@ -140,26 +114,9 @@ import Icon from '../components/Icon.vue'
 const appStore = useAppStore()
 const settings = useSettingsStore()
 
-const bindGroups = ref([])
-const paymentGroups = ref([])
+const groups = ref([])
 const logContainer = ref(null)
 const videoFeedUrl = '/video_feed'
-
-// 与后端 /api/daily/start 的 mode 取值一一对应
-const MODES = [
-  { value: 'full', label: '绑卡 + 充值',
-    hint: '按「补绑已有账号 → 注册新号 → 批量充值」串行执行。绑卡分组的可用卡先用于给未绑满的老账号补绑，剩余卡注册新号绑定；随后对已绑卡的账号统一充值。' },
-  { value: 'bind_only', label: '仅绑卡',
-    hint: '只跑补绑与注册新号两段，跑完即结束，不执行任何充值。适合先囤号、之后再统一充。' },
-  { value: 'recharge_only', label: '仅充值',
-    hint: '跳过卡池准备与全部绑卡动作，直接对已有账号执行充值。候选口径：已设置登录密码且已成功绑卡 ≥1 张的账号。' },
-]
-
-const needsBindGroup = computed(() => settings.dailyMode !== 'recharge_only')
-const needsRecharge = computed(() => settings.dailyMode !== 'bind_only')
-const modeHint = computed(
-  () => MODES.find((m) => m.value === settings.dailyMode)?.hint || ''
-)
 
 // 只有真正多开 worker 时才切分栏布局，串行时保持原有的双栏视觉
 const isParallel = computed(() => appStore.workers.length > 1)
@@ -184,42 +141,30 @@ watch(
 
 async function loadGroups() {
   try {
-    bindGroups.value = await getCardGroups({ type: 'bind' })
-    paymentGroups.value = await getCardGroups({ type: 'payment' })
+    groups.value = await getCardGroups()
     // 分组唯一项时默认选中
-    if (!settings.dailyBindGroupId && bindGroups.value.length === 1) {
-      settings.dailyBindGroupId = bindGroups.value[0].id
-    }
-    if (!settings.dailyPaymentGroupId && paymentGroups.value.length === 1) {
-      settings.dailyPaymentGroupId = paymentGroups.value[0].id
+    if (!settings.dailyGroupId && groups.value.length === 1) {
+      settings.dailyGroupId = groups.value[0].id
     }
   } catch (e) { console.error(e) }
 }
 
 async function handleStart() {
   if (appStore.isRunning) { alert('任务已在运行中'); return }
-  if (needsBindGroup.value && !settings.dailyBindGroupId) { alert('请选择绑卡分组'); return }
+  if (!settings.dailyGroupId) { alert('请选择卡池分组'); return }
   appStore.clearLogs()
   settings.save()
 
-  const body = { mode: settings.dailyMode }
-  if (needsBindGroup.value) {
-    body.bind_group_id = settings.dailyBindGroupId
-    body.max_bindable_cards = settings.maxBindableCards || 2
-    if (settings.captchaApiKey) body.captcha_api_key = settings.captchaApiKey
-  }
-  if (needsRecharge.value && settings.dailyPaymentGroupId) {
-    body.payment_group_id = settings.dailyPaymentGroupId
-  }
+  const body = { group_id: settings.dailyGroupId }
   if (settings.loginPassword) body.login_password = settings.loginPassword
+  if (settings.captchaApiKey) body.captcha_api_key = settings.captchaApiKey
 
   try {
     const result = await startDailyPipeline(body)
     appStore.poll()
-    const label = MODES.find((m) => m.value === settings.dailyMode)?.label || settings.dailyMode
     alert(result.group_name
-      ? `已启动每日流水线 · ${label}（分组「${result.group_name}」可用卡 ${result.usable_cards} 张）`
-      : `已启动每日流水线 · ${label}`)
+      ? `已启动每日充值任务（分组「${result.group_name}」未消耗卡 ${result.usable_cards} 张 · 可用账号 ${result.accounts} 个）`
+      : '已启动每日充值任务')
   } catch (e) {
     alert('启动失败: ' + e.message)
   }
@@ -272,26 +217,6 @@ onMounted(loadGroups)
   margin-bottom: 4px;
   color: #555;
 }
-
-.mode-tabs {
-  display: inline-flex;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
-  overflow: hidden;
-}
-.mode-tab {
-  padding: 7px 18px;
-  font-size: 13px;
-  border: none;
-  border-left: 1px solid #e5e7eb;
-  background: #fff;
-  color: #4b5563;
-  cursor: pointer;
-}
-.mode-tab:first-child { border-left: none; }
-.mode-tab:hover:not(:disabled) { background: #f3f4f6; }
-.mode-tab.active { background: #2563eb; color: #fff; font-weight: 600; }
-.mode-tab:disabled { cursor: not-allowed; opacity: .6; }
 
 .btn-primary .icon, .btn-danger .icon { display: inline-block; vertical-align: -2px; margin-right: 4px; }
 

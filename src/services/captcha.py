@@ -32,6 +32,150 @@ def is_available():
     return _solver is not None
 
 
+# 在 hcaptcha 帧加载前劫持 window.hcaptcha.render，捕获其 callback。
+# Stripe 的 invisible enterprise hCaptcha 不读 h-captcha-response textarea，只认
+# hcaptcha.render({callback}) 里那个 callback（解出后由它 postMessage 交付给结账页）。
+# 捕获后，2captcha 出 token 时主动调 callback(token) 即完成交付。
+_HCAPTCHA_HOOK_JS = r"""
+(() => {
+  if (window.__hcapHookInstalled) return;
+  window.__hcapHookInstalled = true;
+  var H = window.__hcapHook = { callbacks: [], resolvers: [], widgetIds: [],
+      setterFired: 0, renderCalls: 0, executeCalls: 0, getResponseCalls: 0,
+      renderParamKeys: [], token: null, redefendCount: 0 };
+
+  function deliver(cb, token) { try { cb(token); return true; } catch(e){ return false; } }
+
+  function wrap(hc) {
+    if (!hc || hc.__hooked) return hc;
+    try {
+      // 包装 render：捕获 callback（可能是函数或全局函数名）与 widget id。
+      var origRender = hc.render;
+      if (typeof origRender === 'function') {
+        hc.render = function(container, params) {
+          var wid;
+          try {
+            H.renderCalls++;
+            if (params) {
+              H.renderParamKeys.push(Object.keys(params).join(','));
+              if (typeof params.callback === 'function') H.callbacks.push(params.callback);
+              else if (typeof params.callback === 'string' && typeof window[params.callback] === 'function')
+                H.callbacks.push(window[params.callback]);
+            }
+          } catch(e){}
+          try { wid = origRender.apply(this, arguments); if (wid != null) H.widgetIds.push(wid); return wid; }
+          catch(e){ return wid; }
+        };
+      }
+      // 包装 execute：Stripe invisible hCaptcha 的核心投递口。无论 async 与否都拦成
+      // 我们可控的 Promise——存下 resolver，等 2captcha token 到手再 resolve；同时把
+      // 已捕获的 render callback 也留作后备通道。不调用原始 execute（避免真实挑战弹窗）。
+      var origExecute = hc.execute;
+      if (typeof origExecute === 'function') {
+        hc.execute = function(id, opts) {
+          try {
+            H.executeCalls++;
+            if (id != null && typeof id !== 'object') H.widgetIds.push(id);
+            var p = new Promise(function(resolve){
+              // enterprise execute({async:true}) resolve 形状为 {response, key}；
+              // key 是 widget/sitekey 而非 token，这里回填我们记到的 widget id。
+              H.resolvers.push(function(token){
+                resolve({ response: token, key: (H.widgetIds[0] != null ? H.widgetIds[0] : id) });
+              });
+            });
+            // 若已经拿到 token（execute 晚于注入），立刻兑现
+            if (H.token) { H.resolvers.forEach(function(r){ r(H.token); }); }
+            return p;
+          } catch(e){}
+          return origExecute.apply(this, arguments);
+        };
+      }
+      // 包装 getResponse：callback 之后常被调来复核 token，返回我们注入的 token。
+      var origGetResponse = hc.getResponse;
+      hc.getResponse = function(id) {
+        H.getResponseCalls++;
+        if (H.token) return H.token;
+        try { return origGetResponse ? origGetResponse.apply(this, arguments) : ''; } catch(e){ return ''; }
+      };
+      if (typeof hc.getRespKey === 'function') {
+        var origRespKey = hc.getRespKey;
+        hc.getRespKey = function(id) {
+          if (H.widgetIds[0] != null) return H.widgetIds[0];
+          try { return origRespKey.apply(this, arguments); } catch(e){ return ''; }
+        };
+      }
+      hc.__hooked = true;
+    } catch(e){}
+    return hc;
+  }
+
+  // 交付：把 token 灌给本帧捕获的所有通道。inject 侧会在每个 frame 调用它。
+  H.deliverToken = function(token) {
+    H.token = token;
+    var n = 0;
+    (H.callbacks || []).forEach(function(cb){ if (deliver(cb, token)) n++; });
+    (H.resolvers || []).forEach(function(rz){ try { rz(token); n++; } catch(e){} });
+    return n;
+  };
+
+  try {
+    var _hc = window.hcaptcha;
+    if (_hc) wrap(_hc);
+    // 用 configurable:true 定义 accessor。hCaptcha api.js 之后若用自己的 defineProperty
+    // 覆盖会绕过我们，故 get 里对新对象兜底 wrap，set 里也 wrap。
+    Object.defineProperty(window, 'hcaptcha', {
+      configurable: true,
+      get: function(){ return _hc && !_hc.__hooked ? (_hc = wrap(_hc)) : _hc; },
+      set: function(v){ H.setterFired++; _hc = wrap(v); }
+    });
+  } catch(e){}
+})();
+"""
+
+
+def install_hcaptcha_hook(driver):
+    """在 context 层装 hcaptcha callback 劫持（须在导航到含 hCaptcha 的页面之前调）。
+
+    ⚠️ Patchright（反检测魔改 Playwright）为隐身会**静默禁用** add_init_script（底层
+    CDP addScriptToEvaluateOnNewDocument 是自动化检测重点特征）。实测该 hook 在任何帧
+    （含顶层）都不生效（见 07-25 帧探测：全帧 hookInstalled=false）。故真正生效的安装靠
+    reinstall_hcaptcha_hook() 在提交前逐帧 evaluate。这里保留 add_init_script 仅作无害兜底。
+    """
+    try:
+        driver.context.add_init_script(_HCAPTCHA_HOOK_JS)
+        print("  hCaptcha callback hook 已安装（add_init_script，Patchright 下可能被忽略）")
+        return True
+    except Exception as e:
+        print(f"  安装 hCaptcha hook 失败: {str(e)[:100]}")
+        return False
+
+
+def reinstall_hcaptcha_hook(driver):
+    """逐帧 evaluate 注入 hcaptcha hook——绕开 Patchright 下失效的 add_init_script。
+
+    必须在**点击提交/触发 hcaptcha.execute() 之前**调用：hCaptcha invisible 的 render 在
+    页面加载时已发生（render callback 会漏捕），但 execute() 在提交时才触发；只要在提交前把
+    execute 包装装到承载 window.hcaptcha 的帧（Stripe 的 b.stripecdn HCaptchaInvisible.html）上，
+    就能把 execute 拦成可控 Promise，等 2captcha token 到手再 resolve 交付。
+
+    幂等：hook 自身有 __hcapHookInstalled 守卫，重复注入无副作用。返回成功注入的帧数。
+    """
+    installed = 0
+    try:
+        for fr in driver.page.frames:
+            try:
+                fr.evaluate(_HCAPTCHA_HOOK_JS)
+                ok = fr.evaluate("() => !!window.__hcapHookInstalled")
+                if ok:
+                    installed += 1
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"  逐帧注入 hcaptcha hook 失败: {str(e)[:100]}")
+    print(f"  hCaptcha hook 逐帧注入完成：{installed} 帧")
+    return installed
+
+
 def solve_turnstile(driver, max_retries=2):
     if not is_available():
         print("  2Captcha solver not initialized")
@@ -411,78 +555,95 @@ def _find_hcaptcha_sitekey_in_dom_tree(node):
     return None
 
 
-def _inject_hcaptcha_token(driver, token, sitekey):
-    try:
-        injected = driver.page.evaluate("""(token) => {
-            var success = false;
+_HCAPTCHA_INJECT_JS = r"""(token) => {
+    var out = {hookCbs: 0, textareas: 0, setResponse: 0, callbacks: 0};
 
-            // 1. 填充所有 hCaptcha response textarea
-            var textareas = document.querySelectorAll(
-                'textarea[name="h-captcha-response"], ' +
-                'textarea[name="g-recaptcha-response"], ' +
-                'textarea[id*="h-captcha-response"], ' +
-                'textarea[id*="g-recaptcha-response"]'
-            );
-            for (var i = 0; i < textareas.length; i++) {
-                textareas[i].innerHTML = token;
-                textareas[i].value = token;
-                success = true;
+    // 0. 优先：把 token 交给被 hook 捕获的交付通道（Stripe invisible hCaptcha 唯一有效）。
+    //    a) render 的 callback；b) execute() 返回的可控 Promise 的 resolver；
+    //    c) 存入 H.token，让此后的 getResponse()/晚到的 execute() 也能拿到。
+    try {
+        var h = window.__hcapHook;
+        if (h) {
+            out.hookDiag = {sf: h.setterFired, rc: h.renderCalls, ec: h.executeCalls,
+                            gr: h.getResponseCalls, cbs: (h.callbacks||[]).length,
+                            rs: (h.resolvers||[]).length, wids: (h.widgetIds||[]).length,
+                            keys: h.renderParamKeys};
+            if (typeof h.deliverToken === 'function') {
+                out.hookCbs += h.deliverToken(token);
+            } else {
+                h.token = token;
+                (h.callbacks || []).forEach(function(cb){ try { cb(token); out.hookCbs++; } catch(e){} });
+                (h.resolvers || []).forEach(function(rz){ try { rz(token); out.hookCbs++; } catch(e){} });
             }
+        }
+    } catch(e){}
 
-            // 2. 通过 hcaptcha API 设置 response
-            try {
-                if (window.hcaptcha) {
-                    // 尝试 setResponse 方法
-                    var containers = document.querySelectorAll('.h-captcha, [data-hcaptcha-widget-id]');
-                    containers.forEach(function(c) {
-                        try {
-                            var widgetId = c.getAttribute('data-hcaptcha-widget-id');
-                            if (widgetId) { hcaptcha.setResponse(widgetId, token); success = true; }
-                        } catch(e) {}
-                    });
-                    // 如果没找到 widgetId，尝试用 getWidgetID 获取
-                    if (!success) {
-                        try {
-                            var ids = hcaptcha.getAllIds ? hcaptcha.getAllIds() : [];
-                            for (var i = 0; i < ids.length; i++) {
-                                hcaptcha.setResponse(ids[i], token);
-                                success = true;
-                            }
-                        } catch(e) {}
-                    }
-                }
-            } catch(e) {}
+    // 1. 填充所有 hCaptcha/reCAPTCHA response textarea（native setter + 事件，
+    //    让受控组件/监听者看见变更）
+    var tas = document.querySelectorAll(
+        'textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"], ' +
+        'textarea[id*="h-captcha-response"], textarea[id*="g-recaptcha-response"]');
+    var setter = null;
+    try { setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set; } catch(e) {}
+    for (var i = 0; i < tas.length; i++) {
+        try { if (setter) setter.call(tas[i], token); else tas[i].value = token; } catch(e) { tas[i].value = token; }
+        try { tas[i].innerHTML = token; } catch(e) {}
+        try { tas[i].dispatchEvent(new Event('input', {bubbles: true})); } catch(e) {}
+        try { tas[i].dispatchEvent(new Event('change', {bubbles: true})); } catch(e) {}
+        out.textareas++;
+    }
 
-            // 3. 触发回调事件
-            try { document.dispatchEvent(new CustomEvent('hcaptcha-solved', {detail: {token: token}})); } catch(e) {}
-            try {
-                // 触发 input/change 事件
-                var event = new Event('input', { bubbles: true });
-                var changeEvent = new Event('change', { bubbles: true });
-                textareas.forEach(function(ta) {
-                    ta.dispatchEvent(event);
-                    ta.dispatchEvent(changeEvent);
-                });
-            } catch(e) {}
+    // 2. window.hcaptcha.setResponse（按 widget id）
+    try {
+        if (window.hcaptcha) {
+            var ids = [];
+            try { ids = window.hcaptcha.getAllIds ? window.hcaptcha.getAllIds() : []; } catch(e) {}
+            document.querySelectorAll('[data-hcaptcha-widget-id]').forEach(function(c) {
+                var w = c.getAttribute('data-hcaptcha-widget-id'); if (w) ids.push(w);
+            });
+            for (var j = 0; j < ids.length; j++) {
+                try { window.hcaptcha.setResponse(ids[j], token); out.setResponse++; } catch(e) {}
+            }
+        }
+    } catch(e) {}
 
-            // 4. 尝试触发 hCaptcha 的原生回调 (onVerify/data-callback)
-            try {
-                var cbContainers = document.querySelectorAll('.h-captcha[data-callback], [data-hcaptcha-widget-id][data-callback]');
-                cbContainers.forEach(function(c) {
-                    var cbName = c.getAttribute('data-callback');
-                    if (cbName && typeof window[cbName] === 'function') {
-                        window[cbName](token);
-                        success = true;
-                    }
-                });
-            } catch(e) {}
+    // 3. data-callback 原生回调
+    try {
+        document.querySelectorAll('[data-callback]').forEach(function(c) {
+            var n = c.getAttribute('data-callback');
+            if (n && typeof window[n] === 'function') { try { window[n](token); out.callbacks++; } catch(e) {} }
+        });
+    } catch(e) {}
+    try { document.dispatchEvent(new CustomEvent('hcaptcha-solved', {detail: {token: token}})); } catch(e) {}
 
-            return success;
-        }""", token)
-        return injected
+    return out;
+}"""
+
+
+def _inject_hcaptcha_token(driver, token, sitekey):
+    """把 2Captcha 解出的 token 交付给页面。遍历所有 frame 注入。
+
+    关键：Stripe Checkout 的 enterprise/invisible hCaptcha，其 h-captcha-response textarea 与
+    hcaptcha 对象在跨域子 iframe（b.stripecdn.com/.../HCaptchaInvisible.html）里，顶层文档没有。
+    故必须逐帧 evaluate 注入，命中任一 frame 即算注入到位（见 07-25 task frame 诊断）。
+    """
+    any_set = False
+    try:
+        for fr in driver.page.frames:
+            try:
+                out = fr.evaluate(_HCAPTCHA_INJECT_JS, token)
+            except Exception:
+                continue
+            diag = out.get('hookDiag') if out else None
+            diag_active = diag and (diag.get('sf') or diag.get('rc') or diag.get('ec'))
+            if out and (out.get('hookCbs') or out.get('textareas') or out.get('setResponse')
+                        or out.get('callbacks') or diag_active):
+                print(f"  hCaptcha token 注入 frame {(fr.url or '')[:55]}: {out}")
+                if out.get('hookCbs') or out.get('textareas') or out.get('setResponse') or out.get('callbacks'):
+                    any_set = True
     except Exception as e:
         print(f"  Inject hCaptcha token error: {e}")
-        return False
+    return any_set
 
 
 def _inject_turnstile_token(driver, token):
