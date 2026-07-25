@@ -72,22 +72,47 @@ def _click_continue_github(session):
 
 
 def _click_authorize_if_present(session):
-    """GitHub OAuth 授权页若有「Authorize」按钮则点（新号首次）。返回是否点了。
+    """GitHub OAuth/App 授权页若有「Authorize」按钮则点（新号首次）。返回是否点了。
 
-    GitHub 的 Authorize 按钮有防点击劫持延迟（初始 disabled 数秒），Playwright 的 click
-    会等到可交互，timeout 给足。
+    GitHub 的 Authorize 按钮有**防点击劫持延迟**（初始 disabled 数秒，JS 定时器到点才启用）；
+    且文案随应用名变化（"Authorize opencode" / "Authorize and install" 等），是 <button
+    type=submit name=authorize value=1> 或 <input type=submit>。故**轮询等其可点再点**，
+    并按文案 + 选择器双重兜底，避免停在授权页不动。
     """
     if "github.com" not in _cur_url(session):
         return False
     page = session.page
-    for name in ("Authorize", "Authorize OpenCode Console"):
-        try:
-            btn = page.get_by_role("button", name=name)
-            if btn.count():
-                btn.first.click(timeout=12000)
-                return True
-        except Exception:
-            continue
+    names = ["Authorize", "Authorize and install", "Continue", "Install", "授权"]
+    selectors = [
+        'button[name="authorize"][value="1"]',
+        'form[action*="/authorize"] button[type="submit"]',
+        'button[type="submit"]',
+        'input[type="submit"]',
+    ]
+    deadline = time.time() + 25    # 覆盖防点击劫持延迟
+    while time.time() < deadline:
+        if "github.com" not in _cur_url(session):
+            return True            # 已离开授权页（可能已被别的点击推进）
+        for nm in names:
+            try:
+                btn = page.get_by_role("button", name=nm)
+                if btn.count() and btn.first.is_enabled():
+                    btn.first.click(timeout=5000)
+                    print(f"  [opencode] 已点授权按钮：{nm}", flush=True)
+                    return True
+            except Exception:
+                pass
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() and loc.first.is_enabled():
+                    loc.first.click(timeout=5000)
+                    print(f"  [opencode] 已点授权按钮（selector {sel}）", flush=True)
+                    return True
+            except Exception:
+                pass
+        time.sleep(1.5)
+    print("  [opencode] 授权按钮 25s 内未能点击（可能被 flag / 无按钮）", flush=True)
     return False
 
 
