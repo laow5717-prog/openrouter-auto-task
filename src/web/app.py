@@ -414,8 +414,12 @@ class AppState:
         return fresh + good
 
     def _recharge_one_account(self, email, login_password, payment_group_id=None,
-                              worker=None):
-        """为单个账号执行一次充值访问，返回 (result, err)，result ∈ {"success", "failed"}。
+                              worker=None, captcha_api_key=None,
+                              captcha_server="api.multibot.cloud"):
+        """为单个账号执行一次充值访问，返回 (result, err)，
+        result ∈ {"success", "failed", "archived"(余额≥$20 已归档、未扣款)}。
+
+        captcha_api_key/captcha_server 透传给 registration.recharge_account 用于自动解 hCaptcha。
 
         用 payment_group_id 指定分组的可选卡（_eligible_cards：新卡优先，再复用好卡；已排除
         无效/过期/冷却）逐张尝试，付成一张即 success。逐卡的卡状态标记（paid/invalid/冷却）
@@ -447,12 +451,20 @@ class AppState:
                 should_stop=lambda: self.stop_requested,
                 card_state_model=models['card_state'],
                 payment_registry=self.payment_registry,
+                captcha_api_key=captcha_api_key,
+                captcha_server=captcha_server,
             )
 
             if outcome == "topup":
                 self.set_action(worker, f"{email} 充值成功（卡 {card_last4}）")
                 self.add_log(f"{email} AI Credits 充值 $20 成功（卡 {card_last4}）")
                 return "success", ''
+
+            if outcome == "archived":
+                # 余额≥阈值已归档（未扣款）：既非成功也非失败，该账号退出后续轮转
+                self.set_action(worker, f"{email} 余额≥$20，已归档跳过")
+                self.add_log(f"{email} 余额≥$20，已归档跳过充值（{err}）")
+                return "archived", err or 'archived'
 
             # outcome == "failed"：逐卡的失效标记与记账已在 registration 内完成
             self.set_action(worker, f"{email} 本次未付成: {err}")
@@ -465,7 +477,8 @@ class AppState:
             self.add_log(f"充值异常: {e}")
             return "failed", str(e)
 
-    def run_daily_pipeline(self, group_id, login_password=None, captcha_api_key=None):
+    def run_daily_pipeline(self, group_id, login_password=None, captcha_api_key=None,
+                           captcha_server="api.multibot.cloud"):
         """每日充值任务：卡池驱动的账号轮转充值，串行跑在单个后台线程。
 
         选定一个卡池分组，用账号列表逐账号轮转充值：一个账号在其会话内充成 1 张卡后即轮转
@@ -476,6 +489,10 @@ class AppState:
         的坏卡被拒（判无效）、好卡被拒（24h 速率冷却）或过期，才退出可选集。逐卡的卡状态
         标记与 recharge_logs 记账在 recharge_account 内部完成；本方法只负责取可选卡、轮转
         账号、计数与收尾。
+
+        captcha_api_key/captcha_server 透传给充值流程用于自动解 hCaptcha（server 默认 Multibot）。
+        账号选取排除 banned 与 archived；登录后实时余额 ≥$20 的账号会被归档（status='archived'）
+        并退出后续轮转。
 
         login_password 可选，用于覆盖账号自身密码（一般留空，用各账号 accounts.login_password）。
         并发度固定为 1（串行）：WorkerPool 的 is_serial 分支走同线程，保留截图/停止集成。"""
@@ -492,6 +509,8 @@ class AppState:
 
         paid_total = 0            # 成功付款次数
         fail_total = 0            # 账号访问未付成次数
+        archived_total = 0        # 余额≥$20 归档跳过次数
+        done_emails = set()       # 本次运行已归档、退出后续轮转的账号
 
         # 并发度固定为 1（串行）。WorkerPool.is_serial 走同线程分支，行为与直接调用等价。
         pool = WorkerPool(self, 1)
@@ -506,7 +525,7 @@ class AppState:
             accounts = [
                 a for a in accts
                 if (login_password or a.get('login_password'))
-                and (a.get('status') or '') != 'banned'
+                and (a.get('status') or '') not in ('banned', 'archived')
             ]
             if not accounts:
                 self._hooked_print("无可充值账号（需有登录密码且未封禁），任务结束")
@@ -532,13 +551,16 @@ class AppState:
                     self._hooked_print("已无可选卡（全部无效/过期或冷却中），任务结束")
                     break
                 round_num += 1
-                round_stats = {'paid': 0, 'failed': 0}
+                round_stats = {'paid': 0, 'failed': 0, 'archived': 0}
                 self._hooked_print(f"\n{'=' * 50}\n充值轮次 {round_num}（当前可选卡 {remaining} 张）\n{'=' * 50}")
 
                 def _recharge_one(worker, acct):
                     """本轮推进单个账号一次访问。跑在 worker 线程内。"""
                     email = acct['email']
                     if self.stop_requested:
+                        return
+                    # 本次运行已归档的账号（余额≥$20）不再处理
+                    if email in done_emails:
                         return
                     # 可选卡已在别的账号访问中被耗尽则提前收手
                     if not self._eligible_cards(group_id):
@@ -554,11 +576,16 @@ class AppState:
                         self._hooked_print(f"\n充值账号: {email}")
                         result, err = self._recharge_one_account(
                             email, login_password or acct.get('login_password'),
-                            payment_group_id=group_id, worker=worker)
+                            payment_group_id=group_id, worker=worker,
+                            captcha_api_key=captcha_api_key, captcha_server=captcha_server)
                         with round_lock:
                             if result == "success":
                                 round_stats['paid'] += 1
                                 self.success_count += 1
+                            elif result == "archived":
+                                # 余额≥$20 归档：既非成功也非失败，退出该账号后续轮转
+                                round_stats['archived'] += 1
+                                done_emails.add(email)
                             else:
                                 round_stats['failed'] += 1
                                 self.fail_count += 1
@@ -573,20 +600,24 @@ class AppState:
                     finally:
                         self.account_registry.release(email)
 
-                # map 是 barrier：本轮所有账号都访问完才进入下一轮
-                pool.map(accounts, _recharge_one)
+                # map 是 barrier：本轮所有账号都访问完才进入下一轮。已归档账号本轮起排除，
+                # 避免对余额≥$20 的账号反复重开浏览器空跑。
+                pool.map([a for a in accounts if a['email'] not in done_emails], _recharge_one)
                 paid_total += round_stats['paid']
                 fail_total += round_stats['failed']
+                archived_total += round_stats['archived']
 
-                # 进展 = 本轮有成功付款，或可选卡数减少（坏卡判无效 / 好卡进冷却 / 过期）。
-                # 只要还有进展就继续轮转；整轮零成功且可选卡数没减少（全部账号 login 失败 /
-                # hCaptcha 拦截等，一张卡都没定案）才兜底结束防死循环，需人工介入。
+                # 进展 = 本轮有成功付款，或可选卡数减少（坏卡判无效 / 好卡进冷却 / 过期），
+                # 或有账号被归档（退出轮转、账号集在收敛）。只要还有进展就继续轮转；整轮零成功、
+                # 无卡定案、也无归档（全部账号 login 失败 / hCaptcha 拦截等）才兜底结束防死循环。
                 # 说明：好卡持续成功时可选卡数不减、但计为进展，会一直复用直到好卡被风控
-                # 陆续冷却而收敛；MAX_ROUNDS 是极端不收敛下的最终兜底。
+                # 陆续冷却而收敛；归档账号已进 done_emails 下轮不再处理，故不会无限循环；
+                # MAX_ROUNDS 是极端不收敛下的最终兜底。
                 after = len(self._eligible_cards(group_id))
-                progressed = round_stats['paid'] > 0 or after < remaining
+                progressed = (round_stats['paid'] > 0 or after < remaining
+                              or round_stats['archived'] > 0)
                 if not progressed and not self.stop_requested:
-                    self._hooked_print("整轮无成功付款且无卡被消耗/冷却，结束任务（兜底防死循环）")
+                    self._hooked_print("整轮无成功付款且无卡被消耗/冷却/归档，结束任务（兜底防死循环）")
                     break
 
         except Exception as e:
@@ -609,7 +640,7 @@ class AppState:
                 remaining = '?'
             self.current_action = (
                 f"每日充值任务完成（成功付款 {paid_total} 次 / "
-                f"未付成 {fail_total} 次 / 剩余可选卡 {remaining} 张）"
+                f"未付成 {fail_total} 次 / 归档跳过 {archived_total} 个 / 剩余可选卡 {remaining} 张）"
             )
             self._hooked_print(f"\n{'#' * 50}")
             self._hooked_print(self.current_action)

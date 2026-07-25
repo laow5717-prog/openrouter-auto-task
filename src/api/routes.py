@@ -346,6 +346,9 @@ def recharge_account():
     data = request.json or {}
     email = data.get('email', '')
     payment_group_id = data.get('payment_group_id')
+    captcha_api_key = data.get('captcha_api_key')
+    # 充值默认用 Multibot 解支付页 hCaptcha；可传 captcha_server='2captcha.com' 切回
+    captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
     if not email:
         return jsonify({"error": "未指定账号"}), 400
 
@@ -376,7 +379,9 @@ def recharge_account():
 
     def _do_recharge():
         try:
-            state._recharge_one_account(email, login_password, payment_group_id)
+            state._recharge_one_account(email, login_password, payment_group_id,
+                                        captcha_api_key=captcha_api_key,
+                                        captcha_server=captcha_server)
         except InterruptedError:
             state.add_log("充值已中断")
         except Exception as e:
@@ -958,8 +963,10 @@ def start_daily_pipeline():
 
     login_password = data.get('login_password') or None
     captcha_api_key = data.get('captcha_api_key')
+    # 充值默认用 Multibot 解支付页 hCaptcha；可传 captcha_server='2captcha.com' 切回
+    captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
 
-    # 启动门：分组要有可选卡（排除无效/过期/冷却），且要有可充值账号（有登录密码且未封禁）
+    # 启动门：分组要有可选卡（排除无效/过期/冷却），且要有可充值账号（有登录密码、未封禁、未归档）
     eligible = len(state._eligible_cards(group_id))
     if not eligible:
         return jsonify({"error": "该分组无可选卡（全部无效/过期或冷却中），无事可做"}), 400
@@ -967,15 +974,16 @@ def start_daily_pipeline():
     accts = models['account'].get_all(order_desc=False)
     account_count = sum(
         1 for a in accts
-        if (login_password or a.get('login_password')) and (a.get('status') or '') != 'banned'
+        if (login_password or a.get('login_password'))
+        and (a.get('status') or '') not in ('banned', 'archived')
     )
     if account_count == 0:
-        return jsonify({"error": "无可充值账号（需有登录密码且未封禁），无事可做"}), 400
+        return jsonify({"error": "无可充值账号（需有登录密码、未封禁、未归档），无事可做"}), 400
 
     import threading
     threading.Thread(
         target=state.run_daily_pipeline,
-        args=(group_id, login_password, captcha_api_key),
+        args=(group_id, login_password, captcha_api_key, captcha_server),
         daemon=True,
     ).start()
 

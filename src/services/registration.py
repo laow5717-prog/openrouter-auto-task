@@ -18,6 +18,16 @@ _NOT_IMPLEMENTED = (
 )
 
 
+def _recharge_skip_balance():
+    """充值跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并把账号归档。
+    默认 20，可用环境变量 OPENCODE_RECHARGE_SKIP_BALANCE 覆盖。"""
+    import os
+    try:
+        return float(os.environ.get("OPENCODE_RECHARGE_SKIP_BALANCE", "20"))
+    except ValueError:
+        return 20.0
+
+
 def register_one_account(db, account_model, card_info_list=None, login_password=None,
                          monitor_callback=None, max_bindable_cards=2, captcha_api_key=None):
     """注册单个账号并添加信用卡。
@@ -54,22 +64,35 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
                      should_stop=None, card_binding_model=None, card_state_model=None,
-                     payment_registry=None):
+                     payment_registry=None, captcha_api_key=None,
+                     captcha_server="api.multibot.cloud"):
     """登录 opencode 账号并在 zen 控制台 Stripe Checkout 充值（美元，$20 credits）。
 
-    编排：create_driver(profile_id=email) → 确保 opencode 登录 → 从 payment_cards 逐张
-    尝试 Stripe 付款，付成一张即返回（该账号本次访问消耗到 1 张成功卡）。沿途把明确拒付
-    的卡标为 invalid、逐卡写 recharge_logs（成功/失败+原因）。3DS 记冷却、hCaptcha 停手
-    —— 二者均不算「消耗」、不写卡消耗日志。浏览器操作见 browser/opencode_billing。
+    编排：create_driver_vanilla(profile_id=email)（原生 Playwright 栈，hCaptcha token 注入
+    仅在原生栈生效；与 create_driver 复用同一 profile 目录，登录态不丢）→ 装 hCaptcha hook →
+    确保 opencode 登录 → 登录后读实时余额，≥ RECHARGE_SKIP_BALANCE（默认 $20）则跳过充值并
+    把账号归档（status='archived'）→ 否则从 payment_cards 逐张尝试 Stripe 付款，付成一张即返回。
+    沿途把明确拒付的卡标为 invalid、逐卡写 recharge_logs（成功/失败+原因）。支付页遇 hCaptcha 时
+    用 multibot/2captcha 自动解（最多 3 次，见 opencode_billing.detect_payment_result）；3DS 记冷却。
+    浏览器操作见 browser/opencode_billing。
 
-    返回契约: (ok, err, responses, card_last4, outcome)，outcome ∈ {"topup"(成功), "failed"}。
+    captcha_api_key: 传入则 init_solver(key, server=captcha_server) 并装 hook 自动解 hCaptcha；
+                     不传则退化为旧行为（检测到 hCaptcha 提示人工、超时 needs_captcha）。
+    captcha_server:  求解服务域名，默认 Multibot（api.multibot.cloud）；可传 '2captcha.com'。
+
+    返回契约: (ok, err, responses, card_last4, outcome)，
+    outcome ∈ {"topup"(成功), "failed", "archived"(余额≥阈值已归档、未扣款)}。
 
     卡消耗与逐卡记账集中在本函数：成功→card_pool 标 paid + valid_card + recharge_logs
     success；明确拒付→card_pool 标 invalid + recharge_logs failed（带原因）。调用方无需
     再预建占位 log。payment_registry 传入时对每张卡做 in-flight 排他（并发安全网）。
     """
-    from src.browser.driver import create_driver, close_driver
+    from src.browser.driver import create_driver_vanilla, close_driver
     from src.browser import opencode_billing as ob
+    from src.services import captcha as captcha_solver
+
+    # 余额跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并归档账号。
+    skip_balance = _recharge_skip_balance()
 
     responses = []
 
@@ -107,13 +130,40 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
     session = None
     try:
-        session = create_driver(headless=False, profile_id=email)
+        # 原生 Playwright 栈：hCaptcha token 注入只在原生栈生效（Patchright 阉割了 add_init_script）；
+        # 与 create_driver 复用同一 profile 目录（data/profiles/<email>），登录态照常复用。
+        session = create_driver_vanilla(profile_id=email)
         if monitor_callback:
             monitor_callback(session, f"为 {email} 启动浏览器")
+
+        # 装 hCaptcha hook（须在导航到含 hCaptcha 的 Stripe 结账页之前）。未配 captcha_api_key
+        # 时不装、不解，充值行为与改造前一致（检测到 hCaptcha 提示人工、超时 needs_captcha）。
+        if captcha_api_key:
+            captcha_solver.init_solver(captcha_api_key, server=captcha_server)
+        if captcha_solver.is_available():
+            captcha_solver.install_hcaptcha_hook(session)
 
         wid, detail = ob.ensure_opencode_session(session, monitor_callback, login_password, email)
         if not wid:
             return (False, f"opencode 未登录：{detail}", responses, last4, "failed")
+
+        # R2 归档预检：登录后读实时余额，≥ 阈值即跳过充值并归档（不试任何卡、不扣款）。
+        # 以实时余额为准——DB 余额会随 credits 消耗过时，不可作归档依据。
+        try:
+            cur_bal = ob.read_current_balance(session, wid, monitor_callback)
+        except Exception:
+            cur_bal = None
+        if cur_bal is not None and cur_bal >= skip_balance:
+            if account_model:
+                try:
+                    account_model.update_status(email, "archived")
+                    account_model.update_balance(email, cur_bal)
+                except Exception:
+                    pass
+            if monitor_callback:
+                monitor_callback(session, f"{email} 余额 ${cur_bal} ≥ ${skip_balance}，跳过充值并归档")
+            return (False, f"余额 ${cur_bal} ≥ ${skip_balance}，跳过并归档",
+                    responses, last4, "archived")
 
         # 单次充值最多尝试的卡数上限：卡池可能上千张，若不设限，一批坏卡会在同一
         # workspace 上连续制造大量拒付，极易触发 Stripe/opencode 的反欺诈 velocity

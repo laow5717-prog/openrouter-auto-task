@@ -12,6 +12,8 @@ js.stripe.com iframe），可直接用 page 定位填充。
 import re
 import time
 
+from src.services import captcha as captcha_solver
+
 WORKSPACE_RE = re.compile(r'/workspace/(wrk_[A-Za-z0-9]+)')
 
 # 找美金币种块中心坐标（Stripe 币种区默认按 IP 显示 CN¥，需点美金块切换）
@@ -153,6 +155,22 @@ def _read_balance(session):
         return None
     m = _BAL_RE.search(body)
     return float(m.group(1)) if m else None
+
+
+def read_current_balance(session, wid, monitor=None):
+    """导航到 billing 页读当前 AI Credits 余额（美元），读不到返回 None。
+
+    供充值前「余额 ≥ 阈值即跳过并归档」预检使用：登录拿到 wid 后、进入试卡循环前调用一次，
+    以**实时余额**为准（DB 余额会随 credits 消耗过时，不可作归档依据）。
+    """
+    billing_url = f"https://opencode.ai/workspace/{wid}/billing"
+    try:
+        session.get(billing_url)
+        time.sleep(3)
+    except Exception:
+        return None
+    _step(monitor, session, "读取当前余额")
+    return _read_balance(session)
 
 
 def start_recharge(session, wid, amount, monitor):
@@ -657,6 +675,7 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
     saw_captcha = False
     saw_3ds = False
     overlay_baseline = 0
+    captcha_tries = 0
 
     def _balance_grew():
         if balance_before is None:
@@ -716,11 +735,9 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
                     return {"outcome": "failed", "detail": f"拒付/认证失败: {snippet[:120]}"}
             except Exception:
                 pass
-            # hCaptcha 人机验证挑战：点 Pay 后 Stripe 风控可能弹出，需人工点 Verify 才放行。
-            if _captcha_challenge_present(session) is not None and not saw_captcha:
-                saw_captcha = True
-                _step(monitor, session, "检测到 hCaptcha 人机验证，请在浏览器点 Verify 完成…")
-            # 3DS 交互挑战：等待其加载/完成，不立即失败。
+            # 3DS 优先：3DS 出现 = 人机验证已过（Stripe 先过 captcha 才进发卡行授权），故一旦
+            # 见过 3DS 就绝不回头解 hCaptcha——否则常驻 invisible hCaptcha 的 checkbox iframe
+            # （含「i am human」文案）会被反复误判。3DS 交互挑战等待加载/完成，不立即失败。
             if _threeds_challenge_present(session):
                 if not saw_3ds:
                     saw_3ds = True
@@ -728,11 +745,33 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
                     # （计数 0），不把随后正常渲染出的这一个误判为「新弹窗」。
                     overlay_baseline = max(_count_top_layer_overlays(session), 1)
                     _step(monitor, session, "检测到 3DS 交互挑战，等待其加载完成…")
-                else:
-                    # 挑战期间遮罩层数超过基线（冒出新弹窗）→ 认证失败
-                    if _count_top_layer_overlays(session) > overlay_baseline:
-                        _step(monitor, session, "3DS 期间出现新弹窗，判定认证失败，换下一张")
-                        return {"outcome": "failed", "detail": "3DS 出现新弹窗，认证失败"}
+                # 挑战期间遮罩层数超过基线（冒出新弹窗）→ 认证失败
+                elif _count_top_layer_overlays(session) > overlay_baseline:
+                    _step(monitor, session, "3DS 期间出现新弹窗，判定认证失败，换下一张")
+                    return {"outcome": "failed", "detail": "3DS 出现新弹窗，认证失败"}
+            # hCaptcha 人机验证：仅在尚未进入 3DS 阶段时才解。点 Pay 后 Stripe 风控可能弹出，
+            # 用 multibot/2captcha 自动解 token（最多 3 次，镜像订阅流程）；3 次仍未过提前返回
+            # needs_captcha（不空等，换下一张卡）。solver 不可用时回退旧行为——提示人工点 Verify。
+            elif not saw_3ds and _captcha_challenge_present(session) is not None:
+                if not saw_captcha:
+                    saw_captcha = True
+                    _step(monitor, session, "检测到 hCaptcha 人机验证")
+                if captcha_solver.is_available() and captcha_tries < 3:
+                    captcha_tries += 1
+                    _step(monitor, session, f"用 solver 自动解 hCaptcha（第 {captcha_tries} 次）…")
+                    try:
+                        if captcha_solver.solve_hcaptcha(session):
+                            _step(monitor, session, "hCaptcha token 已注入，等待支付结果…")
+                            time.sleep(4)
+                    except Exception as e:
+                        print(f"  hCaptcha 解题异常: {str(e)[:120]}", flush=True)
+                elif captcha_solver.is_available() and captcha_tries >= 3:
+                    # 解 3 次仍卡在 hCaptcha（token 被拒/账号级风控）——提前收手换下一张卡
+                    _step(monitor, session, "hCaptcha 解 3 次仍未过，提前收手（换下一张卡）")
+                    return {"outcome": "needs_captcha",
+                            "detail": "hCaptcha 解 3 次仍未通过（token 被拒/账号级风控）"}
+                elif not captcha_solver.is_available():
+                    _step(monitor, session, "未配置 solver，请在浏览器手动点 Verify 完成…")
 
         time.sleep(3)
 
