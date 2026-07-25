@@ -89,10 +89,11 @@ def _click_authorize_if_present(session):
         'button[type="submit"]',
         'input[type="submit"]',
     ]
-    deadline = time.time() + 25    # 覆盖防点击劫持延迟
-    while time.time() < deadline:
+    start = time.time()
+    while time.time() - start < 25:
         if "github.com" not in _cur_url(session):
             return True            # 已离开授权页（可能已被别的点击推进）
+        # 1) 自然可点时点击（防点击劫持延迟自然解除后 disabled 消失）
         for nm in names:
             try:
                 btn = page.get_by_role("button", name=nm)
@@ -109,6 +110,26 @@ def _click_authorize_if_present(session):
                     loc.first.click(timeout=5000)
                     print(f"  [opencode] 已点授权按钮（selector {sel}）", flush=True)
                     return True
+            except Exception:
+                pass
+        # 2) 按钮一直 disabled（GitHub 防点击劫持 JS 定时器在自动化/后台标签下常不解除）
+        #    → 等 6s 后强制移除 disabled 属性再 JS 点击
+        if time.time() - start > 6:
+            try:
+                ok = page.evaluate(r"""() => {
+                    const b = document.querySelector(
+                        'button[name="authorize"][value="1"], button.js-oauth-authorize-btn, '
+                        + 'form[action*="/authorize"] button[type=submit]');
+                    if (!b) return false;
+                    b.removeAttribute('disabled'); b.disabled = false;
+                    b.click();
+                    return true;
+                }""")
+                if ok:
+                    print("  [opencode] 强制点授权按钮（移除 disabled）", flush=True)
+                    time.sleep(2)
+                    if "github.com" not in _cur_url(session):
+                        return True
             except Exception:
                 pass
         time.sleep(1.5)

@@ -998,6 +998,8 @@ def start_daily_subscribe_pipeline():
         return jsonify({"error": "卡池分组不存在"}), 404
 
     captcha_api_key = data.get('captcha_api_key')
+    # 订阅默认用 Multibot 解 hCaptcha；可传 captcha_server='2captcha.com' 切回
+    captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
 
     # 启动门：分组要有可选卡，且要有待订阅账号（status 非 subscribed/banned）
     eligible = len(state._eligible_cards(group_id))
@@ -1014,7 +1016,7 @@ def start_daily_subscribe_pipeline():
     import threading
     threading.Thread(
         target=state.run_daily_subscribe_pipeline,
-        args=(group_id, captcha_api_key),
+        args=(group_id, captcha_api_key, captcha_server),
         daemon=True,
     ).start()
 

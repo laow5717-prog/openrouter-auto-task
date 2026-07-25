@@ -5,6 +5,8 @@
 
 import time
 
+import requests
+
 try:
     from twocaptcha import TwoCaptcha
 except ImportError:
@@ -12,10 +14,70 @@ except ImportError:
 
 _solver = None
 _api_key = None
+_server = "2captcha.com"
+
+_MULTIBOT_HOSTS = ("multibot.cloud", "multibot.in")
 
 
-def init_solver(api_key):
-    global _solver, _api_key
+def _is_multibot():
+    return any(h in (_server or "") for h in _MULTIBOT_HOSTS)
+
+
+def _multibot_hcaptcha(sitekey, url, rqdata=None, invisible=True, max_wait=180, poll=5):
+    """直接调 Multibot in.php/res.php 解 hCaptcha（Token）。
+
+    ⚠️ 关键：Multibot 的参数名与 2captcha 库不同——要 `isInvisible`/`enterprise`/`data`，
+    而 twocaptcha 库发的是 `invisible`（且不发 enterprise）。参数名不匹配会让 Multibot 收不到
+    invisible/enterprise 标志、解错东西一直超时。故 Multibot 走本函数按其正确参数名直连。
+    返回 token 或 None。
+    """
+    base = "https://api.multibot.cloud"
+    params = {"key": _api_key, "method": "hcaptcha", "sitekey": sitekey,
+              "pageurl": url, "json": "1"}
+    if invisible:
+        params["isInvisible"] = "1"
+    if rqdata:
+        params["enterprise"] = "1"
+        params["data"] = rqdata
+    try:
+        files = {k: (None, str(v)) for k, v in params.items()}
+        r = requests.post(f"{base}/in.php", files=files, timeout=30).json()
+    except Exception as e:
+        print(f"  [multibot] in.php 提交失败: {str(e)[:100]}")
+        return None
+    if str(r.get("status")) != "1":
+        print(f"  [multibot] 提交被拒: {r.get('request') or r}")
+        return None
+    task_id = r.get("request")
+    print(f"  [multibot] 任务已提交 id={task_id}，轮询结果…")
+    elapsed = 0
+    while elapsed < max_wait:
+        time.sleep(poll)
+        elapsed += poll
+        try:
+            rr = requests.get(f"{base}/res.php",
+                              params={"key": _api_key, "id": task_id, "json": "1"},
+                              timeout=30).json()
+        except Exception:
+            continue
+        if str(rr.get("status")) == "1":
+            return rr.get("request")   # token
+        req = str(rr.get("request") or "")
+        if req and req != "CAPCHA_NOT_READY":
+            print(f"  [multibot] 求解失败: {req}")
+            return None
+    print(f"  [multibot] 等结果超时（{max_wait}s）")
+    return None
+
+
+def init_solver(api_key, server="2captcha.com"):
+    """初始化 hCaptcha token 求解器。
+
+    server: 求解服务域名。默认 2captcha.com；传 'api.multibot.cloud' 即切到 Multibot——
+    它提供 2captcha 兼容的 in.php/res.php 接口（method=hcaptcha + sitekey + enterprise + data=rqdata
+    + isInvisible），故沿用 twocaptcha 库、整套注入架构不变，只换 token 供应商。
+    """
+    global _solver, _api_key, _server
     if not api_key:
         _solver = None
         _api_key = None
@@ -24,8 +86,9 @@ def init_solver(api_key):
         print("  2captcha-python not installed, captcha service unavailable")
         return
     _api_key = api_key
-    _solver = TwoCaptcha(api_key)
-    print(f"  2Captcha solver initialized (Key: {api_key[:8]}...)")
+    _server = server or "2captcha.com"
+    _solver = TwoCaptcha(api_key, server=_server)
+    print(f"  hCaptcha solver initialized (server={_server}, key={api_key[:8]}...)")
 
 
 def is_available():
@@ -42,7 +105,18 @@ _HCAPTCHA_HOOK_JS = r"""
   window.__hcapHookInstalled = true;
   var H = window.__hcapHook = { callbacks: [], resolvers: [], widgetIds: [],
       setterFired: 0, renderCalls: 0, executeCalls: 0, getResponseCalls: 0,
-      renderParamKeys: [], token: null, redefendCount: 0 };
+      renderParamKeys: [], token: null, redefendCount: 0,
+      sitekey: null, rqdata: null };   // hCaptcha 实际 render/execute 用的权威 sitekey+rqdata
+
+  function capParams(p) {
+    // 从 render/execute 的参数对象里捕获 sitekey 与 rqdata（enterprise 权威来源）
+    try {
+      if (!p || typeof p !== 'object') return;
+      if (p.sitekey && !H.sitekey) H.sitekey = String(p.sitekey);
+      var rq = p.rqdata || p.rqData || p.rqdatas;
+      if (rq && !H.rqdata) H.rqdata = String(rq);
+    } catch(e){}
+  }
 
   function deliver(cb, token) { try { cb(token); return true; } catch(e){ return false; } }
 
@@ -58,6 +132,7 @@ _HCAPTCHA_HOOK_JS = r"""
             H.renderCalls++;
             if (params) {
               H.renderParamKeys.push(Object.keys(params).join(','));
+              capParams(params);            // 捕获 sitekey+rqdata
               if (typeof params.callback === 'function') H.callbacks.push(params.callback);
               else if (typeof params.callback === 'string' && typeof window[params.callback] === 'function')
                 H.callbacks.push(window[params.callback]);
@@ -75,6 +150,7 @@ _HCAPTCHA_HOOK_JS = r"""
         hc.execute = function(id, opts) {
           try {
             H.executeCalls++;
+            capParams(opts);              // execute 的 opts 常含 enterprise rqdata
             if (id != null && typeof id !== 'object') H.widgetIds.push(id);
             var p = new Promise(function(resolve){
               // enterprise execute({async:true}) resolve 形状为 {response, key}；
@@ -217,16 +293,39 @@ def solve_turnstile(driver, max_retries=2):
     return False
 
 
+def _extract_from_hook(driver):
+    """从 hook 捕获的权威值取 (sitekey, rqdata)——hCaptcha 在 render/execute 触发时传入的
+    真实参数（提交那一刻的准确配对），比 scrape 帧 URL 可靠。逐帧找 window.__hcapHook。"""
+    for fr in driver.page.frames:
+        try:
+            r = fr.evaluate("() => { var h=window.__hcapHook; return h ? "
+                            "{sk: h.sitekey||null, rq: h.rqdata||null} : null; }")
+        except Exception:
+            continue
+        if r and (r.get("sk") or r.get("rq")):
+            return r.get("sk"), r.get("rq")
+    return None, None
+
+
 def _extract_hcaptcha_params(driver):
     """提取**配对的** (sitekey, rqdata)。
 
     Stripe 结账页同时挂两个 hCaptcha sitekey：普通的（无 rqdata）与 enterprise 的（带 rqdata，
-    才是提交时真正要过的那个）。若把普通 sitekey 配上 enterprise 的 rqdata 去 2captcha 求解，
-    hCaptcha 会报「sitekey for this hcaptcha is incorrect」而拒收。故必须**从同一个含 rqdata 的
-    enterprise hcaptcha iframe src 里取同 src 的 sitekey**，保证配对；取不到再退回各自单独提取。
+    才是提交时真正要过的那个）。喂错 sitekey/rqdata 会被 hCaptcha 报「sitekey ... is incorrect」
+    或一直解不出（NOT_READY）。取值优先级：
+      ① hook 捕获的 render/execute 权威值（hCaptcha 提交那刻实际用的，最准）；
+      ② 同一含 rqdata 的 enterprise iframe src 里的 sitekey+rqdata 配对；
+      ③ 各自单独提取兜底。
     """
     import re as _re
     import urllib.parse
+
+    # ① hook 权威值
+    hk_key, hk_rq = _extract_from_hook(driver)
+    if hk_key and hk_rq:
+        return hk_key, hk_rq
+
+    # ② 同 src 配对
     ent_key = ent_rq = None
     try:
         for src in _collect_iframe_srcs(driver.page):
@@ -239,11 +338,13 @@ def _extract_hcaptcha_params(driver):
             mk = _re.search(r'[#&?]sitekey=([a-f0-9-]{36,})', src, _re.I)
             if mk:
                 ent_key = mk.group(1)
-                break   # 同 src 同时有 sitekey+rqdata → enterprise 配对，最可靠
+                break
     except Exception:
         pass
-    sitekey = ent_key or _extract_hcaptcha_sitekey(driver)
-    rqdata = ent_rq if ent_rq is not None else _extract_hcaptcha_rqdata(driver)
+
+    # ③ 兜底：hook 单值 > src 配对值 > 各自提取
+    sitekey = hk_key or ent_key or _extract_hcaptcha_sitekey(driver)
+    rqdata = hk_rq or (ent_rq if ent_rq is not None else _extract_hcaptcha_rqdata(driver))
     return sitekey, rqdata
 
 
@@ -267,12 +368,17 @@ def solve_hcaptcha(driver, max_retries=2):
 
     for attempt in range(max_retries):
         try:
-            print(f"  Calling 2Captcha for hCaptcha... (attempt {attempt + 1}/{max_retries})")
-            if rqdata:
-                result = _solver.hcaptcha(sitekey=sitekey, url=page_url, data=rqdata)
+            print(f"  Calling hCaptcha solver ({_server})... (attempt {attempt + 1}/{max_retries})")
+            # Multibot 走原生 in.php（正确参数名 isInvisible/enterprise/data）；其余用 twocaptcha 库。
+            if _is_multibot():
+                token = _multibot_hcaptcha(sitekey, page_url, rqdata=rqdata, invisible=True) or ''
             else:
-                result = _solver.hcaptcha(sitekey=sitekey, url=page_url)
-            token = result.get('code', '')
+                # Stripe 是 invisible enterprise：带 invisible=1 + data=rqdata（2captcha 参数名）
+                if rqdata:
+                    result = _solver.hcaptcha(sitekey=sitekey, url=page_url, data=rqdata, invisible=1)
+                else:
+                    result = _solver.hcaptcha(sitekey=sitekey, url=page_url, invisible=1)
+                token = result.get('code', '')
             if not token:
                 print(f"  2Captcha returned empty token")
                 continue

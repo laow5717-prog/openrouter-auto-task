@@ -46,6 +46,9 @@ _DECLINE_HINTS = [
     # ——这是「卡无法验证」的明确失败并提示换卡，归 failed（换下一张卡），不是等待人工。
     "unable to authenticate", "authenticate your payment",
     "choose a different payment",
+    # 提交后 Stripe 通用报错「There was an error processing your request.」——支付未成，
+    # 归 failed 自动换下一张卡（不空等超时）。
+    "error processing your request", "processing your request",
 ]
 
 # hCaptcha 人机验证「图像挑战」：仅当 Stripe 真的弹出需人工点选图片的挑战时才归

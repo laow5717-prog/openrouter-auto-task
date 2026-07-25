@@ -59,17 +59,19 @@ def main():
     ap.add_argument("--max", type=int, default=5, help="最多尝试卡数（防风控）")
     ap.add_argument("--captcha-key", default=os.environ.get("TWOCAPTCHA_API_KEY", "") or cfg.captcha.api_key,
                     help="2captcha API key（默认取环境变量 TWOCAPTCHA_API_KEY 或 config）")
+    ap.add_argument("--server", default=os.environ.get("CAPTCHA_SERVER", "2captcha.com"),
+                    help="求解服务域名：2captcha.com（默认）或 api.multibot.cloud")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--patchright", action="store_true",
                     help="用 Patchright 主栈（默认用原生 Playwright——hCaptcha token 注入只在原生栈生效）")
     args = ap.parse_args()
 
-    # 初始化 2captcha 求解器（付款时 Stripe 可能弹 hCaptcha，自动解）
+    # 初始化 hCaptcha 求解器（付款时 Stripe 弹 hCaptcha，自动解）；server 可切 Multibot
     if args.captcha_key:
-        captcha_solver.init_solver(args.captcha_key)
-        print(f"  2captcha 已启用: {'可用' if captcha_solver.is_available() else '不可用(未装库?)'}")
+        captcha_solver.init_solver(args.captcha_key, server=args.server)
+        print(f"  求解器已启用({args.server}): {'可用' if captcha_solver.is_available() else '不可用(未装库?)'}")
     else:
-        print("  ⚠️ 未提供 2captcha key，遇 hCaptcha 需人工")
+        print("  ⚠️ 未提供 captcha key，遇 hCaptcha 需人工")
 
     db = Database()
     card_pool = CardPoolModel(db)

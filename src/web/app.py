@@ -638,7 +638,8 @@ class AppState:
     # 下一轮该账号会带新卡再来，坏卡已被标 invalid 退出可选集）。
     SUBSCRIBE_MAX_CARDS_PER_ACCOUNT = 5
 
-    def _subscribe_one_account(self, acct, payment_group_id, captcha_api_key, worker=None):
+    def _subscribe_one_account(self, acct, payment_group_id, captcha_api_key, worker=None,
+                               captcha_server="api.multibot.cloud"):
         """单账号一次推进：未注册先注册（Patchright，Arkose 跳过），已注册走原生栈登录+逐卡订阅。
 
         返回 (result, detail)，result ∈ {"subscribed","registered_only","skipped","failed"}。
@@ -685,7 +686,7 @@ class AppState:
 
         # --- B. 订阅分支：原生 Playwright 栈（hCaptcha token 注入只在原生栈生效）---
         if captcha_api_key:
-            captcha_solver.init_solver(captcha_api_key)
+            captcha_solver.init_solver(captcha_api_key, server=captcha_server)
 
         session = create_driver_vanilla(profile_id=email)
         monitor = worker.make_monitor(self)
@@ -757,8 +758,11 @@ class AppState:
             worker.clear_active_driver()
             close_driver(session)
 
-    def run_daily_subscribe_pipeline(self, group_id, captcha_api_key=None):
+    def run_daily_subscribe_pipeline(self, group_id, captcha_api_key=None,
+                                     captcha_server="api.multibot.cloud"):
         """每日订阅任务：账号轮转——未注册先注册、已注册登录订阅，成功即换下一个账号。
+
+        captcha_server: hCaptcha 求解服务，默认 Multibot（api.multibot.cloud）；可传 2captcha.com。
 
         镜像 run_daily_pipeline 的串行轮转/停止/兜底骨架，但：待订阅账号集 = status∉(subscribed,banned)；
         单账号动作 = _subscribe_one_account；订阅成功的账号从后续轮次剔除。
@@ -826,7 +830,8 @@ class AppState:
                         self.set_action(worker, f"轮次{round_num} 订阅账号 {email}")
                         self._hooked_print(f"\n订阅账号: {email}")
                         result, detail = self._subscribe_one_account(
-                            acct, group_id, captcha_api_key, worker=worker)
+                            acct, group_id, captcha_api_key, worker=worker,
+                            captcha_server=captcha_server)
                         with round_lock:
                             if result == "subscribed":
                                 round_stats['subscribed'] += 1
