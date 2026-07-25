@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 31
-- **Last Active**: 2026-07-19
+- **Total Sessions**: 32
+- **Last Active**: 2026-07-26
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1069 | Active |
+| `journal-1.md` | ~1151 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 32 | 2026-07-26 | 已验证卡永久有效：曾成功卡失败改24h冷却不标无效 | `2edf5b9` | `main` |
 | 31 | 2026-07-19 | 修复浏览器 profile 白屏；定位 Turnstile token 未交付 | `9202eb7` | `main` |
 | 30 | 2026-07-19 | 卡池跨分组移动：手工迁移 100 张待验证卡 + 功能产品化 | `57144d0` | `main` |
 | 29 | 2026-07-19 | 登录邮箱二次验证自动化 | `3bf2539` | `main` |

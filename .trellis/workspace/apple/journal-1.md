@@ -1116,3 +1116,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 **决定性外部限制**：账号建成后登录即被 GitHub 反滥用挂起（github.com/suspended），连续多账号 100% 复现。根因 mail.tm web-library.net 临时域名 + Patchright 指纹 + 数据中心 IP 被风控识别，非脚本缺陷。新增 outcome=account_suspended（ok=False）如实报，与 error 区分。已存记忆 github-signup-suspended。commit 31bd0d0。
 
 **后续（另开任务）突破挂起**：换非公开临时邮箱域/自建域、住宅代理、真人化指纹节奏、建号后先养号再登录。
+
+
+## Session 32: 已验证卡永久有效：曾成功卡失败改24h冷却不标无效
+
+**Date**: 2026-07-26
+**Task**: 已验证卡永久有效：曾成功卡失败改24h冷却不标无效
+**Branch**: `main`
+
+### Summary
+
+让曾支付成功过的卡（全局 valid_cards）永久保持有效：mark_invalid_by_number 加底层不变式（valid_cards 成员永不标 invalid）；app.py 订阅 failed 分支对齐 registration（有效卡打 24h 冷却而非标无效）；新增 scripts/fix_valid_cards_status.py 并对主库修复存量——已验证卡分组 8 张 invalid→有效；新增 tests/test_valid_card_invariant.py。口径按用户确认=全局曾成功卡。顺带确认 test_daily_pipeline 5 个失败为改动前既有（run_daily_pipeline 签名/旧 kwargs 不一致），未在本次处理。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2edf5b9` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
