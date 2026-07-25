@@ -28,6 +28,19 @@ class AccountModel:
             (status, email),
         )
 
+    def reset_failed_to_registered(self):
+        """一次性修正：把被误标 'failed'（实际可用）的账号批量改回 'registered'。
+
+        'failed' 仅由 GitHub 注册失败分支写入（web/app._subscribe_one_account），充值流程
+        从不写它；这些账号目前实际可用，列表显示"失败"是错误的。返回受影响行数。
+        幂等：无 failed 时返回 0。
+        """
+        cur = self.db.execute(
+            "UPDATE accounts SET status='registered', updated_at=datetime('now','localtime') "
+            "WHERE status='failed'"
+        )
+        return cur.rowcount
+
     def update_bound_cards(self, email, count, sync_status=True):
         """记录账单页核对到的真实已绑卡数。
 
