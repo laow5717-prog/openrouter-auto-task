@@ -268,9 +268,20 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
             if fmfr is not None:
                 _close_threeds_modal(fmfr, session, monitor)
                 return {"outcome": "failed", "detail": f"3DS 认证失败: {fmsg[:150]}"}
-            # hCaptcha 人机验证：2captcha 自动解，最多 3 次；3 次仍未过即提前返回 needs_captcha，
-            # 不空等满 timeout（避免一直停在支付页）。
-            if _captcha_challenge_present(session) is not None:
+            # 3DS 交互挑战优先判：3DS 出现 = 人机验证这一关已过（Stripe 先过 captcha 才
+            # 进发卡行授权），故一旦进入/见过 3DS，就绝不再回头解 hCaptcha——否则 enterprise
+            # 隐形 hCaptcha 的 checkbox iframe（常驻 DOM、含「i am human」文案）会被反复误判。
+            threeds_now = _threeds_challenge_present(session)
+            if threeds_now:
+                if not saw_3ds:
+                    saw_3ds = True
+                    overlay_baseline = max(_count_top_layer_overlays(session), 1)
+                    _step(monitor, session, "检测到 3DS 交互挑战，等待其加载完成…")
+                elif _count_top_layer_overlays(session) > overlay_baseline:
+                    return {"outcome": "failed", "detail": "3DS 出现新弹窗，认证失败"}
+            # hCaptcha 人机验证：仅在尚未进入 3DS 阶段时才解。2captcha 自动解，最多 3 次；
+            # 3 次仍未过即提前返回 needs_captcha，不空等满 timeout（避免一直停在支付页）。
+            elif not saw_3ds and _captcha_challenge_present(session) is not None:
                 if not saw_captcha:
                     saw_captcha = True
                     _step(monitor, session, "检测到 hCaptcha 人机验证")
@@ -291,14 +302,6 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
                                 "detail": "hCaptcha 解 3 次仍未通过（token 被拒/账号级风控）"}
                 elif not captcha_solver.is_available():
                     _step(monitor, session, "未配置 2captcha，请在浏览器手动点 Verify…")
-            # 3DS 交互挑战：等待加载，不立即失败
-            if _threeds_challenge_present(session):
-                if not saw_3ds:
-                    saw_3ds = True
-                    overlay_baseline = max(_count_top_layer_overlays(session), 1)
-                    _step(monitor, session, "检测到 3DS 交互挑战，等待其加载完成…")
-                elif _count_top_layer_overlays(session) > overlay_baseline:
-                    return {"outcome": "failed", "detail": "3DS 出现新弹窗，认证失败"}
 
         time.sleep(3)
 
