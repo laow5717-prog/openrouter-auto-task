@@ -85,6 +85,38 @@ These are recorded from failures, not preferences:
   `Emulation.setLocaleOverride`. Set language via Chrome's own `--lang` flag and
   the profile's `intl.accept_languages` instead.
 
+## Payment-flow hCaptcha (Stripe Checkout) — subscribe **and** recharge share one shape
+
+Stripe Checkout (both the "Subscribe to Go" flow and the zen-console recharge flow) can
+pop an enterprise / invisible hCaptcha at Pay time. Solving it is fundamentally different
+from the registration-path Turnstile above, and the two payment flows use an **identical**
+mechanism — implement/verify them together:
+
+- **Requires the vanilla Playwright driver** (`create_driver_vanilla`), NOT Patchright.
+  Patchright neuters `add_init_script` / CDP pre-injection for stealth, so the
+  `window.hcaptcha.render/execute` hook never installs and the solved token can't be
+  delivered into Stripe's cross-origin `HCaptchaInvisible.html` OOPIF. The payment flows
+  deliberately trade stealth for injection. `create_driver_vanilla` reuses the **same**
+  `data/profiles/<email>` dir as `create_driver`, so the logged-in profile carries over.
+- **Install the hook before navigating** to the checkout page:
+  `init_solver(key, server)` → `install_hcaptcha_hook(session)` (both flows do this right
+  after creating the vanilla session, before login/checkout).
+- **Solve inside the result-detection loop, 3DS-first**: once a 3DS challenge is seen,
+  never go back to solving hCaptcha (3DS appearing means captcha already passed — otherwise
+  the always-present invisible-hCaptcha checkbox iframe gets re-detected forever). When no
+  3DS, call `solve_hcaptcha` up to **3** times; after 3 failures return `needs_captcha`
+  (account-level risk control — switch card / retry later, do not sit and wait).
+  See `opencode_subscribe.detect_subscribe_result` and `opencode_billing.detect_payment_result`
+  — they are deliberately the same structure.
+- **Balance/余额 is the authoritative success signal** for recharge (`_balance_grew` first
+  each loop); `detect_subscribe_result` uses "left checkout & fell back to opencode" instead.
+- Default solver is **Multibot** (`api.multibot.cloud`); `init_solver` also accepts
+  `2captcha.com`. Multibot needs its own param names (`isInvisible`/`enterprise`/`data`) —
+  it is dispatched through `captcha._multibot_hcaptcha`, not the twocaptcha library.
+- If no `captcha_api_key` is configured, `is_available()` is False → no hook, no solve, and
+  the flow degrades to the old behaviour (detect hCaptcha, prompt for manual Verify, time
+  out to `needs_captcha`). Keep that fallback intact.
+
 ## Testing captcha injection
 
 Token injection must be tested against a **real DOM** — the thing under test is

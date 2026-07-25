@@ -54,6 +54,18 @@ All automation endpoints (`/api/start`, `/api/card/start*`, `/api/accounts/recha
 `/api/daily/start`) share one global lock and one worker-thread lifecycle. Follow it exactly
 or the app deadlocks the next task.
 
+> **Note (07-26, recharge hCaptcha + archive)**: the daily **recharge** pipeline is now
+> recharge-only: `run_daily_pipeline(group_id, login_password, captcha_api_key,
+> captcha_server='api.multibot.cloud')`. Both the daily recharge start endpoint and
+> `/api/accounts/recharge` accept `captcha_api_key` + `captcha_server` (Multibot default) so
+> the payment page's hCaptcha is auto-solved (see
+> [captcha-guidelines.md → Payment-flow hCaptcha](../backend/captcha-guidelines.md)).
+> Account selection excludes `banned` **and** `archived`; accounts whose **live** balance
+> ≥ $20 (env `OPENCODE_RECHARGE_SKIP_BALANCE`) are set to `archived` and skipped (never
+> archive from the possibly-stale DB balance). The three-stage `/api/daily/start`
+> (rebind → register → recharge) contract documented further down predates the 07-23
+> recharge rework and is **stale** — treat the recharge-only signature above as current.
+
 The `is_running` lock still admits **one task at a time**. Parallelism happens
 *inside* the daily pipeline, across browser workers — it does not let two
 endpoints run concurrently. See
