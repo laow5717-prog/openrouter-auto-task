@@ -217,14 +217,22 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
         except Exception:
             return ""
 
-    def _decline_snippet():
-        """逐帧扫描可见文本找拒付/认证失败文案——错误可能渲染在主 checkout 帧或其支付子帧，
-        只读主帧会漏判导致空等到超时。命中返回文案片段，否则 None。
+    # hCaptcha/人机验证类帧——其内部状态字符串（challenge-expired / sitekey incorrect /
+    # challenge-closed 等）会撞上卡拒付关键词(expired/incorrect...)，绝不能在这些帧里认拒付。
+    _CAPTCHA_FRAME_MARKS = ("hcaptcha", "newassets.hcaptcha", "humansecurity",
+                            "human-security", "recaptcha", "arkoselabs", "funcaptcha")
 
-        ⚠️ 排除 hCaptcha 自身报错的误命中：hCaptcha 帧常出现「sitekey for this hcaptcha is
-        incorrect」等文案，含 "incorrect" 会被 _DECLINE_HINTS 误判成卡拒付、错误地把好卡标废。
-        故命中片段若提到 hcaptcha/sitekey 则跳过——那是人机验证问题、不是卡的问题。"""
+    def _decline_snippet():
+        """扫描**真正的 Stripe 支付帧**找拒付/认证失败文案，命中返回片段否则 None。
+
+        ⚠️ 两层防误伤（hCaptcha 内部文本常含 expired/incorrect/closed 等词，会撞卡拒付关键词）：
+          1) 跳过 hCaptcha/人机验证类帧（按 URL 判断）；
+          2) 命中片段若提到 hcaptcha/sitekey/challenge/captcha，也跳过——那是人机验证状态、非卡问题。
+        """
         for fr in session.page.frames:
+            url = (fr.url or "").lower()
+            if any(m in url for m in _CAPTCHA_FRAME_MARKS):
+                continue   # 人机验证帧，跳过（其内部字符串会误命中拒付关键词）
             try:
                 body = (fr.inner_text("body", timeout=1200) or "").lower()
             except Exception:
@@ -232,9 +240,10 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
             for h in _DECLINE_HINTS:
                 idx = body.find(h)
                 if idx >= 0:
-                    seg = body[max(0, idx - 45):idx + 80]
-                    if "hcaptcha" in seg or "sitekey" in seg or "site key" in seg:
-                        continue   # hCaptcha 报错，非卡拒付，跳过
+                    seg = body[max(0, idx - 60):idx + 90]
+                    if any(w in seg for w in ("hcaptcha", "sitekey", "site key",
+                                              "challenge", "captcha")):
+                        continue   # 人机验证相关文案，非卡拒付，跳过
                     return body[max(0, idx - 30):idx + 60].strip()
         return None
 
