@@ -734,10 +734,18 @@ class AppState:
                     self.add_log(f"{email} ✅ 订阅成功（卡 ****{last4}）")
                     return "subscribed", f"****{last4}"
                 elif oc == 'failed':
-                    models['card_pool'].mark_invalid_by_number(num)
+                    # 曾成功过的有效卡（in valid_cards）本次被拒：不判无效，改打 24h 速率冷却，
+                    # 本轮跳过、到期恢复可用；从未成功过的卡才判无效。与 registration.py 一致。
+                    if models['valid_card'].is_valid(num):
+                        models['card_state'].set_cooldown(
+                            num, hours=24, reason='曾成功卡本次支付失败，速率冷却')
+                        note = '曾成功有效卡，24h 冷却'
+                    else:
+                        models['card_pool'].mark_invalid_by_number(num)
+                        note = '标 invalid'
                     models['recharge_log'].mark_failed(log_id, error=res.get('err', ''),
                                                        api_response={"result": res})
-                    self.add_log(f"{email} 卡 ****{last4} 拒付，标 invalid，换下一张")
+                    self.add_log(f"{email} 卡 ****{last4} 拒付，{note}，换下一张")
                 elif oc == 'needs_captcha':
                     # hCaptcha 未过：非卡问题，不标卡无效，换下一张（换次提交 token 可能就过）
                     models['recharge_log'].mark_failed(log_id, error='hCaptcha 未过',

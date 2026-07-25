@@ -307,8 +307,18 @@ class CardPoolModel:
         )
 
     def mark_invalid_by_number(self, card_number):
-        """标记为无效卡（支付被拒等卡自身原因）"""
-        self.mark_status_by_number(card_number, CARD_STATUS_INVALID)
+        """标记为无效卡（支付被拒等卡自身原因）。
+
+        底层不变式：valid_cards 成员（曾支付/绑定成功过的有效卡）**永不**被标为 invalid。
+        它已被证明可用，再次被拒只应进入临时冷却（见 CardPaymentStateModel.set_cooldown），
+        而非永久作废。此守卫是所有「标无效」入口的最终收口——即便上层调用方漏判，
+        有效卡也不会被误标。与 mark_bound_by_number 保留 paid 的做法同构。
+        """
+        self.db.execute(
+            "UPDATE card_pool SET status=? WHERE card_number=? "
+            "AND card_number NOT IN (SELECT card_number FROM valid_cards)",
+            (CARD_STATUS_INVALID, card_number),
+        )
 
     def mark_expired_by_number(self, card_number):
         """标记为已过期（有效期已过）"""
