@@ -679,7 +679,7 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
         grew = _balance_grew()
         if grew is not None:
             _step(monitor, session, f"支付成功（余额 ${balance_before}→${grew}）")
-            return {"outcome": "success", "detail": f"余额 ${balance_before}→${grew}"}
+            return {"outcome": "success", "detail": f"余额 ${balance_before}→${grew}", "balance_after": grew}
 
         stripe_fr = _stripe_present()
 
@@ -694,7 +694,7 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
             grew = _balance_grew()
             if grew is not None:
                 _step(monitor, session, f"支付成功（余额 ${balance_before}→${grew}）")
-                return {"outcome": "success", "detail": f"余额 ${balance_before}→${grew}"}
+                return {"outcome": "success", "detail": f"余额 ${balance_before}→${grew}", "balance_after": grew}
         else:
             # 3DS2 结果弹窗「Payment failed」（发卡行拒绝/需额外验证）→ 确定失败：关闭弹窗后
             # 判 failed、换下一张。独立于挑战框 URL 匹配，是最快最可靠的失败信号，故最先查。
@@ -740,7 +740,7 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
     grew = _balance_grew()
     if grew is not None:
         _step(monitor, session, f"支付成功（余额 ${balance_before}→${grew}）")
-        return {"outcome": "success", "detail": f"余额 ${balance_before}→${grew}"}
+        return {"outcome": "success", "detail": f"余额 ${balance_before}→${grew}", "balance_after": grew}
     if saw_captcha:
         return {"outcome": "needs_captcha",
                 "detail": f"hCaptcha 人机验证未在 {timeout}s 内完成（账号级风控，需人工）"}
@@ -828,5 +828,8 @@ def recharge_via_stripe(session, card, wid, amount=20, monitor=None, should_stop
         "mode": mode,
         "err": "" if result["outcome"] == "success" else result["detail"],
         "last4": last4,
+        # 成功时携带充值后余额（美元），供上层落库刷新 accounts.credits_balance；
+        # 非成功为 None（detect_payment_result 只有余额增长才判 success，故成功必有值）
+        "balance_after": result.get("balance_after"),
         "steps": steps,
     }

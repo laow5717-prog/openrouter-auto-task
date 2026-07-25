@@ -168,6 +168,10 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                     if account_model:
                         try:
                             account_model.update_status(email, "recharged")
+                            # 充值到账后把新余额写回 DB（result.balance_after 来自
+                            # detect_payment_result 读到的 Current Balance）。此前只更状态不更余额，
+                            # 导致列表页余额一直是旧值。None 时 update_balance 内部会安全跳过。
+                            account_model.update_balance(email, result.get("balance_after"))
                         except Exception:
                             pass
                     _log_card_attempt(card, True, "", result)
