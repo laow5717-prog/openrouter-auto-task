@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "整体质量校验基线"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "本任务本质是复用订阅那套解题机制，check 需确认无重复造轮子、正确复用 captcha/opencode_billing"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "captcha 参数与 archived outcome 跨层流动 routes→app→registration→browser，检查数据流一致"}
+{"file": ".trellis/spec/backend/captcha-guidelines.md", "reason": "校验 hCaptcha 解题接入是否遵守 never swallow failure、3DS 优先、token 交付契约"}
+{"file": ".trellis/spec/backend/concurrency-guidelines.md", "reason": "充值管线账号轮转/排他，archived 排除后校验并发与账号排他不受影响"}

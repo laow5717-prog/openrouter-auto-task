@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/captcha-guidelines.md", "reason": "R1 核心：token 交付机制（native setter+事件+callback）、never swallow captcha failure、反检测约束；复用 solve_hcaptcha 前须懂其契约"}
+{"file": ".trellis/spec/backend/browser-profile-guidelines.md", "reason": "充值切 create_driver_vanilla 涉及 profile 复用/清理；确认 vanilla 已具白屏/单例锁卫生，勿删 Cookies/Local Storage"}
+{"file": ".trellis/spec/backend/stripe-payment-element.md", "reason": "detect_payment_result 支付判定与 Stripe 结账页结构；接入 hCaptcha 解题不能破坏 3DS 优先与余额判定"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "R2 归档写 status/balance、R3 批量 failed→registered 的 DB 写法与约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "outcome 契约（archived/failed/error/needs_captcha 分流），错误不吞、失败落在失败处"}
+{"file": ".trellis/spec/api/index.md", "reason": "routes 层 captcha_api_key/captcha_server 透传与启动门约定"}
