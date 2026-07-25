@@ -1149,3 +1149,36 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 33: 充值成功后余额落库修复
+
+**Date**: 2026-07-26
+**Task**: 充值成功后余额落库修复
+**Branch**: `main`
+
+### Summary
+
+定位并修复自动充值成功后 accounts.credits_balance 不更新的问题：detect_payment_result 已读到充值后余额但只写进 detail 文案，成功分支又漏调 update_balance。让 balance_after 从 detect_payment_result → recharge_via_stripe → registration.recharge_account 成功分支透传并落库，前端列表余额随之刷新。归档任务 07-26-account-oneshot-recharge。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fe8a591` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
