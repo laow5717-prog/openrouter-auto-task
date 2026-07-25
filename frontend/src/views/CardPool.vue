@@ -159,7 +159,7 @@
   <!-- 归纳合并弹窗 -->
   <Modal :visible="mergeModal.visible" title="归纳合并（移动非无效卡到新分组）" @close="mergeModal.visible = false">
     <div class="form-group">
-      <label class="form-label">选择源分组（把这些分组里的有效+未验证卡移动到新分组，无效卡留在原组）</label>
+      <label class="form-label">选择源分组（把这些分组里的卡移动到新分组，无效卡始终留在原组）</label>
       <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px">
         <div v-if="groups.length === 0" style="color:var(--text-sub);font-size:12px">暂无分组</div>
         <label v-for="g in groups" :key="g.id" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer">
@@ -168,6 +168,13 @@
           <span style="color:var(--text-sub);font-size:12px">{{ g.card_count }} 张</span>
         </label>
       </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">转移范围</label>
+      <select v-model="mergeModal.bucket" class="ctrl-input">
+        <option value="non_invalid">有效 + 未验证卡</option>
+        <option value="valid">仅有效卡</option>
+      </select>
     </div>
     <div class="form-group">
       <label class="form-label">新分组名称</label>
@@ -371,7 +378,7 @@ const poolBucket = ref('')  // ''=全部 / valid / unverified / invalid
 const poolBuckets = reactive({ total: 0, invalid: 0, valid: 0, unverified: 0 })
 
 // 归纳合并弹窗
-const mergeModal = reactive({ visible: false, sourceIds: [], name: '', type: 'payment' })
+const mergeModal = reactive({ visible: false, sourceIds: [], name: '', type: 'payment', bucket: 'non_invalid' })
 
 // 移动到分组弹窗
 const moveModal = reactive({ visible: false, targetId: null, bucket: 'unverified', limit: 100, busy: false })
@@ -467,6 +474,7 @@ function showMerge() {
   mergeModal.sourceIds = []
   mergeModal.name = ''
   mergeModal.type = 'payment'
+  mergeModal.bucket = 'non_invalid'
   mergeModal.visible = true
 }
 
@@ -478,6 +486,7 @@ async function doMerge() {
       source_group_ids: mergeModal.sourceIds,
       name: mergeModal.name.trim(),
       type: 'payment',
+      bucket: mergeModal.bucket,
     })
     alert(`已合并：移入 ${r.moved} 张，去重 ${r.deduped} 张 → 新分组已创建`)
     mergeModal.visible = false

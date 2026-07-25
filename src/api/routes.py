@@ -720,6 +720,10 @@ def merge_card_pools():
     group_type = data.get('type') or 'payment'
     if group_type not in ('bind', 'payment'):
         group_type = 'payment'
+    # 转移范围：non_invalid（有效+未验证，默认）/ valid（仅有效卡）
+    bucket = data.get('bucket') or 'non_invalid'
+    if bucket not in ('non_invalid', 'valid'):
+        return jsonify({"error": "转移范围无效"}), 400
     if not source_ids:
         return jsonify({"error": "未选择源分组"}), 400
     if not name:
@@ -730,7 +734,7 @@ def merge_card_pools():
             return jsonify({"error": f"源分组 {gid} 不存在"}), 404
 
     new_id = models['card_group'].create(name, group_type=group_type)
-    result = models['card_pool'].move_non_invalid_to_group(source_ids, new_id)
+    result = models['card_pool'].move_non_invalid_to_group(source_ids, new_id, bucket=bucket)
     return jsonify({"status": "ok", "group_id": new_id,
                     "moved": result['moved'], "deduped": result['deduped']})
 

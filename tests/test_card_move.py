@@ -135,3 +135,30 @@ def test_merge_endpoint_still_works(client, groups):
     assert body['status'] == 'ok'
     assert body['moved'] == 20
     assert _bucket(models, body['group_id'])['unverified'] == 20
+
+
+def test_merge_valid_only_moves_valid_cards(client, groups):
+    """bucket='valid' 只把有效卡（命中 valid_cards）移到新组，未验证卡留在原组。"""
+    c, models = client
+    src, _ = groups
+    # 把前 6 张登记为有效卡（进入 valid_cards）
+    nums = [r['card_number'] for r in models['card_pool'].get_all_by_group(src)][:6]
+    for n in nums:
+        models['valid_card'].record({'number': n}, source_type='payment')
+
+    body = c.post('/api/card-pool/merge',
+                  json={'source_group_ids': [src], 'name': '仅有效组',
+                        'bucket': 'valid'}).get_json()
+    assert body['status'] == 'ok'
+    assert body['moved'] == 6, '只应移动 6 张有效卡'
+    assert _bucket(models, body['group_id'])['valid'] == 6
+    assert _bucket(models, src)['unverified'] == 14, '未验证卡应原地不动'
+
+
+def test_merge_rejects_bad_bucket(client, groups):
+    c, models = client
+    src, _ = groups
+    r = c.post('/api/card-pool/merge',
+               json={'source_group_ids': [src], 'name': 'x', 'bucket': 'bogus'})
+    assert r.status_code == 400
+    assert _bucket(models, src)['unverified'] == 20, '非法桶不得产生数据变更'

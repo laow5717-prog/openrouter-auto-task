@@ -137,21 +137,30 @@ class CardPoolModel:
         )
         return cursor.rowcount
 
-    def move_non_invalid_to_group(self, source_group_ids, target_group_id):
-        """把源分组里所有"非无效"卡（有效+未验证）**移动**到目标分组，按卡号去重。
+    def move_non_invalid_to_group(self, source_group_ids, target_group_id, bucket='non_invalid'):
+        """把源分组里指定桶的卡**移动**到目标分组，按卡号去重。
+        bucket='non_invalid'（默认）=有效+未验证；bucket='valid'=仅有效卡。
         返回 {moved, deduped}：moved=移入的去重卡数，deduped=删除的重复行数。
-        卡原状态随卡带走（改 group_id）。同号只保留一行入目标组，其余同号非无效行删除，
+        卡原状态随卡带走（改 group_id）。同号只保留一行入目标组，其余同号命中行删除，
         避免 UNIQUE(card_number, group_id) 冲突。"""
         if not source_group_ids:
             return {'moved': 0, 'deduped': 0}
+        if bucket not in ('non_invalid', 'valid'):
+            raise ValueError(f"不支持的桶: {bucket}")
         for gid in source_group_ids:
             self.refresh_expired_status(gid)
         ph_status = ','.join('?' * len(CARD_STATUS_UNUSABLE))
         ph_groups = ','.join('?' * len(source_group_ids))
+        if bucket == 'valid':
+            # 非无效 且 命中全局历史验证卡
+            frag = (f"COALESCE(status,'') NOT IN ({ph_status}) "
+                    "AND card_number IN (SELECT card_number FROM valid_cards)")
+        else:
+            frag = f"COALESCE(status,'') NOT IN ({ph_status})"
         rows = self.db.fetchall(
             f"""SELECT id, card_number FROM card_pool
                 WHERE group_id IN ({ph_groups})
-                  AND COALESCE(status,'') NOT IN ({ph_status})
+                  AND {frag}
                 ORDER BY id""",
             (*source_group_ids, *CARD_STATUS_UNUSABLE),
         )
