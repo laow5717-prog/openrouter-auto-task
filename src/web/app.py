@@ -616,6 +616,266 @@ class AppState:
             self._hooked_print(f"{'#' * 50}")
 
 
+    # ========= 每日订阅任务（Subscribe to Go）——additive，不改上面的充值路径 =========
+
+    def _hotmail_by_email(self, email):
+        """从 hotmail.xlsx 按 email 取 HotmailAccount（含 ruoanzhu link，注册收码所需）。
+
+        惰性加载并缓存成 dict{email→HotmailAccount}。xlsx 缺失/无该邮箱时返回 None。
+        """
+        if getattr(self, '_hotmail_map', None) is None:
+            self._hotmail_map = {}
+            try:
+                from src.services.hotmail_inbox import read_hotmail_accounts
+                xlsx = os.path.join(get_base_dir(), 'hotmail.xlsx')
+                for acc in read_hotmail_accounts(xlsx):
+                    self._hotmail_map[acc.email] = acc
+            except Exception as e:
+                self._hooked_print(f"读取 hotmail.xlsx 失败: {str(e)[:120]}")
+        return self._hotmail_map.get(email)
+
+    # 单账号单次推进内最多试几张卡即换下一个账号（避免坏卡把一个账号卡死数小时；
+    # 下一轮该账号会带新卡再来，坏卡已被标 invalid 退出可选集）。
+    SUBSCRIBE_MAX_CARDS_PER_ACCOUNT = 5
+
+    def _subscribe_one_account(self, acct, payment_group_id, captcha_api_key, worker=None):
+        """单账号一次推进：未注册先注册（Patchright，Arkose 跳过），已注册走原生栈登录+逐卡订阅。
+
+        返回 (result, detail)，result ∈ {"subscribed","registered_only","skipped","failed"}。
+        逐卡消耗规则镜像 recharge：订阅成功→卡 paid、拒付→卡 invalid、error/unknown→不耗卡换下一张。
+        单次最多试 SUBSCRIBE_MAX_CARDS_PER_ACCOUNT 张即换人（坏卡下不至于卡死单账号）。
+        跑在 worker 线程；InterruptedError 向上抛供轮转感知停止。account 排他由外层 claim 保证。
+        """
+        from src.browser.driver import create_driver_vanilla, close_driver
+        from src.browser.opencode_login import login_and_open_own_go
+        from src.browser.opencode_subscribe import subscribe_via_stripe
+        from src.services import captcha as captcha_solver
+
+        models = self.models
+        worker = worker or self.primary_worker
+        email = acct['email']
+        status = (acct.get('status') or '')
+
+        # --- A. 注册分支：未注册（非 registered/subscribed）先跑 GitHub 注册 ---
+        if status not in ('registered', 'subscribed'):
+            hacc = self._hotmail_by_email(email)
+            if not hacc:
+                self.set_action(worker, f"{email} 无 hotmail 数据，跳过")
+                return "skipped", "无 hotmail 数据（xlsx 缺该邮箱）"
+            from src.services.github_signup_service import signup_one
+            self.set_action(worker, f"{email} 未注册，尝试 GitHub 注册（Arkose 弹则跳过）")
+            # auto_skip_captcha：不弹 Arkose 自动收码完成注册；弹了立即跳过不等人工（全自动）。
+            r = signup_one(headless=False, semi_auto=False, account=hacc,
+                           then_opencode=False, auto_skip_captcha=True)
+            oc = r.get('outcome')
+            if oc == 'reached_captcha':
+                models['account'].update_status(email, 'pending')
+                return "skipped", "碰 Arkose，跳过（全自动模式不等人工）"
+            if oc == 'account_suspended':
+                models['account'].upsert(email, login_password=r.get('github_password'),
+                                         email_password=hacc.password, status='suspended')
+                return "skipped", "注册即挂起"
+            if oc != 'signup_complete':
+                models['account'].update_status(email, 'failed')
+                return "failed", f"注册失败: {oc}"
+            models['account'].upsert(email, login_password=r.get('github_password'),
+                                     email_password=hacc.password, status='registered')
+            self.add_log(f"{email} GitHub 注册成功，转订阅")
+            # signup_one 内部用 create_driver(Patchright)，返回时其 session 已关，下面另起原生栈
+
+        # --- B. 订阅分支：原生 Playwright 栈（hCaptcha token 注入只在原生栈生效）---
+        if captcha_api_key:
+            captcha_solver.init_solver(captcha_api_key)
+
+        session = create_driver_vanilla(profile_id=email)
+        monitor = worker.make_monitor(self)
+        worker.set_active_driver(session)
+        try:
+            # 导航前装 hCaptcha hook（原生栈下 add_init_script 真正生效）
+            if captcha_solver.is_available():
+                captcha_solver.install_hcaptcha_hook(session)
+
+            lg = login_and_open_own_go(session)
+            if not lg.get('ok'):
+                if lg.get('flagged'):
+                    # 新注册账号被 GitHub flag，无法授权 opencode OAuth → 标 flagged 永久跳过
+                    models['account'].update_status(email, 'flagged')
+                    self.set_action(worker, f"{email} GitHub 被 flagged，跳过")
+                    return "skipped", "GitHub 账号被 flagged，无法授权"
+                self.set_action(worker, f"{email} 登录失败: {lg.get('detail','')[:60]}")
+                return "failed", f"登录失败: {lg.get('detail')}"
+            wid = lg['wid']
+
+            # 账号内逐卡试付，成功即止（快照迭代；拒付卡已被标 invalid 退出后续可选集）
+            cards = self._eligible_cards(payment_group_id) if payment_group_id else []
+            if not cards:
+                return "registered_only", "无可选卡"
+            cards = cards[:self.SUBSCRIBE_MAX_CARDS_PER_ACCOUNT]   # 单次卡数上限，避免坏卡卡死
+            for card in cards:
+                if self.stop_requested:
+                    raise InterruptedError("用户请求停止")
+                num = card.get('number', '')
+                last4 = str(num)[-4:]
+                self.set_action(worker, f"{email} 订阅试卡 ****{last4}")
+                log_id = models['recharge_log'].create(email, num, amount=5)
+                res = subscribe_via_stripe(session, card, wid, monitor=monitor,
+                                           should_stop=lambda: self.stop_requested, dry=False)
+                oc = res.get('outcome')
+                if oc == 'success':
+                    models['card_pool'].mark_status_by_number(num, 'paid')
+                    try:
+                        models['valid_card'].record(card, source_type='payment', source_email=email)
+                    except Exception:
+                        pass
+                    models['account'].update_status(email, 'subscribed')
+                    models['recharge_log'].mark_success(log_id, api_response={"result": res})
+                    self.add_log(f"{email} ✅ 订阅成功（卡 ****{last4}）")
+                    return "subscribed", f"****{last4}"
+                elif oc == 'failed':
+                    models['card_pool'].mark_invalid_by_number(num)
+                    models['recharge_log'].mark_failed(log_id, error=res.get('err', ''),
+                                                       api_response={"result": res})
+                    self.add_log(f"{email} 卡 ****{last4} 拒付，标 invalid，换下一张")
+                elif oc == 'needs_captcha':
+                    models['recharge_log'].mark_failed(log_id, error='hCaptcha 未过',
+                                                       api_response={"result": res})
+                    self.set_action(worker, f"{email} hCaptcha 未过，本轮止")
+                    return "failed", "hCaptcha 未过"
+                else:  # error / unknown：不耗卡，换下一张
+                    models['recharge_log'].mark_failed(log_id, error=res.get('err', '') or oc,
+                                                       api_response={"result": res})
+            return "registered_only", "账号内可选卡试尽未成功"
+        except InterruptedError:
+            raise
+        except Exception as e:
+            self.set_action(worker, f"{email} 订阅异常: {str(e)[:80]}")
+            return "failed", str(e)[:200]
+        finally:
+            worker.clear_active_driver()
+            close_driver(session)
+
+    def run_daily_subscribe_pipeline(self, group_id, captcha_api_key=None):
+        """每日订阅任务：账号轮转——未注册先注册、已注册登录订阅，成功即换下一个账号。
+
+        镜像 run_daily_pipeline 的串行轮转/停止/兜底骨架，但：待订阅账号集 = status∉(subscribed,banned)；
+        单账号动作 = _subscribe_one_account；订阅成功的账号从后续轮次剔除。
+        停止：无可选卡 / 无待订阅账号 / 用户停止 / 整轮零进展兜底。
+        """
+        self.is_running = True
+        self.stop_requested = False
+        self.success_count = 0
+        self.fail_count = 0
+        self.current_action = "每日订阅任务启动中"
+        self.update_frame(None)
+        self._patch_prints()
+
+        account_model = self.models['account']
+        subscribed_total = 0
+        fail_total = 0
+        pool = WorkerPool(self, 1)      # 串行
+        round_lock = threading.Lock()
+
+        try:
+            self._hooked_print(f"\n{'#' * 50}")
+            self._hooked_print("每日订阅任务开始（账号轮转：注册/登录 + Stripe 订阅）")
+            self._hooked_print(f"{'#' * 50}")
+
+            eligible = len(self._eligible_cards(group_id))
+            self._hooked_print(f"分组可选卡 {eligible} 张")
+            if not eligible:
+                self._hooked_print("分组内无可选卡，无事可做")
+                return
+
+            # 待订阅 = 非终态：已订阅/封禁/挂起/被 flag 的都排除（flagged=GitHub 禁授权，无解）
+            _DONE = ('subscribed', 'banned', 'suspended', 'flagged')
+
+            def _needing():
+                return [a for a in account_model.get_all(order_desc=False)
+                        if (a.get('status') or '') not in _DONE]
+
+            MAX_ROUNDS = len(_needing()) * 5 + 5
+            round_num = 0
+            while round_num < MAX_ROUNDS:
+                if self.stop_requested:
+                    self._hooked_print("用户停止了任务")
+                    break
+                remaining = len(self._eligible_cards(group_id))
+                if not remaining:
+                    self._hooked_print("已无可选卡，任务结束")
+                    break
+                accounts = _needing()
+                if not accounts:
+                    self._hooked_print("已无待订阅账号（都 subscribed/banned），任务结束")
+                    break
+                round_num += 1
+                round_stats = {'subscribed': 0, 'other': 0}
+                self._hooked_print(f"\n{'=' * 50}\n订阅轮次 {round_num}"
+                                   f"（待订阅账号 {len(accounts)} 个，可选卡 {remaining} 张）\n{'=' * 50}")
+
+                def _do(worker, acct):
+                    email = acct['email']
+                    if self.stop_requested or not self._eligible_cards(group_id):
+                        return
+                    if not self.account_registry.claim(email):
+                        self._hooked_print(f"{email} 正被占用，本轮跳过")
+                        return
+                    try:
+                        self.set_action(worker, f"轮次{round_num} 订阅账号 {email}")
+                        self._hooked_print(f"\n订阅账号: {email}")
+                        result, detail = self._subscribe_one_account(
+                            acct, group_id, captcha_api_key, worker=worker)
+                        with round_lock:
+                            if result == "subscribed":
+                                round_stats['subscribed'] += 1
+                                self.success_count += 1
+                            else:
+                                round_stats['other'] += 1
+                                self.fail_count += 1
+                        self._hooked_print(f"{email} → {result}（{detail}）")
+                    except InterruptedError:
+                        self._hooked_print("订阅阶段被中断")
+                        raise
+                    except Exception as e:
+                        with round_lock:
+                            round_stats['other'] += 1
+                            self.fail_count += 1
+                        self._hooked_print(f"订阅 {email} 出错: {e}")
+                    finally:
+                        self.account_registry.release(email)
+
+                pool.map(accounts, _do)
+                subscribed_total += round_stats['subscribed']
+                fail_total += round_stats['other']
+
+                # 进展 = 本轮有订阅成功，或可选卡减少（拒付标无效）。零进展兜底防死循环。
+                after = len(self._eligible_cards(group_id))
+                progressed = round_stats['subscribed'] > 0 or after < remaining
+                if not progressed and not self.stop_requested:
+                    self._hooked_print("整轮无订阅成功且无卡被消耗，结束任务（兜底防死循环）")
+                    break
+
+        except Exception as e:
+            self._hooked_print(f"严重错误: {e}")
+        finally:
+            for w in self.workers.values():
+                w.clear_active_driver()
+                w.stop_screenshot_loop()
+                w.current_action = "空闲"
+                w.busy = False
+            self.account_registry.release_all()
+            self.payment_registry.release_all()
+            self.parallel_mode = False
+            self.is_running = False
+            try:
+                remaining = len(self._eligible_cards(group_id))
+            except Exception:
+                remaining = '?'
+            self.current_action = (f"每日订阅任务完成（订阅成功 {subscribed_total} 个 / "
+                                   f"未成 {fail_total} 次 / 剩余可选卡 {remaining} 张）")
+            self._hooked_print(f"\n{'#' * 50}")
+            self._hooked_print(self.current_action)
+            self._hooked_print(f"{'#' * 50}")
+
     def _patch_prints(self):
         """劫持相关模块的 print 函数以捕获日志"""
         hooked = self._hooked_print
@@ -625,6 +885,14 @@ class AppState:
             browser_module.print = hooked
         except Exception:
             pass
+        # 订阅链路各模块的 print 也劫持，便于 Web 日志捕获
+        for _mod in ('src.browser.opencode_subscribe', 'src.browser.opencode_login',
+                     'src.browser.opencode_billing', 'src.services.github_signup_service'):
+            try:
+                import importlib
+                importlib.import_module(_mod).print = hooked
+            except Exception:
+                pass
         try:
             from src.services import email as email_module
             email_module.print = hooked

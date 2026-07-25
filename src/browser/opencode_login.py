@@ -91,6 +91,18 @@ def _click_authorize_if_present(session):
     return False
 
 
+def _account_flagged(session):
+    """检测 GitHub 授权页是否报「This account is flagged ... cannot authorize a third party
+    application」。新注册账号常被 GitHub 反滥用 flag，无法授权 opencode OAuth。"""
+    try:
+        if "github.com" not in _cur_url(session):
+            return False
+        body = (session.page.inner_text("body", timeout=2000) or "").lower()
+        return "flagged" in body and "authorize" in body
+    except Exception:
+        return False
+
+
 def login_and_open_own_go(session, monitor=None, timeout=150):
     """登录 opencode 并进入该账号自己的 /go 页。
 
@@ -98,9 +110,10 @@ def login_and_open_own_go(session, monitor=None, timeout=150):
       ok:      bool     是否成功进入 /go
       wid:     str|None 该账号自己的 workspace id
       go_url:  str|None
+      flagged: bool     GitHub 账号被 flag，无法授权第三方应用（新号常见）
       detail:  str
     """
-    result = {"ok": False, "wid": None, "go_url": None, "detail": ""}
+    result = {"ok": False, "wid": None, "go_url": None, "flagged": False, "detail": ""}
     deadline = time.time() + timeout
 
     # 1) 触发 opencode 鉴权：访问受保护入口
@@ -125,9 +138,21 @@ def login_and_open_own_go(session, monitor=None, timeout=150):
         # 3) GitHub 授权页（新号首次）点 Authorize
         if "github.com" in _cur_url(session):
             _step(monitor, session, "GitHub 授权页，点 Authorize")
+            # 新注册账号常被 GitHub flag，授权页直接报「account is flagged, cannot authorize」
+            if _account_flagged(session):
+                result["flagged"] = True
+                result["detail"] = "GitHub 账号被 flagged，无法授权第三方应用（opencode OAuth）"
+                _step(monitor, session, result["detail"])
+                return result
             _click_authorize_if_present(session)
             url = _wait_until(session, lambda u: u and "github.com" not in u,
                               timeout=max(10, int(deadline - time.time())))
+            # 点 Authorize 后仍可能停在 github 并显示 flagged
+            if _account_flagged(session):
+                result["flagged"] = True
+                result["detail"] = "GitHub 账号被 flagged，无法授权第三方应用（opencode OAuth）"
+                _step(monitor, session, result["detail"])
+                return result
 
     # 4) 等回落到 opencode workspace，取自己的 wid
     url = _wait_until(

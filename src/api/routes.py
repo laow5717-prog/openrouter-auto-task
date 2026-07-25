@@ -977,3 +977,46 @@ def start_daily_pipeline():
 
     return jsonify({"status": "started", "usable_cards": eligible,
                     "accounts": account_count, "group_name": group['name']})
+
+
+@api.route('/api/daily/subscribe/start', methods=['POST'])
+def start_daily_subscribe_pipeline():
+    """启动每日订阅任务：账号轮转——未注册先注册、已注册登录订阅，成功即换下一个账号，
+    直到无可选卡 / 无待订阅账号 / 用户停止。与每日充值任务互斥（共用 is_running 闸门）。"""
+    state = get_app_state()
+    if state.is_running:
+        return jsonify({"error": "有任务正在运行"}), 400
+
+    models = get_models()
+    data = request.json or {}
+
+    group_id = data.get('group_id')
+    if not group_id:
+        return jsonify({"error": "未指定卡池分组"}), 400
+    group = models['card_group'].get_by_id(group_id)
+    if not group:
+        return jsonify({"error": "卡池分组不存在"}), 404
+
+    captcha_api_key = data.get('captcha_api_key')
+
+    # 启动门：分组要有可选卡，且要有待订阅账号（status 非 subscribed/banned）
+    eligible = len(state._eligible_cards(group_id))
+    if not eligible:
+        return jsonify({"error": "该分组无可选卡（全部无效/过期或冷却中），无事可做"}), 400
+
+    accts = models['account'].get_all(order_desc=False)
+    account_count = sum(1 for a in accts
+                        if (a.get('status') or '') not in
+                        ('subscribed', 'banned', 'suspended', 'flagged'))
+    if account_count == 0:
+        return jsonify({"error": "无待订阅账号（都已 subscribed/banned/suspended/flagged），无事可做"}), 400
+
+    import threading
+    threading.Thread(
+        target=state.run_daily_subscribe_pipeline,
+        args=(group_id, captcha_api_key),
+        daemon=True,
+    ).start()
+
+    return jsonify({"status": "started", "usable_cards": eligible,
+                    "accounts": account_count, "group_name": group['name']})

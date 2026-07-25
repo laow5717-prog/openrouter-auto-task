@@ -3,8 +3,9 @@
   <div class="info-banner">
     <Icon name="bolt" size="16" />
     <span>
-      <strong>每日充值任务：</strong>
-      选定一个卡池分组，用账号列表逐账号轮转充值（一个账号充成一张即换下一个账号）。新卡优先、成功的好卡可复用；坏卡首拒判无效、好卡再拒进 24h 冷却，直到无可选卡为止。逐卡记录卡片状态与原因，并写入充值记录。
+      <strong>每日任务：</strong>
+      <strong>「开始充值」</strong>逐账号轮转充值（充成一张即换下一个账号，新卡优先、好卡可复用）。
+      <strong>「开始订阅」</strong>逐账号轮转 Subscribe to Go：未注册的先注册（碰 Arkose 自动跳过）、已注册的登录后逐卡试付，订阅成功即换下一个账号，直到无可选卡或无待订阅账号。两者互斥、共用卡池分组与 2Captcha Key。
     </span>
   </div>
 
@@ -41,11 +42,17 @@
         </div>
       </div>
 
-      <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
-        <button v-if="!appStore.isRunning" class="btn btn-primary" style="width:auto;padding:8px 24px"
-                :disabled="!settings.dailyGroupId" @click="handleStart">
-          <Icon name="play" size="15" /> 开始运行
-        </button>
+      <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <template v-if="!appStore.isRunning">
+          <button class="btn btn-primary" style="width:auto;padding:8px 24px"
+                  :disabled="!settings.dailyGroupId" @click="handleStart">
+            <Icon name="play" size="15" /> 开始充值
+          </button>
+          <button class="btn btn-primary" style="width:auto;padding:8px 24px"
+                  :disabled="!settings.dailyGroupId" @click="handleStartSubscribe">
+            <Icon name="bolt" size="15" /> 开始订阅
+          </button>
+        </template>
         <button v-else class="btn btn-danger" style="width:auto;padding:8px 24px" @click="handleStop">
           <Icon name="stop" size="15" /> 停止
         </button>
@@ -108,7 +115,7 @@
 import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
-import { getCardGroups, startDailyPipeline, stopTask } from '../api'
+import { getCardGroups, startDailyPipeline, startDailySubscribe, stopTask } from '../api'
 import Icon from '../components/Icon.vue'
 
 const appStore = useAppStore()
@@ -165,6 +172,26 @@ async function handleStart() {
     alert(result.group_name
       ? `已启动每日充值任务（分组「${result.group_name}」未消耗卡 ${result.usable_cards} 张 · 可用账号 ${result.accounts} 个）`
       : '已启动每日充值任务')
+  } catch (e) {
+    alert('启动失败: ' + e.message)
+  }
+}
+
+async function handleStartSubscribe() {
+  if (appStore.isRunning) { alert('任务已在运行中'); return }
+  if (!settings.dailyGroupId) { alert('请选择卡池分组'); return }
+  appStore.clearLogs()
+  settings.save()
+
+  const body = { group_id: settings.dailyGroupId }
+  if (settings.captchaApiKey) body.captcha_api_key = settings.captchaApiKey
+
+  try {
+    const result = await startDailySubscribe(body)
+    appStore.poll()
+    alert(result.group_name
+      ? `已启动每日订阅任务（分组「${result.group_name}」可选卡 ${result.usable_cards} 张 · 待订阅账号 ${result.accounts} 个）`
+      : '已启动每日订阅任务')
   } catch (e) {
     alert('启动失败: ' + e.message)
   }

@@ -156,12 +156,14 @@ def _finish_semi_auto(session, fetch_code, result):
 
 
 def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
-               then_opencode=False):
+               then_opencode=False, auto_skip_captcha=False):
     """执行一次 GitHub 注册。
 
     semi_auto=False：只跑到 Arkose 验证码出现为止（outcome=reached_captcha）。
     semi_auto=True：跑到验证码后**暂停等人工手动过码**，通过后自动收验证邮件、
                     回填 launch code、判定注册是否完成。需有头模式且有人在场过码。
+    auto_skip_captcha=True：**全自动**——不弹 Arkose 时自动收码完成注册（signup_complete）；
+                    弹 Arkose 时立即返回 reached_captcha 跳过、绝不等人工。用于批量注册。
     keep_open=True：流程跑完后**不关浏览器**，进程挂住（Ctrl-C 结束），供人肉眼查看最终页面。
     account：可选 HotmailAccount（含 email/password/link）。
              - None（默认）：走原 mail.tm 临时邮箱路径，收码走 mail.tm API。
@@ -264,7 +266,9 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
         result["screenshot"] = _screenshot(session, address)
 
         if term["terminal"] == gh.TERM_CAPTCHA:
-            if not semi_auto:
+            # auto_skip_captcha：弹 Arkose 即返回 reached_captcha 跳过，绝不等人工
+            # （全自动批量注册用；不弹 Arkose 的账号仍会走 VERIFY_EMAIL 分支自动完成）。
+            if not semi_auto or auto_skip_captcha:
                 result["ok"] = True
                 result["outcome"] = "reached_captcha"
                 result["reason"] = term["detail"]
@@ -276,7 +280,8 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
             result["screenshot"] = _screenshot(session, address)
         elif term["terminal"] == gh.TERM_VERIFY_EMAIL:
             # 未出验证码，直接进邮箱验证页——无需人工，直接自动收码回填。
-            if not semi_auto:
+            # semi_auto 或 auto_skip_captcha 都走自动收码完成；纯默认模式才停在此。
+            if not semi_auto and not auto_skip_captcha:
                 result["ok"] = True
                 result["outcome"] = "reached_verify_email"
                 result["reason"] = term["detail"] + "（默认模式不自动收码；加 --semi-auto 可自动回填）"

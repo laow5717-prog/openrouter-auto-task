@@ -99,3 +99,5 @@ export const getValidCards = (params) => get('/api/valid-cards', params)
 
 // Daily one-click pipeline
 export const startDailyPipeline = (data) => post('/api/daily/start', data)
+// Daily subscribe pipeline（账号轮转：注册/登录 + Stripe 订阅）
+export const startDailySubscribe = (data) => post('/api/daily/subscribe/start', data)
