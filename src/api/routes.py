@@ -305,6 +305,9 @@ def get_accounts():
             "cards_checked_at": acc.get('cards_checked_at') or '',
             "credits_balance": acc.get('credits_balance'),
             "balance_updated_at": acc.get('balance_updated_at') or '',
+            "apikey": acc.get('apikey') or '',
+            "apikey_updated_at": acc.get('apikey_updated_at') or '',
+            "email_verify_link": acc.get('email_verify_link') or '',
         })
 
     return jsonify({"data": data, "total": total, "page": page, "page_size": page_size})
@@ -565,10 +568,7 @@ def export_accounts():
     ws = wb.active
     ws.title = "Accounts"
 
-    headers = ["邮箱", "CF密码", "邮箱密码", "状态", "注册时间",
-               "卡号", "有效期", "CVC", "持卡人",
-               "国家", "地址1", "地址2", "城市", "州/省", "邮编", "公司",
-               "绑卡状态", "绑卡时间", "Credits余额", "余额更新时间"]
+    headers = ["邮箱", "GitHub密码", "邮箱密码", "认证链接", "apikey", "余额"]
     header_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
     header_font = Font(bold=True, size=11)
     for col_idx, h in enumerate(headers, 1):
@@ -578,39 +578,13 @@ def export_accounts():
 
     row_idx = 2
     for acc in accounts:
-        email = acc['email']
-        cards = models['card_binding'].get_by_email(email)
-
-        def write_acc_cols(r):
-            ws.cell(row=r, column=1, value=email)
-            ws.cell(row=r, column=2, value=acc.get('login_password') or '')
-            ws.cell(row=r, column=3, value=acc.get('email_password') or '')
-            ws.cell(row=r, column=4, value=acc.get('status') or '')
-            ws.cell(row=r, column=5, value=acc.get('created_at') or '')
-            ws.cell(row=r, column=19, value=acc.get('credits_balance'))
-            ws.cell(row=r, column=20, value=acc.get('balance_updated_at') or '')
-
-        if cards:
-            for card in cards:
-                write_acc_cols(row_idx)
-                ws.cell(row=row_idx, column=6, value=card.get('card_number', ''))
-                expiry = f"{card.get('expiry_month', '')}/{card.get('expiry_year', '')}" if card.get('expiry_month') else ''
-                ws.cell(row=row_idx, column=7, value=expiry)
-                ws.cell(row=row_idx, column=8, value=card.get('cvc', ''))
-                ws.cell(row=row_idx, column=9, value=card.get('card_holder', ''))
-                ws.cell(row=row_idx, column=10, value=card.get('country', ''))
-                ws.cell(row=row_idx, column=11, value=card.get('address', ''))
-                ws.cell(row=row_idx, column=12, value=card.get('address2', ''))
-                ws.cell(row=row_idx, column=13, value=card.get('city', ''))
-                ws.cell(row=row_idx, column=14, value=card.get('state', ''))
-                ws.cell(row=row_idx, column=15, value=card.get('zip', ''))
-                ws.cell(row=row_idx, column=16, value=card.get('company', ''))
-                ws.cell(row=row_idx, column=17, value=card.get('status', ''))
-                ws.cell(row=row_idx, column=18, value=card.get('attempted_at') or '')
-                row_idx += 1
-        else:
-            write_acc_cols(row_idx)
-            row_idx += 1
+        ws.cell(row=row_idx, column=1, value=acc['email'])
+        ws.cell(row=row_idx, column=2, value=acc.get('login_password') or '')
+        ws.cell(row=row_idx, column=3, value=acc.get('email_password') or '')
+        ws.cell(row=row_idx, column=4, value=acc.get('email_verify_link') or '')
+        ws.cell(row=row_idx, column=5, value=acc.get('apikey') or '')
+        ws.cell(row=row_idx, column=6, value=acc.get('credits_balance'))
+        row_idx += 1
 
     for col in ws.columns:
         max_len = 0

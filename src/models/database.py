@@ -157,6 +157,15 @@ ALTER TABLE accounts ADD COLUMN bound_card_count INTEGER;
 ALTER TABLE accounts ADD COLUMN cards_checked_at TEXT;
 """
 
+# 账号补充列:apikey = opencode API key（明文，读自 /workspace/<wid>/keys 的 Default key，
+# apikey_updated_at 记抓取时刻）；email_verify_link = hotmail.xlsx 每行第三段的 ruoanzhu 收信链接。
+# 均 additive、可空，不影响既有读写。
+_SCHEMA_V10 = """
+ALTER TABLE accounts ADD COLUMN apikey TEXT;
+ALTER TABLE accounts ADD COLUMN apikey_updated_at TEXT;
+ALTER TABLE accounts ADD COLUMN email_verify_link TEXT;
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -167,6 +176,7 @@ _MIGRATIONS = {
     7: _SCHEMA_V7,
     8: _SCHEMA_V8,
     9: _SCHEMA_V9,
+    10: _SCHEMA_V10,
 }
 
 

@@ -705,13 +705,15 @@ class AppState:
                 return "skipped", "碰 Arkose，跳过（全自动模式不等人工）"
             if oc == 'account_suspended':
                 models['account'].upsert(email, login_password=r.get('github_password'),
-                                         email_password=hacc.password, status='suspended')
+                                         email_password=hacc.password, status='suspended',
+                                         email_verify_link=hacc.link)
                 return "skipped", "注册即挂起"
             if oc != 'signup_complete':
                 models['account'].update_status(email, 'failed')
                 return "failed", f"注册失败: {oc}"
             models['account'].upsert(email, login_password=r.get('github_password'),
-                                     email_password=hacc.password, status='registered')
+                                     email_password=hacc.password, status='registered',
+                                     email_verify_link=hacc.link)
             self.add_log(f"{email} GitHub 注册成功，转订阅")
             # signup_one 内部用 create_driver(Patchright)，返回时其 session 已关，下面另起原生栈
 

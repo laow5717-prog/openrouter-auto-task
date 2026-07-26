@@ -7,19 +7,27 @@ class AccountModel:
     def __init__(self, db):
         self.db = db
 
-    def upsert(self, email, login_password=None, email_password=None, status='registered'):
-        existing = self.db.fetchone("SELECT id, login_password, email_password FROM accounts WHERE email = ?", (email,))
+    def upsert(self, email, login_password=None, email_password=None, status='registered',
+               email_verify_link=None):
+        existing = self.db.fetchone(
+            "SELECT id, login_password, email_password, email_verify_link FROM accounts WHERE email = ?",
+            (email,),
+        )
         if existing:
             final_pw = login_password if login_password else existing['login_password']
             final_ep = email_password if email_password else existing['email_password']
+            # 传入非空才覆盖认证链接，否则保留原值（同 login_password 语义）
+            final_link = email_verify_link if email_verify_link else existing['email_verify_link']
             self.db.execute(
-                "UPDATE accounts SET login_password=?, email_password=?, status=?, updated_at=datetime('now','localtime') WHERE email=?",
-                (final_pw, final_ep, status, email),
+                "UPDATE accounts SET login_password=?, email_password=?, status=?, email_verify_link=?, "
+                "updated_at=datetime('now','localtime') WHERE email=?",
+                (final_pw, final_ep, status, final_link, email),
             )
         else:
             self.db.execute(
-                "INSERT INTO accounts (email, login_password, email_password, status) VALUES (?, ?, ?, ?)",
-                (email, login_password, email_password, status),
+                "INSERT INTO accounts (email, login_password, email_password, status, email_verify_link) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (email, login_password, email_password, status, email_verify_link),
             )
 
     def update_status(self, email, status):
@@ -74,6 +82,34 @@ class AccountModel:
             "updated_at=datetime('now','localtime') WHERE email=?",
             (float(balance), email),
         )
+
+    def update_apikey(self, email, apikey):
+        """记录该账号从 opencode /keys 页抓到的 API key（明文）。
+
+        apikey 为空/None 时直接跳过，避免把抓取失败写成空值覆盖已有 key。
+        """
+        if not apikey:
+            return
+        self.db.execute(
+            "UPDATE accounts SET apikey=?, apikey_updated_at=datetime('now','localtime'), "
+            "updated_at=datetime('now','localtime') WHERE email=?",
+            (apikey, email),
+        )
+
+    def backfill_email_verify_link(self, email, link):
+        """回填邮箱认证链接（hotmail.xlsx 的 ruoanzhu 收信链接）。
+
+        只写「账号已存在且当前为空」的行——不新建账号、不覆盖已有链接，可重复执行。
+        返回受影响行数（1 表示回填成功，0 表示账号不存在或已有链接）。
+        """
+        if not link:
+            return 0
+        cur = self.db.execute(
+            "UPDATE accounts SET email_verify_link=?, updated_at=datetime('now','localtime') "
+            "WHERE email=? AND (email_verify_link IS NULL OR email_verify_link='')",
+            (link, email),
+        )
+        return cur.rowcount
 
     def get_email_password(self, email):
         """取该账号的邮箱密码（用于登录二次验证时换 mail.tm token）。
