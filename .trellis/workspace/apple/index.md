@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 33
+- **Total Sessions**: 34
 - **Last Active**: 2026-07-26
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1184 | Active |
+| `journal-1.md` | ~1220 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 34 | 2026-07-26 | 充值 hCaptcha 自动解 + 余额≥$20 归档 + 修复误标 failed 账号 | `fef9180`, `aac230a`, `420a2dc`, `5a83146` | `main` |
 | 33 | 2026-07-26 | 充值成功后余额落库修复 | `fe8a591` | `main` |
 | 32 | 2026-07-26 | 已验证卡永久有效：曾成功卡失败改24h冷却不标无效 | `2edf5b9` | `main` |
 | 31 | 2026-07-19 | 修复浏览器 profile 白屏；定位 Turnstile token 未交付 | `9202eb7` | `main` |

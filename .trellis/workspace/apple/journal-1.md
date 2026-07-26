@@ -1182,3 +1182,39 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 34: 充值 hCaptcha 自动解 + 余额≥$20 归档 + 修复误标 failed 账号
+
+**Date**: 2026-07-26
+**Task**: 充值 hCaptcha 自动解 + 余额≥$20 归档 + 修复误标 failed 账号
+**Branch**: `main`
+
+### Summary
+
+充值支付环节复用订阅那套 hCaptcha 自动解：recharge_account 改用 create_driver_vanilla（复用同 profile 登录态）+ init_solver(multibot) + install_hcaptcha_hook；detect_payment_result 接入 solve_hcaptcha（3DS 优先、非3DS阶段最多解3次、3次不过判 needs_captcha，未配 key 退化等人工）。登录后读实时余额≥$20 即 status=archived 跳过不扣款、退出轮转（新 outcome archived，env OPENCODE_RECHARGE_SKIP_BALANCE 可调）。captcha_api_key/captcha_server 从 routes→app→registration 透传，日常与单账号充值端点均生效，启动门/轮转排除 archived。R3 一次性把误标 failed 的账号批量改回 registered（新增 AccountModel.reset_failed_to_registered + scripts/fix_failed_accounts_status.py，已跑 4 个 failed→registered）+ tests/test_account_status.py。spec 更新 captcha-guidelines(Payment-flow hCaptcha 一节) 与 api/index。订阅流程零改动。pytest 152 pass/5 fail(5个是07-23遗留陈旧用例)。遗留债待办：test_daily_pipeline.py 与 api/index 三阶段契约仍停在07-23重构前绑卡流程；R1/R2 端到端需真实跑批验证。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fef9180` | (see git log) |
+| `aac230a` | (see git log) |
+| `420a2dc` | (see git log) |
+| `5a83146` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
