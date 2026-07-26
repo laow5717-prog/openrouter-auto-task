@@ -40,21 +40,23 @@
           <tr>
             <th style="width:40px"><input type="checkbox" :checked="allChecked" @change="toggleAll($event.target.checked)"></th>
             <th>邮箱账号</th>
-            <th>CF密码</th>
+            <th>GitHub密码</th>
             <th>邮箱密码 <a href="https://mail.tm" target="_blank" style="font-weight:normal;font-size:11px;color:var(--primary)">(mail.tm)</a></th>
             <th style="white-space:nowrap">状态</th>
             <th style="white-space:nowrap">绑定卡片</th>
             <th style="white-space:nowrap">Credits 余额</th>
+            <th style="white-space:nowrap">API Key</th>
+            <th style="white-space:nowrap">邮箱认证链接</th>
             <th style="white-space:nowrap">时间</th>
-            <th style="white-space:nowrap">操作</th>
+            <th style="white-space:nowrap" class="col-actions">操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="9" class="table-loading">加载中...</td>
+            <td colspan="11" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="accounts.length === 0">
-            <td colspan="9" class="table-empty">暂无数据</td>
+            <td colspan="11" class="table-empty">暂无数据</td>
           </tr>
           <tr v-for="acc in accounts" :key="acc.email">
             <td><input type="checkbox" :checked="selected.has(acc.email)" @change="toggleSelect(acc.email, $event.target.checked)"></td>
@@ -83,8 +85,17 @@
               </span>
               <span v-else style="color:var(--text-sub)">-</span>
             </td>
+            <td style="font-family:monospace"
+                :title="acc.apikey_updated_at ? `抓取于 ${acc.apikey_updated_at}` : ''">
+              {{ acc.apikey || '-' }}
+            </td>
+            <td>
+              <a v-if="acc.email_verify_link" :href="acc.email_verify_link" target="_blank"
+                 style="color:var(--primary)">{{ acc.email_verify_link }}</a>
+              <span v-else style="color:var(--text-sub)">-</span>
+            </td>
             <td>{{ acc.time }}</td>
-            <td style="display:flex;gap:6px;align-items:center">
+            <td class="col-actions" style="display:flex;gap:6px;align-items:center">
               <button
                 class="row-browse-btn"
                 :disabled="openBrowserEmails.has(acc.email)"
@@ -467,6 +478,17 @@ onUnmounted(stopBrowserPoll)
   word-break: break-all;
   min-width: 100px;
 }
+
+/* 操作列固定在表格右侧，横向滚动时保持可见 */
+.acc-table th.col-actions,
+.acc-table td.col-actions {
+  position: sticky;
+  right: 0;
+  background: #fff;
+  box-shadow: -6px 0 8px -6px rgba(0, 0, 0, 0.12);
+}
+.acc-table th.col-actions { z-index: 3; }
+.acc-table td.col-actions { z-index: 2; }
 
 .card-count-badge {
   display: inline-flex;
