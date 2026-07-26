@@ -1218,3 +1218,37 @@ Migrated frontend to Vue 3 + Vite SPA. Added paginated account list with filteri
 ### Next Steps
 
 - None - task complete
+
+
+## Session 35: 账号 apikey 与邮箱认证链接落库 + 列表/导出优化
+
+**Date**: 2026-07-26
+**Task**: 账号 apikey 与邮箱认证链接落库 + 列表/导出优化
+**Branch**: `main`
+
+### Summary
+
+V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail.xlsx 回填认证链接 10/10；scripts/fetch_apikeys.py 抓取有余额账号 apikey 7/7；列表接口与前端账号表新增两列明文展示；操作列固定右侧(sticky)；CF密码改名 GitHub密码；账号导出精简为 邮箱/GitHub密码/邮箱密码/认证链接/apikey/余额 6 字段。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e4978a8` | (see git log) |
+| `dcdea50` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
