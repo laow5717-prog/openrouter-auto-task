@@ -466,6 +466,13 @@ class AppState:
                 self.add_log(f"{email} 余额≥$20，已归档跳过充值（{err}）")
                 return "archived", err or 'archived'
 
+            if outcome == "flagged":
+                # GitHub 被 flag 无法授权 OAuth：账号级终态（registration 已标
+                # status='flagged'），同 archived 语义退出后续轮转
+                self.set_action(worker, f"{email} GitHub 被 flagged，退出轮转")
+                self.add_log(f"{email} GitHub 账号被 flagged，已标记并退出每日轮转（{err}）")
+                return "flagged", err or 'flagged'
+
             # outcome == "failed"：逐卡的失效标记与记账已在 registration 内完成
             self.set_action(worker, f"{email} 本次未付成: {err}")
             self.add_log(f"{email} 本次未付成: {err}")
@@ -491,8 +498,9 @@ class AppState:
         账号、计数与收尾。
 
         captcha_api_key/captcha_server 透传给充值流程用于自动解 hCaptcha（server 默认 Multibot）。
-        账号选取排除 banned 与 archived；登录后实时余额 ≥$20 的账号会被归档（status='archived'）
-        并退出后续轮转。
+        账号选取排除 banned、archived 与 flagged；登录后实时余额 ≥$20 的账号会被归档
+        （status='archived'）并退出后续轮转；GitHub 被 flag 无法授权 OAuth 的账号会被标
+        flagged 并退出轮转（与订阅管线一致）。
 
         login_password 可选，用于覆盖账号自身密码（一般留空，用各账号 accounts.login_password）。
         并发度固定为 1（串行）：WorkerPool 的 is_serial 分支走同线程，保留截图/停止集成。"""
@@ -510,7 +518,8 @@ class AppState:
         paid_total = 0            # 成功付款次数
         fail_total = 0            # 账号访问未付成次数
         archived_total = 0        # 余额≥$20 归档跳过次数
-        done_emails = set()       # 本次运行已归档、退出后续轮转的账号
+        flagged_total = 0         # GitHub flagged 标记退出次数
+        done_emails = set()       # 本次运行已归档/flagged、退出后续轮转的账号
 
         # 并发度固定为 1（串行）。WorkerPool.is_serial 走同线程分支，行为与直接调用等价。
         pool = WorkerPool(self, 1)
@@ -525,7 +534,7 @@ class AppState:
             accounts = [
                 a for a in accts
                 if (login_password or a.get('login_password'))
-                and (a.get('status') or '') not in ('banned', 'archived')
+                and (a.get('status') or '') not in ('banned', 'archived', 'flagged')
             ]
             if not accounts:
                 self._hooked_print("无可充值账号（需有登录密码且未封禁），任务结束")
@@ -551,7 +560,7 @@ class AppState:
                     self._hooked_print("已无可选卡（全部无效/过期或冷却中），任务结束")
                     break
                 round_num += 1
-                round_stats = {'paid': 0, 'failed': 0, 'archived': 0}
+                round_stats = {'paid': 0, 'failed': 0, 'archived': 0, 'flagged': 0}
                 self._hooked_print(f"\n{'=' * 50}\n充值轮次 {round_num}（当前可选卡 {remaining} 张）\n{'=' * 50}")
 
                 def _recharge_one(worker, acct):
@@ -586,6 +595,10 @@ class AppState:
                                 # 余额≥$20 归档：既非成功也非失败，退出该账号后续轮转
                                 round_stats['archived'] += 1
                                 done_emails.add(email)
+                            elif result == "flagged":
+                                # GitHub 被 flag 无法授权 OAuth：账号级终态，退出后续轮转
+                                round_stats['flagged'] += 1
+                                done_emails.add(email)
                             else:
                                 round_stats['failed'] += 1
                                 self.fail_count += 1
@@ -606,6 +619,7 @@ class AppState:
                 paid_total += round_stats['paid']
                 fail_total += round_stats['failed']
                 archived_total += round_stats['archived']
+                flagged_total += round_stats['flagged']
 
                 # 进展 = 本轮有成功付款，或可选卡数减少（坏卡判无效 / 好卡进冷却 / 过期），
                 # 或有账号被归档（退出轮转、账号集在收敛）。只要还有进展就继续轮转；整轮零成功、
@@ -615,7 +629,7 @@ class AppState:
                 # MAX_ROUNDS 是极端不收敛下的最终兜底。
                 after = len(self._eligible_cards(group_id))
                 progressed = (round_stats['paid'] > 0 or after < remaining
-                              or round_stats['archived'] > 0)
+                              or round_stats['archived'] > 0 or round_stats['flagged'] > 0)
                 if not progressed and not self.stop_requested:
                     self._hooked_print("整轮无成功付款且无卡被消耗/冷却/归档，结束任务（兜底防死循环）")
                     break
@@ -640,7 +654,8 @@ class AppState:
                 remaining = '?'
             self.current_action = (
                 f"每日充值任务完成（成功付款 {paid_total} 次 / "
-                f"未付成 {fail_total} 次 / 归档跳过 {archived_total} 个 / 剩余可选卡 {remaining} 张）"
+                f"未付成 {fail_total} 次 / 归档跳过 {archived_total} 个 / "
+                f"flagged 退出 {flagged_total} 个 / 剩余可选卡 {remaining} 张）"
             )
             self._hooked_print(f"\n{'#' * 50}")
             self._hooked_print(self.current_action)

@@ -20,6 +20,8 @@
         <option value="interrupted">已中断</option>
         <option value="all_bindings_failed">绑卡全部失败</option>
         <option value="banned">已封禁</option>
+        <option value="flagged">GitHub受限</option>
+        <option value="archived">已归档</option>
         <option value="failed">失败</option>
         <option value="error">错误</option>
       </select>
@@ -273,6 +275,11 @@ const statusMap = {
   billing_page: '账单页面',
   all_bindings_failed: '绑卡全部失败',
   banned: '已封禁',
+  flagged: 'GitHub受限',       // GitHub 反滥用 flag，无法授权第三方 OAuth，每日任务不再轮转
+  archived: '已归档',          // 余额≥阈值，每日充值跳过
+  suspended: '已挂起',
+  subscribed: '已订阅',
+  recharged: '已充值',
 }
 // 账单页真实绑卡数 - 库内已关联卡数 = 卡池外的卡，仅计数不展示明细
 function extraBoundCount(acc) {
@@ -287,10 +294,11 @@ function accStatusLabel(s) {
   return s
 }
 function accStatusClass(s) {
-  if (s === 'banned') return 'fail'
+  if (s === 'banned' || s === 'flagged' || s === 'suspended') return 'fail'
   if (s.includes('bound') || s === 'registered') return 'success'
+  if (s === 'subscribed' || s === 'recharged') return 'success'
   if (s.includes('failed') || s === 'error') return 'fail'
-  if (s === 'interrupted' || s === 'billing_page') return 'warn'
+  if (s === 'interrupted' || s === 'billing_page' || s === 'archived') return 'warn'
   return ''
 }
 

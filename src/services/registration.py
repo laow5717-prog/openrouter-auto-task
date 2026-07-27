@@ -81,7 +81,8 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     captcha_server:  求解服务域名，默认 Multibot（api.multibot.cloud）；可传 '2captcha.com'。
 
     返回契约: (ok, err, responses, card_last4, outcome)，
-    outcome ∈ {"topup"(成功), "failed", "archived"(余额≥阈值已归档、未扣款)}。
+    outcome ∈ {"topup"(成功), "failed", "archived"(余额≥阈值已归档、未扣款),
+               "flagged"(GitHub 账号被 flag 无法授权 OAuth，已标 status='flagged')}。
 
     卡消耗与逐卡记账集中在本函数：成功→card_pool 标 paid + valid_card + recharge_logs
     success；明确拒付→card_pool 标 invalid + recharge_logs failed（带原因）。调用方无需
@@ -145,6 +146,15 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
         wid, detail = ob.ensure_opencode_session(session, monitor_callback, login_password, email)
         if not wid:
+            if "flagged" in (detail or ""):
+                # GitHub 账号被 flag，无法授权 opencode OAuth——账号级终态（与订阅管线的
+                # flagged 处理一致）：标记后由上层退出每日轮转，不再每轮空开浏览器。
+                if account_model:
+                    try:
+                        account_model.update_status(email, "flagged")
+                    except Exception:
+                        pass
+                return (False, f"opencode 未登录：{detail}", responses, last4, "flagged")
             return (False, f"opencode 未登录：{detail}", responses, last4, "failed")
 
         # R2 归档预检：登录后读实时余额，≥ 阈值即跳过充值并归档（不试任何卡、不扣款）。
