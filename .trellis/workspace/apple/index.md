@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 35
-- **Last Active**: 2026-07-26
+- **Total Sessions**: 36
+- **Last Active**: 2026-07-27
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1254 | Active |
+| `journal-1.md` | ~1285 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 36 | 2026-07-27 | 诊断充值 hCaptcha 误报根因 + briced35 GitHub 重注册(未成) | - | `main` |
 | 35 | 2026-07-26 | 账号 apikey 与邮箱认证链接落库 + 列表/导出优化 | `e4978a8`, `dcdea50` | `main` |
 | 34 | 2026-07-26 | 充值 hCaptcha 自动解 + 余额≥$20 归档 + 修复误标 failed 账号 | `fef9180`, `aac230a`, `420a2dc`, `5a83146` | `main` |
 | 33 | 2026-07-26 | 充值成功后余额落库修复 | `fe8a591` | `main` |
