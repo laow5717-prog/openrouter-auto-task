@@ -82,6 +82,19 @@ login session — a worse outcome than the white screen being fixed.
 `_kill_chrome_for_profile(..., grace=5)` on the close path, `grace=0` on the
 launch path (orphans there will not exit on their own).
 
+**The close watchdog is two-stage: Chrome first, then the node driver.**
+Killing Chrome does not always unblock a hung `context.close()` — the 2026-07-28
+daily-recharge incident had Chrome already exited while `close()` still sat
+blocked in the Playwright **node driver** (`cli.js run-driver`) for ~300s with
+zero log output, indistinguishable from a dead task. The watchdog therefore
+kills Chrome at 30s, waits up to 10 more seconds on `_close_finished`, and then
+SIGKILLs `_node_pid` (captured at driver creation via
+`playwright._impl_obj._connection._transport._proc.pid` — verified on both the
+Patchright and vanilla stacks). The flag is set before `watchdog.cancel()`
+because cancel is a no-op once the timer has fired; the flag is the only thing
+preventing a kill after a slow-but-successful close. Watchdog threads only ever
+`os.kill` — never touch Playwright objects from another thread.
+
 **Process lookup uses `ps`, not psutil.** psutil is not a dependency and should
 not become one for this. `ps -Ao pid=,command=` does not truncate long command
 lines the way `ps aux` does, which matters because the match key is the full

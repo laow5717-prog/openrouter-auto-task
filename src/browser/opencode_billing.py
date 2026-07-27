@@ -134,14 +134,19 @@ def ensure_opencode_session(session, monitor, login_password, email):
         elif not login.get("ok"):
             return None, f"GitHub 登录未确认：{login.get('detail')}"
 
-    # 回到 opencode 建立会话
-    session.get("https://opencode.ai/auth")
-    time.sleep(3)
-    _step(monitor, session, "GitHub 登录后建立 opencode 会话")
-    wid = _extract_wid(session.current_url)
+    # 回到 opencode 建立会话：走完整 OAuth 链（Continue with GitHub → Authorize →
+    # flagged 检测 → provision 重试，见 opencode_login）。此前只重访 /auth 裸等 3 秒取
+    # wid——凡 profile 里 opencode 会话 cookie 已过期（GitHub 能重登）的账号必然失败。
+    from src.browser import opencode_login as ol
+    _step(monitor, session, "GitHub 登录后建立 opencode 会话（OAuth 链）")
+    res = ol.login_and_open_own_go(session, monitor)
+    wid = res.get("wid")
     if wid:
+        # billing 只需要 wid；/go 落地异常（res.ok=False）不影响后续导航 billing 页
         return wid, "GitHub 登录成功并建立 opencode 会话"
-    return None, "GitHub 已登录但未能建立 opencode 会话"
+    if res.get("flagged"):
+        return None, "GitHub 账号被 flagged，无法授权 opencode OAuth"
+    return None, f"GitHub 已登录但未能建立 opencode 会话：{(res.get('detail') or '')[:120]}"
 
 
 _BAL_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)\s*Current Balance')

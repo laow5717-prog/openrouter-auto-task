@@ -141,6 +141,15 @@ class BrowserSession:
         self.overdue_dialog_seen = False
         self.credit_balance = None          # 被动监听 credit-balance 接口捕获的最新余额（美元）
         self.credit_balance_ts = None       # 上次捕获余额的时间戳（time.time()）
+        # Playwright/Patchright node driver 进程 pid（cli.js run-driver）。quit() 看门狗
+        # 杀完 Chrome 后 close 仍可能阻塞在 node 侧（实测 Chrome 已退、close 干等 ~300s
+        # 才自解），需要它做二段回收。取不到（内部结构变动）则为 None，降级为只杀 Chrome。
+        self._node_pid = None
+        self._close_finished = False        # close 是否已走完（看门狗二段回收的判据）
+        try:
+            self._node_pid = playwright._impl_obj._connection._transport._proc.pid
+        except Exception:
+            pass
 
     # ---- 事件监听（在 create_driver 中挂载，均在业务线程回调） ----
     def _on_console(self, msg):
@@ -269,6 +278,21 @@ class BrowserSession:
                     _kill_chrome_for_profile(self._user_data_dir, '关闭超时', grace=0)
                 except Exception as e:
                     print(f"  ⚠️ 强制回收失败: {str(e)[:120]}")
+                # 二段回收：Chrome 已退（或刚被杀）后 close 仍可能阻塞在 node driver
+                # （实测 fernandezr701：Chrome 早已退出、context.close() 仍干等 ~300s
+                # 才自解，期间任务静默如挂死）。再等 10s，仍没走完就直接杀 node——
+                # 阻塞的调用随连接断开立刻抛错解开。同样只做 os.kill，不碰 Playwright 对象。
+                import signal
+                for _ in range(20):
+                    if self._close_finished:
+                        return
+                    time.sleep(0.5)
+                if self._node_pid:
+                    print("  ⏱️ close 仍阻塞，强制回收 Playwright node driver 进程")
+                    try:
+                        os.kill(self._node_pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
 
             watchdog = threading.Timer(_CLOSE_WATCHDOG_SEC, _force_kill)
             watchdog.daemon = True
@@ -286,6 +310,8 @@ class BrowserSession:
         except Exception as e:
             print(f"  ⚠️ 停止 playwright 失败: {str(e)[:120]}")
         finally:
+            # 标志位先于 cancel：Timer 已触发时 cancel 是空操作，二段回收只认这个标志。
+            self._close_finished = True
             if watchdog is not None:
                 watchdog.cancel()
 
