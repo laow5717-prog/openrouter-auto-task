@@ -655,6 +655,44 @@ def _close_threeds_modal(fr, session, monitor):
     return False
 
 
+# 3DS 交互挑战 Lightbox 出现后的宽限秒数：先等它自动完成/消失（部分发卡行自动放行，
+# 余额到账走 success）。超过仍在则视为需持卡人参与的真挑战——自动化场景无人可验，
+# 判失败、关弹窗、换下一张卡。
+_THREEDS_CHALLENGE_GRACE_SEC = 30
+
+
+def _threeds_challenge_lightbox(session):
+    """Stripe 3DS2 交互挑战弹窗：.LightboxModal 内嵌 iframe#challengeFrame /
+    name=stripe-challenge-frame（实机 2026-07-28，capitalone ACS）。返回承载弹窗的
+    frame；无则 None。该弹窗要求持卡人在发卡行侧完成验证，干等不会自行成功。"""
+    sel = (".LightboxModal iframe#challengeFrame, "
+           ".LightboxModal iframe[name='stripe-challenge-frame'], "
+           ".LightboxModal .ThreeDS2-challenge")
+    try:
+        for fr in session.page.frames:
+            try:
+                if fr.locator(sel).count():
+                    return fr
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _close_challenge_lightbox(fr, session, monitor):
+    """点挑战弹窗的 Cancel（.LightboxModalClose）关闭之，让下一张卡干净重试。尽力而为。"""
+    try:
+        btn = fr.locator(".LightboxModal .LightboxModalClose")
+        if btn.count():
+            btn.first.click(timeout=2000)
+            _step(monitor, session, "已关闭 3DS 挑战弹窗（Cancel），换下一张")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
     """点 Pay / Add 后判定支付结果。返回 dict{outcome, detail}。
 
@@ -667,6 +705,8 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
     「认证失败」信号才判 failed：
       - 挑战期间冒出**新弹窗**（top-layer 遮罩层数量超过初见时的基线）；
       - Stripe 出现明确拒付/认证失败文案（如 unable to authenticate，内容变了）；
+      - 3DS 挑战 Lightbox（iframe#challengeFrame，需持卡人在发卡行侧验证）出现且
+        _THREEDS_CHALLENGE_GRACE_SEC 内未自动消失 → 点 Cancel 关弹窗后判 failed；
       - 直到超时挑战弹窗**仍未自动消失**（未解决）。
     failed 由上层按「是否曾成功」判定消耗（好卡→24h 冷却，坏卡→invalid）。
 
@@ -681,6 +721,7 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
     saw_3ds = False
     overlay_baseline = 0
     captcha_tries = 0
+    challenge_since = None    # 3DS 挑战 Lightbox 首见时刻（宽限计时）
 
     def _balance_grew():
         if balance_before is None:
@@ -740,6 +781,24 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
                     return {"outcome": "failed", "detail": f"拒付/认证失败: {snippet[:120]}"}
             except Exception:
                 pass
+            # 3DS 交互挑战 Lightbox（challengeFrame）：需持卡人在发卡行侧验证，自动化下无人
+            # 可点。给 _THREEDS_CHALLENGE_GRACE_SEC 宽限（可能自动放行消失/余额到账判成功），
+            # 仍在则视为校验不通过：点 Cancel 关掉弹窗后判 failed 换下一张。
+            ch_fr = _threeds_challenge_lightbox(session)
+            if ch_fr is not None:
+                if not saw_3ds:      # 挑战出现 = captcha 关已过，同样禁止回头解 hCaptcha
+                    saw_3ds = True
+                    overlay_baseline = max(_count_top_layer_overlays(session), 1)
+                if challenge_since is None:
+                    challenge_since = time.time()
+                    _step(monitor, session, "检测到 3DS 挑战弹窗（challengeFrame），等待其自动完成…")
+                elif time.time() - challenge_since > _THREEDS_CHALLENGE_GRACE_SEC:
+                    _close_challenge_lightbox(ch_fr, session, monitor)
+                    return {"outcome": "failed",
+                            "detail": f"3DS 挑战弹窗 {_THREEDS_CHALLENGE_GRACE_SEC}s 内未自动通过"
+                                      "（需持卡人验证），已关闭换卡"}
+            else:
+                challenge_since = None    # 弹窗消失（自动放行）→ 复位，余额判定接手
             # 3DS 优先：3DS 出现 = 人机验证已过（Stripe 先过 captcha 才进发卡行授权），故一旦
             # 见过 3DS 就绝不回头解 hCaptcha——否则常驻 invisible hCaptcha 的 checkbox iframe
             # （含「i am human」文案）会被反复误判。3DS 交互挑战等待加载/完成，不立即失败。

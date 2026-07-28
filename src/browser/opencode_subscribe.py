@@ -19,6 +19,7 @@ from src.browser.opencode_billing import (
     fill_phone_if_present, uncheck_save_info, check_ai_agent_consent,
     _captcha_challenge_present, _threeds_challenge_present,
     _threeds_failure_modal, _close_threeds_modal, _count_top_layer_overlays,
+    _threeds_challenge_lightbox, _close_challenge_lightbox, _THREEDS_CHALLENGE_GRACE_SEC,
     _DECLINE_HINTS,
 )
 from src.browser.opencode_login import login_and_open_own_go, _extract_wid
@@ -204,6 +205,7 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
     saw_3ds = False
     overlay_baseline = 0
     captcha_tries = 0
+    challenge_since = None    # 3DS 挑战 Lightbox 首见时刻（宽限计时）
 
     def _stripe_fr():
         for fr in session.page.frames:
@@ -268,6 +270,23 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
             if fmfr is not None:
                 _close_threeds_modal(fmfr, session, monitor)
                 return {"outcome": "failed", "detail": f"3DS 认证失败: {fmsg[:150]}"}
+            # 3DS 交互挑战 Lightbox（challengeFrame）：需持卡人在发卡行侧验证，自动化下无人
+            # 可点。宽限期内未自动消失即判失败：点 Cancel 关弹窗换下一张（同充值路径）。
+            ch_fr = _threeds_challenge_lightbox(session)
+            if ch_fr is not None:
+                if not saw_3ds:
+                    saw_3ds = True
+                    overlay_baseline = max(_count_top_layer_overlays(session), 1)
+                if challenge_since is None:
+                    challenge_since = time.time()
+                    _step(monitor, session, "检测到 3DS 挑战弹窗（challengeFrame），等待其自动完成…")
+                elif time.time() - challenge_since > _THREEDS_CHALLENGE_GRACE_SEC:
+                    _close_challenge_lightbox(ch_fr, session, monitor)
+                    return {"outcome": "failed",
+                            "detail": f"3DS 挑战弹窗 {_THREEDS_CHALLENGE_GRACE_SEC}s 内未自动通过"
+                                      "（需持卡人验证），已关闭换卡"}
+            else:
+                challenge_since = None
             # 3DS 交互挑战优先判：3DS 出现 = 人机验证这一关已过（Stripe 先过 captcha 才
             # 进发卡行授权），故一旦进入/见过 3DS，就绝不再回头解 hCaptcha——否则 enterprise
             # 隐形 hCaptcha 的 checkbox iframe（常驻 DOM、含「i am human」文案）会被反复误判。
