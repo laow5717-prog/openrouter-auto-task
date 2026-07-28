@@ -1283,3 +1283,37 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Next Steps
 
 - None - task complete
+
+
+## Session 37: 每日充值假死排查:OAuth 链修复 + 关闭看门狗两段回收 + flagged 自动退出
+
+**Date**: 2026-07-28
+**Task**: 每日充值假死排查:OAuth 链修复 + 关闭看门狗两段回收 + flagged 自动退出
+**Branch**: `main`
+
+### Summary
+
+排查每日充值任务在「GitHub 登录后建立 opencode 会话」处静默 5 分钟的现象:1) ensure_opencode_session 缺 OAuth 点击链,改为复用 opencode_login 的 Continue with GitHub→Authorize→flagged 检测→provision 重试链,实测查明 fernandezr701 真因是 GitHub 账号被 flagged;2) quit() 看门狗杀 Chrome 后 close 仍阻塞在 Playwright node driver ~300s,新增二段回收(10s 后 SIGKILL node,pid 创建时捕获,两栈验证),阻塞路径 40s 内收尾,spec 已记录;3) 新增 flagged 账号自动标记 status='flagged' 并退出每日轮转(选取过滤/进展计数/收尾统计/前端状态文案),fernandezr701 已手工标记。注意:dev 热重载曾中断一次运行中的每日任务。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7c77cae` | (see git log) |
+| `0baef21` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
