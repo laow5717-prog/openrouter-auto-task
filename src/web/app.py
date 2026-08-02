@@ -32,10 +32,18 @@ from src.web.worker import (
 )
 
 
+# Stripe 付款域名绕过代理直连。i-proxy 等住宅/移动代理把支付类域名（stripe.com）
+# 列入黑名单、拒绝建隧道（CONNECT 返回 503），导致 checkout.stripe.com 打不开。
+# 实测本机直连 stripe 正常（302），故让 stripe 走直连、其余（github/opencode）走代理。
+# Stripe 结账风控看卡/账单/设备指纹，不强依赖 IP 与 opencode 会话同源，可接受本机 IP。
+_PROXY_BYPASS = "*.stripe.com, stripe.com, *.stripecdn.com, b.stripecdn.com, js.stripe.com, m.stripe.com, m.stripe.network, *.stripe.network"
+
+
 def _to_pw_proxy(row):
     """proxies 表 row（host/port/username/password）→ Playwright proxy dict。
-    server 只放 scheme+host+port，凭据走 username/password 字段（不 URL 内嵌）。"""
-    d = {"server": f"http://{row['host']}:{row['port']}"}
+    server 只放 scheme+host+port，凭据走 username/password 字段（不 URL 内嵌）。
+    bypass 让 Stripe 付款域名直连（代理商封了 stripe，见 _PROXY_BYPASS）。"""
+    d = {"server": f"http://{row['host']}:{row['port']}", "bypass": _PROXY_BYPASS}
     if row.get('username'):
         d["username"] = row['username']
         d["password"] = row.get('password') or ''
