@@ -116,25 +116,41 @@ setting `None` — otherwise the binding leaks into later phases.
   increment returned. Reading the counter afterwards gets whatever another
   worker has pushed it to.
 
-## Account refill on exhaustion (recharge pipeline)
+## Recharge pipeline: worker-autonomous register+recharge
 
-`run_daily_pipeline` recomputes the payable set **every round from the DB**
-(`_payable_now`), not once on entry. Two invariants depend on this:
+`run_daily_pipeline` is a single `pool.run_until_empty(_produce, _do)` at
+`cfg.concurrency.max_workers` (not a hardcoded serial map). Each worker
+autonomously pulls one account and either recharges it or, if none are payable,
+registers one `imported` account — so registration and recharge run concurrently
+across workers, not in separate phases.
 
-- **Success de-dup**: a recharged account has `status='recharged'`, which the
-  payable filter excludes (alongside banned/archived/flagged). Recompute-per-round
-  is what makes a just-succeeded account drop out next round without bookkeeping.
-- **Refill**: when a round's payable set is empty, the coordinator registers one
-  `imported` account (`_register_one_account`, shared with the subscribe pipeline)
-  and `continue`s — the newly-registered account is `registered` with a password,
-  so the next `_payable_now()` picks it up and it flows into login→recharge.
+**`_produce` (guarded by `produce_lock`)** finds-and-claims atomically: it scans
+`_payable_now()` first, else `_registerable_imported()`, and returns the first
+account it can `account_registry.claim()`. The lock spanning find+claim is what
+stops two workers taking the same account (mirrors `_register_bind_loop._produce`).
 
-Refill iterations must **not** increment `round_num` — they converge on the
-finite supply of `imported` rows instead (each `_register_one_account` moves the
-candidate out of `imported`: registered/pending/suspended/failed), so a batch of
-Arkose-blocked registrations can never loop forever. `round_num` is only for real
-recharge rounds; `MAX_ROUNDS` folds in `imported` count so the backstop still
-bounds the combined work. The refill account is claimed/released like any other.
+**`_do` (per worker)** releases the account in `finally` and updates a `done` set
++ `stats` under `state_lock`. Three de-dup / termination invariants live here:
+
+- **Success de-dup**: recharge success sets `status='recharged'`, excluded by
+  `_payable_now` (alongside banned/archived/flagged and any email in `done`).
+- **Register→recharge closure**: a freshly-registered account is **not** added to
+  `done`; after release, the next `_produce` sees it as `registered`+password and
+  hands it to whichever worker is free — the login→recharge step, possibly on a
+  different worker than registered it.
+- **Termination**: recharge *failure* adds the email to `done` (was the old
+  `done_emails`+`progressed` backstop) so a card-declining account is never
+  re-pulled forever; archived/flagged/failed-registration also land in `done`.
+  Every account thus reaches recharged or `done`, and `imported`/payable are
+  finite, so `_produce` eventually returns None and all workers exit. There is no
+  round counter and no `MAX_ROUNDS` — `run_until_empty` converges by draining.
+
+Because both stubbed methods (`_recharge_one_account`, `_register_one_account`)
+only touch the passed `worker` and never write `self` counters unlocked, the only
+shared mutable state is `done`/`stats`, both under `state_lock`. Card exclusion is
+still `PaymentCardRegistry` inside `recharge_account` (per-card). See
+`tests/test_daily_pipeline.py` for the concurrency assertions (no overlap, peak>1,
+clean release, serial==parallel ledger).
 
 ## Never do
 

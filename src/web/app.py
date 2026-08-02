@@ -519,15 +519,15 @@ class AppState:
 
         account_model = self.models['account']
 
-        paid_total = 0            # 成功付款次数
-        fail_total = 0            # 账号访问未付成次数
-        archived_total = 0        # 余额≥$20 归档跳过次数
-        flagged_total = 0         # GitHub flagged 标记退出次数
-        registered_total = 0      # 账号耗尽时注册补号成功次数
-        done_emails = set()       # 本次运行已归档/flagged、退出后续轮转的账号
+        # 结果计数（收尾摘要用）。self.success_count/fail_count 另供前端进度条。
+        stats = {'paid': 0, 'fail': 0, 'archived': 0, 'flagged': 0, 'registered': 0}
+        # 本次运行已终结（recharged/archived/flagged/注册未成）不再领的 email。
+        done = set()
+        produce_lock = threading.Lock()   # 「找账号 + claim」原子领取
+        state_lock = threading.Lock()     # 护 done + stats 的读写
 
-        # 并发度固定为 1（串行）。WorkerPool.is_serial 走同线程分支，行为与直接调用等价。
-        pool = WorkerPool(self, 1)
+        # 并发度读 config（clamp 1-4）。max_workers=1 仍走 WorkerPool 同线程分支（应急串行）。
+        pool = WorkerPool(self, cfg.concurrency.max_workers)
 
         try:
             self._hooked_print(f"\n{'#' * 50}")
@@ -535,30 +535,27 @@ class AppState:
             self._hooked_print(f"{'#' * 50}")
 
             # 可充值账号（实时快照）：有登录密码且状态非终态。排除 recharged——充值成功过的
-            # 账号不再进入轮转（避免重复充值/空开浏览器）。每轮实时重算，故注册补号转正的
-            # 新账号会自动进入下一轮。
+            # 账号不再进入轮转（避免重复充值/空开浏览器）；排除 done——本次运行已终结的账号。
             def _payable_now():
                 return [
                     a for a in account_model.get_all(order_desc=False)
                     if (login_password or a.get('login_password'))
                     and (a.get('status') or '') not in
                         ('banned', 'archived', 'flagged', 'recharged')
-                    and a['email'] not in done_emails
+                    and a['email'] not in done
                 ]
 
-            # 下一个可注册的 imported 账号（未注册、有收码数据：DB 自带 link 或 xlsx 命中）。
-            def _next_registerable_imported():
-                for a in account_model.get_all(order_desc=False):
-                    if (a.get('status') or '') == 'imported' and self._hotmail_for_account(a):
-                        return a
-                return None
+            # 待注册 imported 账号（有收码数据：DB 自带 link 或 xlsx 命中；未在 done）。
+            def _registerable_imported():
+                return [
+                    a for a in account_model.get_all(order_desc=False)
+                    if (a.get('status') or '') == 'imported'
+                    and a['email'] not in done
+                    and self._hotmail_for_account(a)
+                ]
 
             accounts = _payable_now()
-            imported_pending = sum(
-                1 for a in account_model.get_all(order_desc=False)
-                if (a.get('status') or '') == 'imported' and self._hotmail_for_account(a)
-            )
-
+            imported_pending = len(_registerable_imported())
             eligible = len(self._eligible_cards(group_id))
             self._hooked_print(
                 f"可充值账号 {len(accounts)} 个，待注册 imported {imported_pending} 个，"
@@ -570,122 +567,78 @@ class AppState:
                 self._hooked_print("无可充值账号且无 imported 可注册，任务结束")
                 return
 
-            # 单轮账号访问结果计数（跨 worker 共享；串行下也用同一把锁保持结构一致）
-            round_lock = threading.Lock()
-
-            # 兜底上限纳入 imported（每个可能触发一次补号迭代）。补号迭代不递增 round_num，
-            # 靠 imported 耗尽独立收敛；round_num 只在真正充值轮递增。
-            MAX_ROUNDS = (len(accounts) + imported_pending) * 50 + 5
-            round_num = 0
-            while round_num < MAX_ROUNDS:
+            # ── 生产者：每个 worker 反复原子领一个账号。优先充值现有可充账号，无则领一个
+            #    待注册 imported。produce_lock 让「找账号 + claim」原子，两 worker 绝不领同一个
+            #    （参照 _register_bind_loop._produce 的 state_lock + claim_batch）。领到即用
+            #    account_registry 占坑，消费者 finally 释放。返回 None 表示无活可领、worker 退出。
+            def _produce():
                 if self.stop_requested:
-                    self._hooked_print("用户停止了任务")
-                    break
-                remaining = len(self._eligible_cards(group_id))
-                if not remaining:
-                    self._hooked_print("已无可选卡（全部无效/过期或冷却中），任务结束")
-                    break
-
-                # 每轮实时算可充账号。为空 = 账号耗尽 → 注册一个 imported 补号，
-                # 注册成功者下一轮自动进入充值（登录→充值由 recharge_account 完成）。
-                payable = _payable_now()
-                if not payable:
-                    cand = _next_registerable_imported()
-                    if not cand:
-                        self._hooked_print("无可充账号且无 imported 可注册，任务结束")
-                        break
-                    cemail = cand['email']
-                    if not self.account_registry.claim(cemail):
-                        continue
-                    try:
-                        self.set_action(self.primary_worker, f"账号耗尽，注册补号 {cemail}")
-                        self._hooked_print(f"\n可充账号耗尽，注册补号: {cemail}")
-                        rr, rdetail = self._register_one_account(cand, self.primary_worker)
-                    except InterruptedError:
-                        raise
-                    except Exception as e:
-                        rr, rdetail = "failed", str(e)[:120]
-                    finally:
-                        self.account_registry.release(cemail)
-                    if rr == "registered":
-                        registered_total += 1
-                    self._hooked_print(f"补号 {cemail}: {rr}（{rdetail}）")
-                    continue   # 下一轮：注册成功者进 payable；其它已离开 imported
-
-                round_num += 1
-                round_stats = {'paid': 0, 'failed': 0, 'archived': 0, 'flagged': 0}
-                self._hooked_print(f"\n{'=' * 50}\n充值轮次 {round_num}（当前可选卡 {remaining} 张）\n{'=' * 50}")
-
-                def _recharge_one(worker, acct):
-                    """本轮推进单个账号一次访问。跑在 worker 线程内。"""
-                    email = acct['email']
-                    if self.stop_requested:
-                        return
-                    # 本次运行已归档的账号（余额≥$20）不再处理
-                    if email in done_emails:
-                        return
-                    # 可选卡已在别的账号访问中被耗尽则提前收手
+                    return None
+                with produce_lock:
                     if not self._eligible_cards(group_id):
-                        return
+                        return None
+                    for a in _payable_now():
+                        if self.account_registry.claim(a['email']):
+                            return ('recharge', a)
+                    for a in _registerable_imported():
+                        if self.account_registry.claim(a['email']):
+                            return ('register', a)
+                    return None
 
-                    # 账号排他：同一 Chrome profile 不可并发（串行下恒成功）
-                    if not self.account_registry.claim(email):
-                        self._hooked_print(f"{email} 正被占用，本轮跳过")
-                        return
-
-                    try:
-                        self.set_action(worker, f"轮次{round_num} 充值账号 {email}")
+            # ── 消费者：跑在 worker 线程。注册成功者「不入 done」——释放后会被（自己或另一个
+            #    worker）当作 payable 领来充值，实现「注册→登录→充值」闭环且可跨 worker 并行；
+            #    充值成功记 success，归档/flagged/充值失败/注册未成入 done（本次不再领），
+            #    其中充值失败入 done 替代原 done_emails+progressed 兜底，防卡全拒账号被无限重领。
+            def _do(worker, item):
+                kind, acct = item
+                email = acct['email']
+                try:
+                    if kind == 'register':
+                        self.set_action(worker, f"账号耗尽，注册补号 {email}")
+                        self._hooked_print(f"\n可充账号耗尽，注册补号: {email}")
+                        rr, rdetail = self._register_one_account(acct, worker)
+                        self._hooked_print(f"补号 {email}: {rr}（{rdetail}）")
+                        with state_lock:
+                            if rr == "registered":
+                                stats['registered'] += 1
+                            else:
+                                done.add(email)   # pending/suspended/failed，已离开 imported
+                    else:  # recharge
+                        self.set_action(worker, f"充值账号 {email}")
                         self._hooked_print(f"\n充值账号: {email}")
                         result, err = self._recharge_one_account(
                             email, login_password or acct.get('login_password'),
                             payment_group_id=group_id, worker=worker,
                             captcha_api_key=captcha_api_key, captcha_server=captcha_server)
-                        with round_lock:
+                        with state_lock:
                             if result == "success":
-                                round_stats['paid'] += 1
+                                stats['paid'] += 1
                                 self.success_count += 1
                             elif result == "archived":
-                                # 余额≥$20 归档：既非成功也非失败，退出该账号后续轮转
-                                round_stats['archived'] += 1
-                                done_emails.add(email)
+                                stats['archived'] += 1
+                                done.add(email)
                             elif result == "flagged":
-                                # GitHub 被 flag 无法授权 OAuth：账号级终态，退出后续轮转
-                                round_stats['flagged'] += 1
-                                done_emails.add(email)
+                                stats['flagged'] += 1
+                                done.add(email)
                             else:
-                                round_stats['failed'] += 1
+                                stats['fail'] += 1
                                 self.fail_count += 1
-                    except InterruptedError:
-                        self._hooked_print("充值阶段被中断")
-                        raise
-                    except Exception as e:
-                        with round_lock:
-                            round_stats['failed'] += 1
-                            self.fail_count += 1
-                        self._hooked_print(f"充值 {email} 出错: {e}")
-                    finally:
-                        self.account_registry.release(email)
+                                done.add(email)   # 本次不再重领，防卡全拒无限重试
+                except InterruptedError:
+                    self._hooked_print("充值阶段被中断")
+                    raise
+                except Exception as e:
+                    with state_lock:
+                        stats['fail'] += 1
+                        self.fail_count += 1
+                        done.add(email)
+                    self._hooked_print(f"处理 {email} 出错: {e}")
+                finally:
+                    self.account_registry.release(email)
 
-                # map 是 barrier：本轮所有账号都访问完才进入下一轮。payable 已实时排除
-                # done_emails（归档/flagged）与 recharged，无需再过滤。
-                pool.map(payable, _recharge_one)
-                paid_total += round_stats['paid']
-                fail_total += round_stats['failed']
-                archived_total += round_stats['archived']
-                flagged_total += round_stats['flagged']
-
-                # 进展 = 本轮有成功付款，或可选卡数减少（坏卡判无效 / 好卡进冷却 / 过期），
-                # 或有账号被归档（退出轮转、账号集在收敛）。只要还有进展就继续轮转；整轮零成功、
-                # 无卡定案、也无归档（全部账号 login 失败 / hCaptcha 拦截等）才兜底结束防死循环。
-                # 说明：好卡持续成功时可选卡数不减、但计为进展，会一直复用直到好卡被风控
-                # 陆续冷却而收敛；归档账号已进 done_emails 下轮不再处理，故不会无限循环；
-                # MAX_ROUNDS 是极端不收敛下的最终兜底。
-                after = len(self._eligible_cards(group_id))
-                progressed = (round_stats['paid'] > 0 or after < remaining
-                              or round_stats['archived'] > 0 or round_stats['flagged'] > 0)
-                if not progressed and not self.stop_requested:
-                    self._hooked_print("整轮无成功付款且无卡被消耗/冷却/归档，结束任务（兜底防死循环）")
-                    break
+            # 收敛：每个账号最终 recharged/archived/flagged 或入 done，imported 与 payable
+            # 均有限，_produce 终会领空 → 所有 worker 退出。无 round，故无需 MAX_ROUNDS 兜底。
+            pool.run_until_empty(_produce, _do)
 
         except Exception as e:
             self._hooked_print(f"严重错误: {e}")
@@ -706,9 +659,9 @@ class AppState:
             except Exception:
                 remaining = '?'
             self.current_action = (
-                f"每日充值任务完成（成功付款 {paid_total} 次 / "
-                f"未付成 {fail_total} 次 / 归档跳过 {archived_total} 个 / "
-                f"flagged 退出 {flagged_total} 个 / 注册补号 {registered_total} 个 / "
+                f"每日充值任务完成（成功付款 {stats['paid']} 次 / "
+                f"未付成 {stats['fail']} 次 / 归档跳过 {stats['archived']} 个 / "
+                f"flagged 退出 {stats['flagged']} 个 / 注册补号 {stats['registered']} 个 / "
                 f"剩余可选卡 {remaining} 张）"
             )
             self._hooked_print(f"\n{'#' * 50}")
