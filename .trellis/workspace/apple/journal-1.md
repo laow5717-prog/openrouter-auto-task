@@ -1317,3 +1317,38 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Next Steps
 
 - None - task complete
+
+
+## Session 38: 每日充值:补号收码修复 + 2-worker 并行改造
+
+**Date**: 2026-08-02
+**Task**: 每日充值:补号收码修复 + 2-worker 并行改造
+**Branch**: `main`
+
+### Summary
+
+延续充值补号任务:1) 修复补号误判「imported 0 个」——50 个 imported 账号的 ruoanzhu 收码链接在 accounts.email_verify_link,不在 hotmail.xlsx;新增 _hotmail_for_account 优先用账号自带 link 构造 HotmailAccount,xlsx 仅回退。2) 应用户需求把 run_daily_pipeline 从串行 pool.map 轮转重构为 worker 自治 run_until_empty 并行(并发度读 cfg.concurrency.max_workers=2):_produce 用 produce_lock 原子「找账号+claim」,_do 里注册成功者不入 done 待领来充值(注册→充值闭环可跨 worker)、充值失败/终态入 done 收敛,三重排他(领取锁+account claim+PaymentCardRegistry)。重写失效的 test_daily_pipeline.py(5 用例覆盖闭环/去重/无 overlap/释放/串并行一致),并发回归 43 测试全过。真机验证 2 worker 一充一注并行无冲突。spec 更新 worker 自治编排契约。注:scripts/run_hotmail_github_signup.py 为会话前既有脏文件,未动。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6551ebb` | (see git log) |
+| `e24cda7` | (see git log) |
+| `39cee79` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
