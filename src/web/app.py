@@ -498,9 +498,13 @@ class AppState:
         账号、计数与收尾。
 
         captcha_api_key/captcha_server 透传给充值流程用于自动解 hCaptcha（server 默认 Multibot）。
-        账号选取排除 banned、archived 与 flagged；登录后实时余额 ≥$20 的账号会被归档
-        （status='archived'）并退出后续轮转；GitHub 被 flag 无法授权 OAuth 的账号会被标
-        flagged 并退出轮转（与订阅管线一致）。
+        账号选取排除 banned、archived、flagged 与 recharged（充值成功过的不再重复充值）；
+        登录后实时余额 ≥$20 的账号会被归档（status='archived'）并退出后续轮转；GitHub 被 flag
+        无法授权 OAuth 的账号会被标 flagged 并退出轮转（与订阅管线一致）。
+
+        账号耗尽自动补号：当某轮无可充值账号时，从 imported 账号（hotmail.xlsx 有收码数据）
+        取一个自动注册（复用 _register_one_account，全自动碰 Arkose 跳过），注册成功者
+        转 registered 后于下一轮进入「登录→充值」；所有 imported 处理完仍无可充账号则结束。
 
         login_password 可选，用于覆盖账号自身密码（一般留空，用各账号 accounts.login_password）。
         并发度固定为 1（串行）：WorkerPool 的 is_serial 分支走同线程，保留截图/停止集成。"""
@@ -519,6 +523,7 @@ class AppState:
         fail_total = 0            # 账号访问未付成次数
         archived_total = 0        # 余额≥$20 归档跳过次数
         flagged_total = 0         # GitHub flagged 标记退出次数
+        registered_total = 0      # 账号耗尽时注册补号成功次数
         done_emails = set()       # 本次运行已归档/flagged、退出后续轮转的账号
 
         # 并发度固定为 1（串行）。WorkerPool.is_serial 走同线程分支，行为与直接调用等价。
@@ -529,27 +534,48 @@ class AppState:
             self._hooked_print("每日充值任务开始（卡池驱动 + 账号轮转）")
             self._hooked_print(f"{'#' * 50}")
 
-            # 可充值账号：有登录密码且未被封，按 id 升序（轮转顺序稳定）
-            accts = account_model.get_all(order_desc=False)
-            accounts = [
-                a for a in accts
-                if (login_password or a.get('login_password'))
-                and (a.get('status') or '') not in ('banned', 'archived', 'flagged')
-            ]
-            if not accounts:
-                self._hooked_print("无可充值账号（需有登录密码且未封禁），任务结束")
-                return
+            # 可充值账号（实时快照）：有登录密码且状态非终态。排除 recharged——充值成功过的
+            # 账号不再进入轮转（避免重复充值/空开浏览器）。每轮实时重算，故注册补号转正的
+            # 新账号会自动进入下一轮。
+            def _payable_now():
+                return [
+                    a for a in account_model.get_all(order_desc=False)
+                    if (login_password or a.get('login_password'))
+                    and (a.get('status') or '') not in
+                        ('banned', 'archived', 'flagged', 'recharged')
+                    and a['email'] not in done_emails
+                ]
+
+            # 下一个可注册的 imported 账号（未注册、hotmail.xlsx 有其收码数据）。
+            def _next_registerable_imported():
+                for a in account_model.get_all(order_desc=False):
+                    if (a.get('status') or '') == 'imported' and self._hotmail_by_email(a['email']):
+                        return a
+                return None
+
+            accounts = _payable_now()
+            imported_pending = sum(
+                1 for a in account_model.get_all(order_desc=False)
+                if (a.get('status') or '') == 'imported' and self._hotmail_by_email(a['email'])
+            )
 
             eligible = len(self._eligible_cards(group_id))
-            self._hooked_print(f"可用账号 {len(accounts)} 个，分组可选卡 {eligible} 张")
+            self._hooked_print(
+                f"可充值账号 {len(accounts)} 个，待注册 imported {imported_pending} 个，"
+                f"分组可选卡 {eligible} 张")
             if not eligible:
                 self._hooked_print("分组内无可选卡（全部无效/过期或冷却中），无事可做")
+                return
+            if not accounts and not imported_pending:
+                self._hooked_print("无可充值账号且无 imported 可注册，任务结束")
                 return
 
             # 单轮账号访问结果计数（跨 worker 共享；串行下也用同一把锁保持结构一致）
             round_lock = threading.Lock()
 
-            MAX_ROUNDS = len(accounts) * 50 + 5   # 兜底上限，正常由无可选卡/零进展先收敛
+            # 兜底上限纳入 imported（每个可能触发一次补号迭代）。补号迭代不递增 round_num，
+            # 靠 imported 耗尽独立收敛；round_num 只在真正充值轮递增。
+            MAX_ROUNDS = (len(accounts) + imported_pending) * 50 + 5
             round_num = 0
             while round_num < MAX_ROUNDS:
                 if self.stop_requested:
@@ -559,6 +585,33 @@ class AppState:
                 if not remaining:
                     self._hooked_print("已无可选卡（全部无效/过期或冷却中），任务结束")
                     break
+
+                # 每轮实时算可充账号。为空 = 账号耗尽 → 注册一个 imported 补号，
+                # 注册成功者下一轮自动进入充值（登录→充值由 recharge_account 完成）。
+                payable = _payable_now()
+                if not payable:
+                    cand = _next_registerable_imported()
+                    if not cand:
+                        self._hooked_print("无可充账号且无 imported 可注册，任务结束")
+                        break
+                    cemail = cand['email']
+                    if not self.account_registry.claim(cemail):
+                        continue
+                    try:
+                        self.set_action(self.primary_worker, f"账号耗尽，注册补号 {cemail}")
+                        self._hooked_print(f"\n可充账号耗尽，注册补号: {cemail}")
+                        rr, rdetail = self._register_one_account(cand, self.primary_worker)
+                    except InterruptedError:
+                        raise
+                    except Exception as e:
+                        rr, rdetail = "failed", str(e)[:120]
+                    finally:
+                        self.account_registry.release(cemail)
+                    if rr == "registered":
+                        registered_total += 1
+                    self._hooked_print(f"补号 {cemail}: {rr}（{rdetail}）")
+                    continue   # 下一轮：注册成功者进 payable；其它已离开 imported
+
                 round_num += 1
                 round_stats = {'paid': 0, 'failed': 0, 'archived': 0, 'flagged': 0}
                 self._hooked_print(f"\n{'=' * 50}\n充值轮次 {round_num}（当前可选卡 {remaining} 张）\n{'=' * 50}")
@@ -613,9 +666,9 @@ class AppState:
                     finally:
                         self.account_registry.release(email)
 
-                # map 是 barrier：本轮所有账号都访问完才进入下一轮。已归档账号本轮起排除，
-                # 避免对余额≥$20 的账号反复重开浏览器空跑。
-                pool.map([a for a in accounts if a['email'] not in done_emails], _recharge_one)
+                # map 是 barrier：本轮所有账号都访问完才进入下一轮。payable 已实时排除
+                # done_emails（归档/flagged）与 recharged，无需再过滤。
+                pool.map(payable, _recharge_one)
                 paid_total += round_stats['paid']
                 fail_total += round_stats['failed']
                 archived_total += round_stats['archived']
@@ -655,7 +708,8 @@ class AppState:
             self.current_action = (
                 f"每日充值任务完成（成功付款 {paid_total} 次 / "
                 f"未付成 {fail_total} 次 / 归档跳过 {archived_total} 个 / "
-                f"flagged 退出 {flagged_total} 个 / 剩余可选卡 {remaining} 张）"
+                f"flagged 退出 {flagged_total} 个 / 注册补号 {registered_total} 个 / "
+                f"剩余可选卡 {remaining} 张）"
             )
             self._hooked_print(f"\n{'#' * 50}")
             self._hooked_print(self.current_action)
@@ -684,6 +738,49 @@ class AppState:
     # 下一轮该账号会带新卡再来，坏卡已被标 invalid 退出可选集）。
     SUBSCRIBE_MAX_CARDS_PER_ACCOUNT = 5
 
+    def _register_one_account(self, acct, worker=None):
+        """未注册账号跑一次 GitHub 全自动注册（Patchright，碰 Arkose 自动跳过不等人工）。
+
+        返回 (result, detail)，result ∈ {"registered","skipped","failed"}：
+          registered — signup_complete：status='registered' 并存 login_password（可转订阅/充值）
+          skipped    — 无 hotmail 数据 / 碰 Arkose（status='pending'）/ 注册即挂起（status='suspended'）
+          failed     — 其它注册未完成（status='failed'）
+
+        供订阅任务（_subscribe_one_account）与充值任务（run_daily_pipeline 补号）共用，
+        保证两条流水线注册行为一致。跑在 worker 线程；account 排他由外层 claim 保证。
+        signup_one 内部用 create_driver(Patchright)，返回时其 session 已关。
+        """
+        models = self.models
+        worker = worker or self.primary_worker
+        email = acct['email']
+
+        hacc = self._hotmail_by_email(email)
+        if not hacc:
+            self.set_action(worker, f"{email} 无 hotmail 数据，跳过")
+            return "skipped", "无 hotmail 数据（xlsx 缺该邮箱）"
+        from src.services.github_signup_service import signup_one
+        self.set_action(worker, f"{email} 未注册，尝试 GitHub 注册（Arkose 弹则跳过）")
+        # auto_skip_captcha：不弹 Arkose 自动收码完成注册；弹了立即跳过不等人工（全自动）。
+        r = signup_one(headless=False, semi_auto=False, account=hacc,
+                       then_opencode=False, auto_skip_captcha=True)
+        oc = r.get('outcome')
+        if oc == 'reached_captcha':
+            models['account'].update_status(email, 'pending')
+            return "skipped", "碰 Arkose，跳过（全自动模式不等人工）"
+        if oc == 'account_suspended':
+            models['account'].upsert(email, login_password=r.get('github_password'),
+                                     email_password=hacc.password, status='suspended',
+                                     email_verify_link=hacc.link)
+            return "skipped", "注册即挂起"
+        if oc != 'signup_complete':
+            models['account'].update_status(email, 'failed')
+            return "failed", f"注册失败: {oc}"
+        models['account'].upsert(email, login_password=r.get('github_password'),
+                                 email_password=hacc.password, status='registered',
+                                 email_verify_link=hacc.link)
+        self.add_log(f"{email} GitHub 注册成功")
+        return "registered", "GitHub 注册成功"
+
     def _subscribe_one_account(self, acct, payment_group_id, captcha_api_key, worker=None,
                                captcha_server="api.multibot.cloud"):
         """单账号一次推进：未注册先注册（Patchright，Arkose 跳过），已注册走原生栈登录+逐卡订阅。
@@ -703,34 +800,12 @@ class AppState:
         email = acct['email']
         status = (acct.get('status') or '')
 
-        # --- A. 注册分支：未注册（非 registered/subscribed）先跑 GitHub 注册 ---
+        # --- A. 注册分支：未注册（非 registered/subscribed）先跑 GitHub 注册（复用共享函数）---
         if status not in ('registered', 'subscribed'):
-            hacc = self._hotmail_by_email(email)
-            if not hacc:
-                self.set_action(worker, f"{email} 无 hotmail 数据，跳过")
-                return "skipped", "无 hotmail 数据（xlsx 缺该邮箱）"
-            from src.services.github_signup_service import signup_one
-            self.set_action(worker, f"{email} 未注册，尝试 GitHub 注册（Arkose 弹则跳过）")
-            # auto_skip_captcha：不弹 Arkose 自动收码完成注册；弹了立即跳过不等人工（全自动）。
-            r = signup_one(headless=False, semi_auto=False, account=hacc,
-                           then_opencode=False, auto_skip_captcha=True)
-            oc = r.get('outcome')
-            if oc == 'reached_captcha':
-                models['account'].update_status(email, 'pending')
-                return "skipped", "碰 Arkose，跳过（全自动模式不等人工）"
-            if oc == 'account_suspended':
-                models['account'].upsert(email, login_password=r.get('github_password'),
-                                         email_password=hacc.password, status='suspended',
-                                         email_verify_link=hacc.link)
-                return "skipped", "注册即挂起"
-            if oc != 'signup_complete':
-                models['account'].update_status(email, 'failed')
-                return "failed", f"注册失败: {oc}"
-            models['account'].upsert(email, login_password=r.get('github_password'),
-                                     email_password=hacc.password, status='registered',
-                                     email_verify_link=hacc.link)
-            self.add_log(f"{email} GitHub 注册成功，转订阅")
-            # signup_one 内部用 create_driver(Patchright)，返回时其 session 已关，下面另起原生栈
+            rr, rdetail = self._register_one_account(acct, worker)
+            if rr != "registered":
+                return rr, rdetail
+            self.add_log(f"{email} 转订阅")
 
         # --- B. 订阅分支：原生 Playwright 栈（hCaptcha token 注入只在原生栈生效）---
         if captcha_api_key:

@@ -116,6 +116,26 @@ setting `None` — otherwise the binding leaks into later phases.
   increment returned. Reading the counter afterwards gets whatever another
   worker has pushed it to.
 
+## Account refill on exhaustion (recharge pipeline)
+
+`run_daily_pipeline` recomputes the payable set **every round from the DB**
+(`_payable_now`), not once on entry. Two invariants depend on this:
+
+- **Success de-dup**: a recharged account has `status='recharged'`, which the
+  payable filter excludes (alongside banned/archived/flagged). Recompute-per-round
+  is what makes a just-succeeded account drop out next round without bookkeeping.
+- **Refill**: when a round's payable set is empty, the coordinator registers one
+  `imported` account (`_register_one_account`, shared with the subscribe pipeline)
+  and `continue`s — the newly-registered account is `registered` with a password,
+  so the next `_payable_now()` picks it up and it flows into login→recharge.
+
+Refill iterations must **not** increment `round_num` — they converge on the
+finite supply of `imported` rows instead (each `_register_one_account` moves the
+candidate out of `imported`: registered/pending/suspended/failed), so a batch of
+Arkose-blocked registrations can never loop forever. `round_num` is only for real
+recharge rounds; `MAX_ROUNDS` folds in `imported` count so the backstop still
+bounds the combined work. The refill account is claimed/released like any other.
+
 ## Never do
 
 - `WHERE status='pending'` to decide whether work remains (misses `processing`)
