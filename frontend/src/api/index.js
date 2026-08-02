@@ -94,6 +94,12 @@ export const mergeCardPools = (body) => post('/api/card-pool/merge', body)
 export const moveCardsToGroup = (groupId, body) => post(`/api/card-pool/${groupId}/move`, body)
 export const deleteInvalidCards = (groupId) => post(`/api/card-pool/${groupId}/delete-invalid`)
 
+// Proxies
+export const getProxies = (params) => get('/api/proxies', params)
+export const importProxies = (text) => post('/api/proxies/import', { text })
+export const deleteProxy = (id) => request(`/api/proxies/${id}`, { method: 'DELETE' }).then(r => r.json())
+export const clearProxies = () => post('/api/proxies/clear')
+
 // Valid cards
 export const getValidCards = (params) => get('/api/valid-cards', params)
 

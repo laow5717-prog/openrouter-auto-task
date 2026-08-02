@@ -21,6 +21,7 @@ from src.models.card_group import CardGroupModel
 from src.models.card_payment_state import CardPaymentStateModel
 from src.models.card_pool import CardPoolModel
 from src.models.database import Database
+from src.models.proxy import ProxyModel
 from src.models.recharge_log import RechargeLogModel
 from src.models.valid_card import ValidCardModel
 from src.web.app import AppState
@@ -60,7 +61,7 @@ class _Tracker:
             self._active -= 1
             self._in_flight.discard(email)
 
-    def register(self, acct, worker=None):
+    def register(self, acct, worker=None, proxy=None):
         """假 _register_one_account：imported → registered（存 login_password）。"""
         email = acct['email']
         self._enter(email)
@@ -103,6 +104,7 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16):
         'account': AccountModel(db), 'recharge_log': RechargeLogModel(db),
         'card_group': CardGroupModel(db), 'card_pool': CardPoolModel(db),
         'valid_card': ValidCardModel(db), 'card_state': CardPaymentStateModel(db),
+        'proxy': ProxyModel(db),
     }
     gid = models['card_group'].create('pay-group', 'pay')
     models['card_pool'].add_cards(gid, _full_cards(n_cards))

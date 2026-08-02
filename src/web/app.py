@@ -23,12 +23,23 @@ from src.models.card_pool import CardPoolModel
 from src.models.valid_card import ValidCardModel
 from src.models.card_payment_state import CardPaymentStateModel
 from src.models.invoice_payment_state import InvoicePaymentStateModel
+from src.models.proxy import ProxyModel
 from src.services import registration, card as card_service
 from src.api.routes import api
 from src.web.worker import (
-    WorkerState, WorkerPool, AccountRegistry, PaymentCardRegistry, ClaimReaper,
-    get_current_worker,
+    WorkerState, WorkerPool, AccountRegistry, PaymentCardRegistry, ProxyRegistry,
+    ClaimReaper, get_current_worker,
 )
+
+
+def _to_pw_proxy(row):
+    """proxies 表 row（host/port/username/password）→ Playwright proxy dict。
+    server 只放 scheme+host+port，凭据走 username/password 字段（不 URL 内嵌）。"""
+    d = {"server": f"http://{row['host']}:{row['port']}"}
+    if row.get('username'):
+        d["username"] = row['username']
+        d["password"] = row.get('password') or ''
+    return d
 
 
 class AppState:
@@ -76,6 +87,7 @@ class AppState:
         # 并发排他：账号（Chrome profile 单实例约束）与支付卡（选卡闸门时间差）
         self.account_registry = AccountRegistry(self)
         self.payment_registry = PaymentCardRegistry()
+        self.proxy_registry = ProxyRegistry()
 
     # ---------- worker 管理 ----------
 
@@ -415,7 +427,7 @@ class AppState:
 
     def _recharge_one_account(self, email, login_password, payment_group_id=None,
                               worker=None, captcha_api_key=None,
-                              captcha_server="api.multibot.cloud"):
+                              captcha_server="api.multibot.cloud", proxy=None):
         """为单个账号执行一次充值访问，返回 (result, err)，
         result ∈ {"success", "failed", "archived"(余额≥$20 已归档、未扣款)}。
 
@@ -453,6 +465,7 @@ class AppState:
                 payment_registry=self.payment_registry,
                 captcha_api_key=captcha_api_key,
                 captcha_server=captcha_server,
+                proxy=proxy,
             )
 
             if outcome == "topup":
@@ -554,12 +567,32 @@ class AppState:
                     and self._hotmail_for_account(a)
                 ]
 
+            # 代理领取:每账号处理时领一个空闲代理出口 IP(反关联),用完释放。
+            # 无代理配置时返回 (None, None) → 直连(行为同现状)。
+            proxy_model = self.models['proxy']
+
+            def _acquire_proxy_for(account_id):
+                """领一个空闲代理(排他)。全忙(100≫worker 数,几乎不触发)则按
+                account_id 取模兜底(不排他,满足「循环复用」)。返回 (pw_dict, proxy_key);
+                proxy_key 为 None 表示取模兜底或无代理,_do 不 release。"""
+                usable = proxy_model.get_usable_list()
+                if not usable:
+                    return None, None
+                worker = get_current_worker() or self.primary_worker
+                p = self.proxy_registry.acquire_free(usable, worker.worker_id)
+                if p is not None:
+                    return _to_pw_proxy(p), self.proxy_registry.key_of(p)
+                p = usable[(account_id or 0) % len(usable)]   # 取模兜底,不排他
+                return _to_pw_proxy(p), None
+
             accounts = _payable_now()
             imported_pending = len(_registerable_imported())
             eligible = len(self._eligible_cards(group_id))
+            proxy_count = proxy_model.count()
             self._hooked_print(
                 f"可充值账号 {len(accounts)} 个，待注册 imported {imported_pending} 个，"
-                f"分组可选卡 {eligible} 张")
+                f"分组可选卡 {eligible} 张，代理 {proxy_count} 个"
+                f"{'（未配置代理，直连）' if not proxy_count else ''}")
             if not eligible:
                 self._hooked_print("分组内无可选卡（全部无效/过期或冷却中），无事可做")
                 return
@@ -579,10 +612,12 @@ class AppState:
                         return None
                     for a in _payable_now():
                         if self.account_registry.claim(a['email']):
-                            return ('recharge', a)
+                            proxy, pkey = _acquire_proxy_for(a.get('id', 0))
+                            return ('recharge', a, proxy, pkey)
                     for a in _registerable_imported():
                         if self.account_registry.claim(a['email']):
-                            return ('register', a)
+                            proxy, pkey = _acquire_proxy_for(a.get('id', 0))
+                            return ('register', a, proxy, pkey)
                     return None
 
             # ── 消费者：跑在 worker 线程。注册成功者「不入 done」——释放后会被（自己或另一个
@@ -590,13 +625,14 @@ class AppState:
             #    充值成功记 success，归档/flagged/充值失败/注册未成入 done（本次不再领），
             #    其中充值失败入 done 替代原 done_emails+progressed 兜底，防卡全拒账号被无限重领。
             def _do(worker, item):
-                kind, acct = item
+                kind, acct, proxy, pkey = item
                 email = acct['email']
+                proxy_note = f"（代理 {proxy['server'].split('//')[-1]}）" if proxy else "（直连）"
                 try:
                     if kind == 'register':
                         self.set_action(worker, f"账号耗尽，注册补号 {email}")
-                        self._hooked_print(f"\n可充账号耗尽，注册补号: {email}")
-                        rr, rdetail = self._register_one_account(acct, worker)
+                        self._hooked_print(f"\n可充账号耗尽，注册补号: {email} {proxy_note}")
+                        rr, rdetail = self._register_one_account(acct, worker, proxy=proxy)
                         self._hooked_print(f"补号 {email}: {rr}（{rdetail}）")
                         with state_lock:
                             if rr == "registered":
@@ -605,11 +641,12 @@ class AppState:
                                 done.add(email)   # pending/suspended/failed，已离开 imported
                     else:  # recharge
                         self.set_action(worker, f"充值账号 {email}")
-                        self._hooked_print(f"\n充值账号: {email}")
+                        self._hooked_print(f"\n充值账号: {email} {proxy_note}")
                         result, err = self._recharge_one_account(
                             email, login_password or acct.get('login_password'),
                             payment_group_id=group_id, worker=worker,
-                            captcha_api_key=captcha_api_key, captcha_server=captcha_server)
+                            captcha_api_key=captcha_api_key, captcha_server=captcha_server,
+                            proxy=proxy)
                         with state_lock:
                             if result == "success":
                                 stats['paid'] += 1
@@ -635,6 +672,8 @@ class AppState:
                     self._hooked_print(f"处理 {email} 出错: {e}")
                 finally:
                     self.account_registry.release(email)
+                    if pkey:
+                        self.proxy_registry.release(pkey)   # 排他领取的代理释放回池
 
             # 收敛：每个账号最终 recharged/archived/flagged 或入 done，imported 与 payable
             # 均有限，_produce 终会领空 → 所有 worker 退出。无 round，故无需 MAX_ROUNDS 兜底。
@@ -651,6 +690,7 @@ class AppState:
                 w.busy = False
             self.account_registry.release_all()
             self.payment_registry.release_all()
+            self.proxy_registry.release_all()
             self.parallel_mode = False
             self.is_running = False
 
@@ -711,7 +751,7 @@ class AppState:
     # 下一轮该账号会带新卡再来，坏卡已被标 invalid 退出可选集）。
     SUBSCRIBE_MAX_CARDS_PER_ACCOUNT = 5
 
-    def _register_one_account(self, acct, worker=None):
+    def _register_one_account(self, acct, worker=None, proxy=None):
         """未注册账号跑一次 GitHub 全自动注册（Patchright，碰 Arkose 自动跳过不等人工）。
 
         返回 (result, detail)，result ∈ {"registered","skipped","failed"}：
@@ -735,7 +775,7 @@ class AppState:
         self.set_action(worker, f"{email} 未注册，尝试 GitHub 注册（Arkose 弹则跳过）")
         # auto_skip_captcha：不弹 Arkose 自动收码完成注册；弹了立即跳过不等人工（全自动）。
         r = signup_one(headless=False, semi_auto=False, account=hacc,
-                       then_opencode=False, auto_skip_captcha=True)
+                       then_opencode=False, auto_skip_captcha=True, proxy=proxy)
         oc = r.get('outcome')
         if oc == 'reached_captcha':
             models['account'].update_status(email, 'pending')
@@ -755,7 +795,7 @@ class AppState:
         return "registered", "GitHub 注册成功"
 
     def _subscribe_one_account(self, acct, payment_group_id, captcha_api_key, worker=None,
-                               captcha_server="api.multibot.cloud"):
+                               captcha_server="api.multibot.cloud", proxy=None):
         """单账号一次推进：未注册先注册（Patchright，Arkose 跳过），已注册走原生栈登录+逐卡订阅。
 
         返回 (result, detail)，result ∈ {"subscribed","registered_only","skipped","failed"}。
@@ -775,7 +815,7 @@ class AppState:
 
         # --- A. 注册分支：未注册（非 registered/subscribed）先跑 GitHub 注册（复用共享函数）---
         if status not in ('registered', 'subscribed'):
-            rr, rdetail = self._register_one_account(acct, worker)
+            rr, rdetail = self._register_one_account(acct, worker, proxy=proxy)
             if rr != "registered":
                 return rr, rdetail
             self.add_log(f"{email} 转订阅")
@@ -784,7 +824,7 @@ class AppState:
         if captcha_api_key:
             captcha_solver.init_solver(captcha_api_key, server=captcha_server)
 
-        session = create_driver_vanilla(profile_id=email)
+        session = create_driver_vanilla(profile_id=email, proxy=proxy)
         monitor = worker.make_monitor(self)
         worker.set_active_driver(session)
         try:
@@ -976,6 +1016,7 @@ class AppState:
                 w.busy = False
             self.account_registry.release_all()
             self.payment_registry.release_all()
+            self.proxy_registry.release_all()
             self.parallel_mode = False
             self.is_running = False
             try:
@@ -1061,6 +1102,7 @@ def create_app(db_path=None):
         'valid_card': ValidCardModel(db),
         'card_state': CardPaymentStateModel(db),
         'invoice_state': InvoicePaymentStateModel(db),
+        'proxy': ProxyModel(db),
     }
 
     # 创建应用状态

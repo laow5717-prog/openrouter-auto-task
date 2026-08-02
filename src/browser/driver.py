@@ -616,7 +616,7 @@ def _prune_profile_cache(user_data_dir):
 
 
 def create_driver(headless=False, profile_id=None, bypass_csp=False,
-                  disable_site_isolation=False):
+                  disable_site_isolation=False, proxy=None):
     """
     创建带有反检测的 Chrome 浏览器会话（使用 Patchright）
 
@@ -629,6 +629,8 @@ def create_driver(headless=False, profile_id=None, bypass_csp=False,
                     导致 hook 不执行。开启后（Page.setBypassCSP）内联注入才能在这些 OOPIF 帧
                     生效——这是 2captcha token 交付进 Stripe enterprise hCaptcha 的前提。
                     仅订阅付款流程需要，默认关闭以最小化对其它流程的检测面。
+        proxy: HTTP 代理 dict {"server","username","password"}，None 则直连。
+               每账号一个出口 IP（反关联）；透传给 launch_persistent_context。
     返回:
         浏览器驱动实例
     """
@@ -731,6 +733,7 @@ def create_driver(headless=False, profile_id=None, bypass_csp=False,
                 no_viewport=True,           # 用真实窗口尺寸（由 --window-size 控制）
                 bypass_csp=bypass_csp,      # 见 create_driver docstring：让内联 hook 注入不被 CSP 拦
                 args=launch_args,
+                **({"proxy": proxy} if proxy else {}),   # 每账号一个出口 IP；None 则直连
             )
             break
         except Exception as e:
@@ -797,8 +800,10 @@ def create_driver(headless=False, profile_id=None, bypass_csp=False,
         raise
 
 
-def create_driver_vanilla(profile_id):
+def create_driver_vanilla(profile_id, proxy=None):
     """用**原生 Playwright**（非 Patchright）创建持久 context + BrowserSession。
+
+    proxy: HTTP 代理 dict {"server","username","password"}，None 直连；每账号一个出口 IP。
 
     专用于 opencode 订阅付款：Patchright 为反检测**阉割了 add_init_script / CDP 脚本前置注入**，
     导致无法在 Stripe enterprise hCaptcha 的跨域 OOPIF 帧脚本加载前 hook，2captcha token 交付不进去
@@ -840,6 +845,7 @@ def create_driver_vanilla(profile_id):
             args=["--no-first-run", "--no-default-browser-check",
                   f"--lang={BROWSER_LANG}", f"--accept-lang={BROWSER_ACCEPT_LANG}",
                   f"--window-size={w},{h}"],
+            **({"proxy": proxy} if proxy else {}),   # 每账号一个出口 IP；None 则直连
         )
         page = context.pages[0] if context.pages else context.new_page()
         context.set_default_timeout(DEFAULT_TIMEOUT_MS)

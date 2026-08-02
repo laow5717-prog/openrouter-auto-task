@@ -156,7 +156,7 @@ def _finish_semi_auto(session, fetch_code, result):
 
 
 def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
-               then_opencode=False, auto_skip_captcha=False):
+               then_opencode=False, auto_skip_captcha=False, proxy=None):
     """执行一次 GitHub 注册。
 
     semi_auto=False：只跑到 Arkose 验证码出现为止（outcome=reached_captcha）。
@@ -231,7 +231,8 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
         # 2) 起浏览器 + 打开注册页（hotmail 用以 email 命名的持久 profile）
         print("=== 步骤 2/4：打开 GitHub 注册页 ===")
         session = create_driver(headless=headless,
-                                profile_id=(address if use_hotmail else None))
+                                profile_id=(address if use_hotmail else None),
+                                proxy=proxy)
         if not gh.open_signup(session):
             result["reason"] = "GitHub 注册页加载失败（邮箱框未出现）"
             result["screenshot"] = _screenshot(session, address)

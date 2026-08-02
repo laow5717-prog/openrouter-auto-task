@@ -166,6 +166,23 @@ ALTER TABLE accounts ADD COLUMN apikey_updated_at TEXT;
 ALTER TABLE accounts ADD COLUMN email_verify_link TEXT;
 """
 
+# 代理池:每账号处理时领一个 HTTP 代理出口 IP（反关联）。username/password 为代理认证凭据，
+# host/port 为网关地址（i-proxy 同网关不同端口=不同出口 IP）。status='' 可用、'invalid' 剔除；
+# assigned_email 预留给「账号固定绑定 IP」模式（当前动态领取不写它）。UNIQUE 去重。
+_SCHEMA_V11 = """
+CREATE TABLE IF NOT EXISTS proxies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    username TEXT DEFAULT '',
+    password TEXT DEFAULT '',
+    status TEXT DEFAULT '',
+    assigned_email TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(host, port, username)
+);
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -177,6 +194,7 @@ _MIGRATIONS = {
     8: _SCHEMA_V8,
     9: _SCHEMA_V9,
     10: _SCHEMA_V10,
+    11: _SCHEMA_V11,
 }
 
 

@@ -1008,3 +1008,52 @@ def start_daily_subscribe_pipeline():
 
     return jsonify({"status": "started", "usable_cards": eligible,
                     "accounts": account_count, "group_name": group['name']})
+
+
+# ==================== 代理 IP 池 ====================
+
+def _mask_proxy(row):
+    """列表展示用:凭据打码,只留首尾几位。"""
+    def _m(s):
+        s = s or ''
+        return s if len(s) <= 4 else f"{s[:3]}***{s[-2:]}"
+    return {
+        'id': row['id'], 'host': row['host'], 'port': row['port'],
+        'username': _m(row.get('username')), 'password': _m(row.get('password')),
+        'status': row.get('status') or '', 'created_at': row.get('created_at'),
+    }
+
+
+@api.route('/api/proxies')
+def get_proxies():
+    models = get_models()
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 50))
+    rows, total = models['proxy'].get_all(page=page, page_size=page_size)
+    return jsonify({"data": [_mask_proxy(r) for r in rows], "total": total,
+                    "page": page, "page_size": page_size})
+
+
+@api.route('/api/proxies/import', methods=['POST'])
+def import_proxies():
+    """粘贴导入:body {text} 每行一个 user:pass@host:port(兼容纯冒号)。"""
+    models = get_models()
+    text = (request.json or {}).get('text', '')
+    if not text.strip():
+        return jsonify({"error": "内容为空"}), 400
+    added, skipped = models['proxy'].add_proxies(text)
+    return jsonify({"added": added, "skipped": skipped, "total": models['proxy'].count()})
+
+
+@api.route('/api/proxies/<int:proxy_id>', methods=['DELETE'])
+def delete_proxy(proxy_id):
+    models = get_models()
+    models['proxy'].delete(proxy_id)
+    return jsonify({"status": "ok"})
+
+
+@api.route('/api/proxies/clear', methods=['POST'])
+def clear_proxies():
+    models = get_models()
+    models['proxy'].clear()
+    return jsonify({"status": "ok"})

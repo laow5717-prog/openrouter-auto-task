@@ -65,7 +65,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      valid_card_model=None, card_pool_model=None, account_model=None,
                      should_stop=None, card_binding_model=None, card_state_model=None,
                      payment_registry=None, captcha_api_key=None,
-                     captcha_server="api.multibot.cloud"):
+                     captcha_server="api.multibot.cloud", proxy=None):
     """登录 opencode 账号并在 zen 控制台 Stripe Checkout 充值（美元，$20 credits）。
 
     编排：create_driver_vanilla(profile_id=email)（原生 Playwright 栈，hCaptcha token 注入
@@ -133,7 +133,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     try:
         # 原生 Playwright 栈：hCaptcha token 注入只在原生栈生效（Patchright 阉割了 add_init_script）；
         # 与 create_driver 复用同一 profile 目录（data/profiles/<email>），登录态照常复用。
-        session = create_driver_vanilla(profile_id=email)
+        session = create_driver_vanilla(profile_id=email, proxy=proxy)
         if monitor_callback:
             monitor_callback(session, f"为 {email} 启动浏览器")
 

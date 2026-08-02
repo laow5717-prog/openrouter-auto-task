@@ -65,6 +65,27 @@ worker holds it" and "register in `open_browsers`".
 See [database-guidelines.md](./database-guidelines.md). Needs to be persistent
 (survives restart) and reapable, hence DB rather than memory.
 
+### 3b. Proxy IPs — `ProxyRegistry`
+
+Same shape as `PaymentCardRegistry` (worker.py) — an in-memory `proxy_key →
+worker_id` map under a lock. Each account run acquires one free proxy so two
+concurrent workers never share an exit IP (which would re-link the accounts the
+proxy was meant to isolate). `key_of(proxy) = "host:port:username"`.
+
+Allocation is in `run_daily_pipeline._produce` (under `produce_lock`, alongside
+the account claim): `acquire_free(usable, worker_id)` returns the first
+un-held proxy; if all are held — only possible when workers > proxies, since 100
+proxies ≫ 2 workers — it falls back to `usable[account_id % N]` **without**
+exclusivity (the "循环复用" the user asked for). The exclusive-held proxy is
+released in `_do`'s finally (the modulo-fallback one is not, signalled by a null
+`proxy_key`). No proxies configured → `proxy=None` → direct connection, same as
+before. Released in the task finally via `proxy_registry.release_all()`.
+
+Trade-off baked in by the user's choice of dynamic allocation: **a given account
+may use a different exit IP across runs**. The proxies table keeps an
+`assigned_email` column so a future "one account, one fixed IP" mode needs no
+schema change.
+
 ### 3. Payment cards — `PaymentCardRegistry`
 
 **Why, and this one is easy to miss**: the eligibility gate in

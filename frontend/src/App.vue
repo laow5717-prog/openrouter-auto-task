@@ -24,6 +24,9 @@
       <router-link to="/recharge-logs" class="nav-item" active-class="active">
         <Icon name="wallet" /> 充值记录
       </router-link>
+      <router-link to="/proxies" class="nav-item" active-class="active">
+        <Icon name="monitor" /> 代理管理
+      </router-link>
     </nav>
 
   </aside>

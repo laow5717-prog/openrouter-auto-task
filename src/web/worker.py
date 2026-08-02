@@ -146,6 +146,56 @@ class PaymentCardRegistry:
             self._in_flight.clear()
 
 
+class ProxyRegistry:
+    """代理 IP 的运行时排他（in-flight 领取）。
+
+    每账号处理时领一个空闲代理出口 IP，并发下两个 worker 各领各的、绝不撞同一个
+    出口（否则两账号同 IP 又被关联，代理就白用了）。用完释放回池。内存态，进程
+    崩溃即清；与 AccountRegistry / PaymentCardRegistry 同构，是第四种运行时排他。
+
+    proxy_key 用 "host:port:username" 唯一标识一个代理。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._in_flight = {}               # proxy_key -> worker_id
+
+    @staticmethod
+    def key_of(proxy):
+        """从 proxy dict（含 host/port/username）算唯一 key。"""
+        return f"{proxy.get('host')}:{proxy.get('port')}:{proxy.get('username','')}"
+
+    def try_acquire(self, proxy_key, worker_id):
+        """占用一个代理。已被别的 worker 占用则返回 False。"""
+        if not proxy_key:
+            return False
+        with self._lock:
+            holder = self._in_flight.get(proxy_key)
+            if holder is not None and holder != worker_id:
+                return False
+            self._in_flight[proxy_key] = worker_id
+            return True
+
+    def acquire_free(self, candidates, worker_id):
+        """从候选代理列表领第一个空闲的，返回该 proxy dict；全忙返回 None。"""
+        for p in candidates:
+            if self.try_acquire(self.key_of(p), worker_id):
+                return p
+        return None
+
+    def release(self, proxy_key):
+        with self._lock:
+            self._in_flight.pop(proxy_key, None)
+
+    def in_flight_keys(self):
+        with self._lock:
+            return set(self._in_flight)
+
+    def release_all(self):
+        with self._lock:
+            self._in_flight.clear()
+
+
 class WorkerState:
     """单个 worker 的隔离状态。
 
