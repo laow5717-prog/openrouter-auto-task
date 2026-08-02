@@ -546,17 +546,17 @@ class AppState:
                     and a['email'] not in done_emails
                 ]
 
-            # 下一个可注册的 imported 账号（未注册、hotmail.xlsx 有其收码数据）。
+            # 下一个可注册的 imported 账号（未注册、有收码数据：DB 自带 link 或 xlsx 命中）。
             def _next_registerable_imported():
                 for a in account_model.get_all(order_desc=False):
-                    if (a.get('status') or '') == 'imported' and self._hotmail_by_email(a['email']):
+                    if (a.get('status') or '') == 'imported' and self._hotmail_for_account(a):
                         return a
                 return None
 
             accounts = _payable_now()
             imported_pending = sum(
                 1 for a in account_model.get_all(order_desc=False)
-                if (a.get('status') or '') == 'imported' and self._hotmail_by_email(a['email'])
+                if (a.get('status') or '') == 'imported' and self._hotmail_for_account(a)
             )
 
             eligible = len(self._eligible_cards(group_id))
@@ -734,6 +734,26 @@ class AppState:
                 self._hooked_print(f"读取 hotmail.xlsx 失败: {str(e)[:120]}")
         return self._hotmail_map.get(email)
 
+    def _hotmail_for_account(self, acct):
+        """为账号取注册收码所需的 HotmailAccount（含 ruoanzhu 收信 link）。
+
+        两个来源，优先账号自带：
+          1. accounts 表自带 email_verify_link（导入时随邮箱一起入库的 ruoanzhu 链接）——
+             多数 imported 账号走这条，收码数据在 DB，不在 hotmail.xlsx。
+          2. 回退 hotmail.xlsx（_hotmail_by_email）——订阅任务那批只在 xlsx 的账号。
+        两者都取不到（无 link 且 xlsx 无该邮箱）返回 None。
+        """
+        link = (acct.get('email_verify_link') or '').strip()
+        if link:
+            from src.services.hotmail_inbox import HotmailAccount
+            return HotmailAccount(
+                email=acct['email'],
+                password=(acct.get('email_password') or ''),
+                link=link,
+                raw='',
+            )
+        return self._hotmail_by_email(acct['email'])
+
     # 单账号单次推进内最多试几张卡即换下一个账号（避免坏卡把一个账号卡死数小时；
     # 下一轮该账号会带新卡再来，坏卡已被标 invalid 退出可选集）。
     SUBSCRIBE_MAX_CARDS_PER_ACCOUNT = 5
@@ -754,10 +774,10 @@ class AppState:
         worker = worker or self.primary_worker
         email = acct['email']
 
-        hacc = self._hotmail_by_email(email)
+        hacc = self._hotmail_for_account(acct)
         if not hacc:
-            self.set_action(worker, f"{email} 无 hotmail 数据，跳过")
-            return "skipped", "无 hotmail 数据（xlsx 缺该邮箱）"
+            self.set_action(worker, f"{email} 无收码数据，跳过")
+            return "skipped", "无收码数据（账号无 email_verify_link 且 xlsx 缺该邮箱）"
         from src.services.github_signup_service import signup_one
         self.set_action(worker, f"{email} 未注册，尝试 GitHub 注册（Arkose 弹则跳过）")
         # auto_skip_captcha：不弹 Arkose 自动收码完成注册；弹了立即跳过不等人工（全自动）。
