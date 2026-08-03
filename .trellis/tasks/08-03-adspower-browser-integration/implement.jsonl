@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/browser-profile-guidelines.md", "reason": "浏览器 profile / 会话生命周期约定，AdsPower 模式要替换的正是这一层"}
+{"file": ".trellis/spec/backend/concurrency-guidelines.md", "reason": "worker 线程与 Playwright 线程绑定红线、注册表排他规则，环境池必须遵守"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "新增 adspower_profiles 表需遵循建表与模型层约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "AdsPower 接口失败的异常分类与降级处理需符合既有约定"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "环境创建/回收/代理绑定的日志格式"}
+{"file": ".trellis/spec/backend/stripe-payment-element.md", "reason": "Stripe 付款链路约束，决定 --proxy-bypass-list 是否够用"}

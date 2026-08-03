@@ -43,6 +43,23 @@ concurrency:
                               # 每个实例是有头 Chrome，约占 300-500MB 内存
   claim_timeout_minutes: 20   # 卡被领取后多久无进展视为 worker 失联，自动回收为 pending
 
+# AdsPower 指纹浏览器（每日任务的浏览器启动方式）
+# enabled=false 时走本地 Chrome 持久 profile（data/profiles/<email>），与接入前一致；
+# enabled=true 时每个账号绑定一个 AdsPower 环境，环境创建时绑定一个独立代理出口 IP。
+# 注意：AdsPower 环境数有套餐上限（当前账号实测 12），配额满时会自动删除已充值成功
+# 账号对应的环境来腾位置。api_key 在客户端「自动化 - API - API Key」里复制。
+adspower:
+  enabled: false
+  base_url: "http://local.adspower.net:50325"
+  api_key: ""
+  group_id: "0"           # 新建环境归入的分组，"0" = 未分组
+  reclaim_batch: 3        # 配额满时单次回收几个环境
+  # 环境指纹的操作系统。留空用代码默认（Windows 10/11 + macOS 12/13）。
+  # 只能填桌面系统：AdsPower 不指定时会在所有系统里随机（含 Android/iOS/Linux），
+  # 移动端 UA 会让 GitHub / Stripe 返回移动版页面，本项目的选择器全是按桌面版写的。
+  # 可选值：Windows 7/8/10/11、Mac OS X 10/11/12/13
+  ua_systems: []
+
 # 验证码服务配置 (2Captcha)
 captcha:
   api_key: ""              # 2Captcha API Key

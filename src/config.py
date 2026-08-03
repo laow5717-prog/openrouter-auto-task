@@ -121,6 +121,29 @@ class ConcurrencyConfig:
 
 
 @dataclass
+class AdsPowerConfig:
+    """AdsPower 指纹浏览器接入配置。
+
+    enabled: 总开关。为 False 时每日任务走原来的本地 Chrome 持久 profile 路径，
+             代码路径与接入前完全一致——这是唯一的回退手段，不需要改代码。
+    base_url: 本地 API 地址。AdsPower 客户端默认监听 50325。
+    api_key:  客户端「自动化 - API - API Key」里复制。走 Authorization: Bearer 头。
+    group_id: 新建环境归入的分组，"0" 是未分组。
+    reclaim_batch: 环境配额满时单次回收几个环境。环境上限很低（实测 12），
+             删多了浪费登录态，删少了并发下不够分。
+    ua_systems: 新建环境的指纹允许哪些操作系统。**只能是桌面系统**——AdsPower 不设此项
+             时会在所有系统里随机（含 Android/iOS/Linux），移动端 UA 会让 GitHub 与
+             Stripe 返回移动版页面，而本项目所有选择器都按桌面版编写。留空用代码默认值。
+    """
+    enabled: bool = False
+    base_url: str = "http://local.adspower.net:50325"
+    api_key: str = ""
+    group_id: str = "0"
+    reclaim_batch: int = 3
+    ua_systems: list = field(default_factory=list)
+
+
+@dataclass
 class AppConfig:
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     email: EmailConfig = field(default_factory=EmailConfig)
@@ -133,6 +156,7 @@ class AppConfig:
     files: FilesConfig = field(default_factory=FilesConfig)
     payment: PaymentConfig = field(default_factory=PaymentConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
+    adspower: AdsPowerConfig = field(default_factory=AdsPowerConfig)
 
 
 def get_base_dir():
@@ -263,6 +287,17 @@ class ConfigLoader:
             self.config.concurrency = ConcurrencyConfig(
                 max_workers=conc.get('max_workers', 1),
                 claim_timeout_minutes=conc.get('claim_timeout_minutes', 20),
+            )
+
+        if 'adspower' in self.raw_config:
+            ads = self.raw_config['adspower']
+            self.config.adspower = AdsPowerConfig(
+                enabled=bool(ads.get('enabled', False)),
+                base_url=ads.get('base_url', 'http://local.adspower.net:50325'),
+                api_key=ads.get('api_key', ''),
+                group_id=str(ads.get('group_id', '0')),
+                reclaim_batch=ads.get('reclaim_batch', 3),
+                ua_systems=list(ads.get('ua_systems') or []),
             )
 
         if 'captcha' in self.raw_config:

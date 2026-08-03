@@ -39,6 +39,10 @@ def _make_session(context, playwright, user_data_dir='/tmp/fake-profile'):
     s._closed = False
     s._temp_profile = None
     s._user_data_dir = user_data_dir
+    # 本地模式：remote_* 均为 None，quit() 走本地分支（杀进程 + 清目录）。
+    # 这两个字段来自 AdsPower 接入，本文件全部用例都只覆盖本地分支。
+    s._remote_browser = None
+    s._remote_stop = None
     return s
 
 

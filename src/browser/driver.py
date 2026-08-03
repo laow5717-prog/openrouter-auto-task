@@ -116,10 +116,17 @@ class BrowserSession:
     """
 
     def __init__(self, playwright, context, page, temp_profile=None, download_dir=None,
-                 user_data_dir=None):
+                 user_data_dir=None, remote_browser=None, remote_stop=None):
         self.playwright = playwright        # sync_playwright().start() 句柄
         self.context = context              # 持久化 BrowserContext
         self.page = page                    # 主 Page
+        # remote 模式（AdsPower 等外部指纹浏览器，经 connect_over_cdp 接管）。
+        # 与本地模式的区别全在 quit()：浏览器进程不归我们管，既不能按 profile 目录
+        # 杀进程（会误伤 AdsPower 自己的实例），也不能删目录（目录在 AdsPower 内部）。
+        # remote_browser 是 connect_over_cdp 返回的 Browser（close() = 断开连接，不关浏览器），
+        # remote_stop 是「请外部管理器关掉这个浏览器」的回调。两者同时为 None 即本地模式。
+        self._remote_browser = remote_browser
+        self._remote_stop = remote_stop
         self._temp_profile = temp_profile   # 临时 profile 目录；持久化时为 None
         # profile 目录（临时/持久化都有值）。与 _temp_profile 职责不同：后者管
         # 「退出时要不要删目录」，本字段管「退出后按目录核查进程是否真的退干净了」。
@@ -265,6 +272,10 @@ class BrowserSession:
             return
         self._closed = True
 
+        if self._remote_stop is not None:
+            self._quit_remote()
+            return
+
         # 看门狗：context.close() / playwright.stop() 会等 Chrome 应答，Chrome 卡死时
         # 这两个调用会无限期阻塞，整条任务线程就此静默——现象是日志停在
         # 「正在关闭浏览器...」之后再无任何输出，且不报错（close_driver 吞异常也救不了，
@@ -327,6 +338,59 @@ class BrowserSession:
                 print(f"  🧹 已清理临时 profile: ...{os.path.basename(self._temp_profile)}")
             except Exception:
                 pass
+
+    def _quit_remote(self):
+        """remote 模式关闭：断开 CDP → 停 playwright → 请外部管理器关浏览器。
+
+        与本地模式的关键差异：
+          - 用 remote_browser.close() 断开连接，**不**调 context.close()。CDP 接管到的
+            context 是浏览器里那个真实的默认上下文，关掉它会连带关掉整个浏览器，
+            外部管理器（AdsPower）随后就收不到自己那份关闭流程，环境状态会停在
+            "Active" 而实际进程已死，下次启动直接失败。
+          - 不按 user_data_dir 杀进程：那个目录属于 AdsPower，用 pkill 匹配会连它自己
+            管理的其它环境一起杀掉。
+
+        看门狗仍然保留，但只做一件事：超时后直接调 remote_stop。CDP 断连不像本地
+        Chrome 那样会把线程钉死，真正可能卡住的是对端无响应，而那正是 remote_stop
+        （走 HTTP 接口）能解决的。
+        """
+        stopped = threading.Event()
+
+        def _force_stop():
+            if stopped.is_set():
+                return
+            print(f"  ⏱️ 断开远程浏览器超时 {_CLOSE_WATCHDOG_SEC}s，直接请求关闭环境")
+            self._call_remote_stop()
+
+        watchdog = threading.Timer(_CLOSE_WATCHDOG_SEC, _force_stop)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            if self._remote_browser is not None:
+                try:
+                    self._remote_browser.close()
+                except Exception as e:
+                    print(f"  ⚠️ 断开远程浏览器连接失败: {str(e)[:120]}")
+            try:
+                self.playwright.stop()
+            except Exception as e:
+                print(f"  ⚠️ 停止 playwright 失败: {str(e)[:120]}")
+        finally:
+            self._close_finished = True
+            stopped.set()
+            watchdog.cancel()
+
+        self._call_remote_stop()
+
+    def _call_remote_stop(self):
+        """幂等地请求外部管理器关闭浏览器（看门狗与正常路径都可能调到）。"""
+        cb, self._remote_stop = self._remote_stop, None
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception as e:
+            print(f"  ⚠️ 关闭远程浏览器环境失败: {str(e)[:150]}")
 
 
 # credit-balance 接口 URL 标记（credits 页加载时页面会自行请求该接口）。

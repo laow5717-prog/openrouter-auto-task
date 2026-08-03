@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "代码质量与验收基线"}
+{"file": ".trellis/spec/backend/concurrency-guidelines.md", "reason": "核查环境池的锁范围、线程绑定与排他是否违规"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核查 AdsPower 失败路径是否都有可读中文提示且不吞异常"}
+{"file": ".trellis/spec/backend/browser-profile-guidelines.md", "reason": "核查 BrowserSession remote 分支未破坏原有关闭语义"}

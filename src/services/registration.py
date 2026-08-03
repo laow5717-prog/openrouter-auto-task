@@ -65,7 +65,8 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      valid_card_model=None, card_pool_model=None, account_model=None,
                      should_stop=None, card_binding_model=None, card_state_model=None,
                      payment_registry=None, captcha_api_key=None,
-                     captcha_server="api.multibot.cloud", proxy=None):
+                     captcha_server="api.multibot.cloud", proxy=None,
+                     browser_factory=None, verify_link=None):
     """登录 opencode 账号并在 zen 控制台 Stripe Checkout 充值（美元，$20 credits）。
 
     编排：create_driver_vanilla(profile_id=email)（原生 Playwright 栈，hCaptcha token 注入
@@ -79,6 +80,12 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     captcha_api_key: 传入则 init_solver(key, server=captcha_server) 并装 hook 自动解 hCaptcha；
                      不传则退化为旧行为（检测到 hCaptcha 提示人工、超时 needs_captcha）。
     captcha_server:  求解服务域名，默认 Multibot（api.multibot.cloud）；可传 '2captcha.com'。
+    browser_factory: 可选 callable(email) -> BrowserSession，替换默认的本地 Chrome 启动
+                     （AdsPower 指纹浏览器接入走这里）。为 None 时行为与接入前逐字一致。
+                     有 factory 时 proxy 参数被忽略——代理由 factory 那一侧绑定到环境上。
+    verify_link:     该账号的若安收信链接（accounts.email_verify_link）。GitHub 新设备
+                     邮箱验证用它自动收码回填；不传则退回等人工。指纹浏览器下每个账号
+                     都是全新环境，新设备验证几乎必然触发，缺它会让流水线停下来等人。
 
     返回契约: (ok, err, responses, card_last4, outcome)，
     outcome ∈ {"topup"(成功), "failed", "archived"(余额≥阈值已归档、未扣款),
@@ -133,7 +140,10 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     try:
         # 原生 Playwright 栈：hCaptcha token 注入只在原生栈生效（Patchright 阉割了 add_init_script）；
         # 与 create_driver 复用同一 profile 目录（data/profiles/<email>），登录态照常复用。
-        session = create_driver_vanilla(profile_id=email, proxy=proxy)
+        # browser_factory 给出时改由它建会话（AdsPower 环境经 CDP 接管，同样是原生栈，
+        # 已实测 add_init_script 前置注入照常生效）。
+        session = (browser_factory(email) if browser_factory is not None
+                   else create_driver_vanilla(profile_id=email, proxy=proxy))
         if monitor_callback:
             monitor_callback(session, f"为 {email} 启动浏览器")
 
@@ -144,7 +154,8 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
         if captcha_solver.is_available():
             captcha_solver.install_hcaptcha_hook(session)
 
-        wid, detail = ob.ensure_opencode_session(session, monitor_callback, login_password, email)
+        wid, detail = ob.ensure_opencode_session(session, monitor_callback, login_password,
+                                                 email, verify_link=verify_link)
         if not wid:
             if "flagged" in (detail or ""):
                 # GitHub 账号被 flag，无法授权 opencode OAuth——账号级终态（与订阅管线的

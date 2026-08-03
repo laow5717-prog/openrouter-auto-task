@@ -183,6 +183,22 @@ CREATE TABLE IF NOT EXISTS proxies (
 );
 """
 
+# AdsPower 环境映射:一账号一环境。email 作主键是「一账号一环境」的结构性保证,
+# 而不是靠调用方自觉;profile_id 加 UNIQUE 防止两条映射指向同一环境——那会绕过
+# AccountRegistry 的单实例约束,两个 worker 同时接管一个浏览器。
+# proxy_id 是环境创建时绑定的 AdsPower 代理 ID(仅记录,占用真值以 AdsPower 的
+# proxy_count 为准)。环境配额稀缺(实测上限 12),last_used_at 供回收时按最久未用排序。
+_SCHEMA_V12 = """
+CREATE TABLE IF NOT EXISTS adspower_profiles (
+    email TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL UNIQUE,
+    profile_no TEXT DEFAULT '',
+    proxy_id TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    last_used_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -195,6 +211,7 @@ _MIGRATIONS = {
     9: _SCHEMA_V9,
     10: _SCHEMA_V10,
     11: _SCHEMA_V11,
+    12: _SCHEMA_V12,
 }
 
 

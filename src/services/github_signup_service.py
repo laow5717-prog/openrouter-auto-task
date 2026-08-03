@@ -19,6 +19,7 @@ import string
 from datetime import datetime, timezone
 
 from src.browser.driver import create_driver, close_driver
+from src.services.adspower import AdsPowerError
 from src.browser import github_signup as gh
 from src.services.email import create_temp_email, wait_for_github_launch_code
 from src.services.hotmail_inbox import wait_for_github_launch_code_ruoanzhu
@@ -156,7 +157,8 @@ def _finish_semi_auto(session, fetch_code, result):
 
 
 def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
-               then_opencode=False, auto_skip_captcha=False, proxy=None):
+               then_opencode=False, auto_skip_captcha=False, proxy=None,
+               browser_factory=None):
     """执行一次 GitHub 注册。
 
     semi_auto=False：只跑到 Arkose 验证码出现为止（outcome=reached_captcha）。
@@ -171,6 +173,9 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
                以 email 命名的持久 profile（固定指纹环境，降挂起风险）。
     then_opencode：注册成功（signup_complete）后，在同一浏览器 session 里续上 opencode
              GitHub-OAuth 登录，并进入该账号自己的 /go 页。结果写入 result['opencode']。
+    browser_factory：可选 callable(email) -> BrowserSession，用于替换默认的本地
+             Chrome 启动方式（AdsPower 指纹浏览器接入即走这里）。为 None 时行为不变。
+             proxy 参数在有 factory 时被忽略——代理由 factory 那一侧绑定。
 
     返回 dict：
       ok:             bool     半自动模式下 = 注册完成；默认模式下 = 推进到验证码
@@ -217,11 +222,14 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
     # 收验证邮件的时间下界：取在提交之前，保证不漏掉提交后到达的验证邮件。
     # mail.tm 为本次新建收件箱，无历史 GitHub 邮件，故不会误取旧码。
     since_ts = datetime.now(timezone.utc)
+    # hotmail 是长期真实邮箱，收件箱里可能留着上一次注册/设备验证的旧 GitHub 码。
+    # 若安收信页的时间是本地时区的 naive 字符串，故另取一个本地时刻作下界。
+    since_local = datetime.now()
 
     # 收码闭包：两条路径都收敛到零参可调用，收尾逻辑对邮箱源无感。
     if use_hotmail:
         def fetch_code():
-            return wait_for_github_launch_code_ruoanzhu(account.link)
+            return wait_for_github_launch_code_ruoanzhu(account.link, since=since_local)
     else:
         def fetch_code():
             return wait_for_github_launch_code(token, since_ts)
@@ -230,9 +238,12 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
     try:
         # 2) 起浏览器 + 打开注册页（hotmail 用以 email 命名的持久 profile）
         print("=== 步骤 2/4：打开 GitHub 注册页 ===")
-        session = create_driver(headless=headless,
-                                profile_id=(address if use_hotmail else None),
-                                proxy=proxy)
+        if browser_factory is not None:
+            session = browser_factory(address)
+        else:
+            session = create_driver(headless=headless,
+                                    profile_id=(address if use_hotmail else None),
+                                    proxy=proxy)
         if not gh.open_signup(session):
             result["reason"] = "GitHub 注册页加载失败（邮箱框未出现）"
             result["screenshot"] = _screenshot(session, address)
@@ -317,6 +328,13 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
                 print(f"  ⚠️ {result['opencode']['detail']}")
 
         return result
+
+    except AdsPowerError:
+        # 浏览器根本没起来（AdsPower 配额满 / 客户端没开）——这不是「这个账号注册失败」，
+        # 而是基础设施不可用。若在此转成 outcome='error'，上层会把账号标 failed，
+        # 于是它退出 imported 池、再也不会被重试，一次配额耗尽就永久废掉一批好账号
+        # （2026-08-03 实测：30 个刚导入的账号因此被误标）。原样抛出，由上层区分处理。
+        raise
 
     except Exception as e:
         result["outcome"] = "error"
