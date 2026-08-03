@@ -259,3 +259,93 @@ def test_user_stop_propagates_through_the_catch_all():
     with pytest.raises(InterruptedError):
         c.top_up(_Sess(), {'number': '4111111111111111'}, 50,
                  should_stop=lambda: True)
+
+
+# ---------- 输入截断必须被发现 ----------
+
+class _FlakyInput:
+    """模拟 Stripe 的受控输入：第一次只吃进前几个字符（DOM 重排丢字符），第二次正常。
+
+    这是实测撞到的真实故障——卡号没填完就去填下一个字段，没有异常、没有报错，
+    只是卡少了几位，表现成「付款莫名失败」。
+    """
+
+    def __init__(self, drop_first=True, formats=False):
+        self.value = ''
+        self._drop_first = drop_first
+        self._round = 0
+        self._formats = formats
+
+    def click(self, timeout=None):
+        pass
+
+    def fill(self, v, timeout=None):
+        self.value = v
+
+    def press_sequentially(self, text, delay=None):
+        self._round += 1
+        if self._drop_first and self._round == 1:
+            self.value = text[:6]            # 只吃进一部分
+        else:
+            self.value = (' '.join(text[i:i + 4] for i in range(0, len(text), 4))
+                          if self._formats else text)
+
+    def input_value(self, timeout=None):
+        return self.value
+
+
+def test_truncated_input_is_retried_until_complete():
+    """字符被吞掉时必须回读发现并重来，不能当成功。"""
+    from src.payments.stripe_checkout import _type_and_verify
+    box = _FlakyInput(drop_first=True)
+    assert _type_and_verify(box, '4111111111111111', delay=0) is True
+    assert box.value == '4111111111111111'
+
+
+def test_gives_up_after_repeated_truncation():
+    """一直填不完整就如实返回 False，让上层归到 error（不消耗卡）。"""
+    from src.payments.stripe_checkout import _type_and_verify
+
+    class _AlwaysShort(_FlakyInput):
+        def press_sequentially(self, text, delay=None):
+            self.value = text[:4]
+
+    assert _type_and_verify(_AlwaysShort(), '4111111111111111', delay=0, attempts=2) is False
+
+
+def test_accepts_stripe_formatted_card_number():
+    """Stripe 会把卡号格式化成 '4111 1111 1111 1111'，校验只比数字。"""
+    from src.payments.stripe_checkout import _type_and_verify
+    box = _FlakyInput(drop_first=False, formats=True)
+    assert _type_and_verify(box, '4111111111111111', delay=0) is True
+    assert ' ' in box.value, '这个替身确实做了格式化'
+
+
+def test_address_candidates_include_bare_names():
+    """地址字段也要有裸 name 候选——只给 Checkout 的 ID 会让邮编填不进去。"""
+    from src.payments.stripe_checkout import _ADDR_FIELD_CANDIDATES
+    assert _ADDR_FIELD_CANDIDATES['zip'][0] == "input[name='postalCode']"
+    assert _ADDR_FIELD_CANDIDATES['city'][0] == "input[name='locality']"
+
+
+def test_threeds_failure_modal_returns_a_tuple_not_a_frame():
+    """钉住 _threeds_failure_modal 的返回形状。
+
+    它返回 (frame, message)，与同模块其余判定函数（返回 frame 或 None）不一样。
+    曾经把它当单值用：元组 (None, '') 永远不是 None，于是**每一笔付款都被误判成
+    3DS 失败并判废**——好卡被白白废掉，而日志看起来完全正常。
+    这条测试是为了让下次改动时这个差异是显式的。
+    """
+    from src.payments.stripe_checkout import _threeds_failure_modal
+
+    class _NoFrames:
+        class _Page:
+            frames = []
+        page = _Page()
+
+    got = _threeds_failure_modal(_NoFrames())
+    assert isinstance(got, tuple) and len(got) == 2, '返回形状变了，调用方要跟着改'
+    assert got[0] is None
+    # 这才是正确的判空方式
+    fr, _msg = got
+    assert fr is None

@@ -394,6 +394,7 @@ def recharge_account():
         return jsonify({"error": "有任务正在运行，请等待完成后再操作"}), 400
 
     data = request.json or {}
+    platform = _req_platform()
     email = data.get('email', '')
     payment_group_id = data.get('payment_group_id')
     captcha_api_key = data.get('captcha_api_key')
@@ -413,16 +414,29 @@ def recharge_account():
     if not account:
         return jsonify({"error": "账号不存在"}), 404
 
+    # 不在这里校验凭据：**需要哪些凭据是平台决定的**。opencode 走 GitHub OAuth 要
+    # login_password，infron 走邮箱 magic link 只要 email_verify_link，将来的平台可能
+    # 两个都不要。缺什么由 adapter.ensure_session 判断并给出可读的 detail
+    # （opencode 会说「该账号未保存登录密码，且 profile 未登录」）。
+    #
+    # 这个前置校验对 opencode 也偏严：profile 已登录但没存密码的账号本来能跑，
+    # 却被挡在门外。
     login_password = account.get('login_password')
-    if not login_password:
-        return jsonify({"error": "该账号没有保存登录密码"}), 400
 
     # opencode 充值时直接在 Stripe Checkout 填卡，无需预先绑卡，故不再校验 bound 状态。
     # 支付卡来自 payment_group_id 指定的卡池分组（见 _recharge_one_account → recharge_account）。
 
+    # 目标平台落到 AppState —— _recharge_one_account 与它下游的选卡、记账全都读
+    # self.platform。此前这个端点收了 platform 参数却从没应用，于是不管传什么都跑
+    # opencode，是接第二个平台时才暴露出来的缺陷。
+    #
+    # 直接改 AppState 是当前设计允许的：一次只跑一个平台（见 multi-platform
+    # guidelines），两条流水线入口也是这么做的。
+    state.platform = platform
+
     # 标记为运行中，在后台线程执行充值
     state.is_running = True
-    state.current_action = f"正在为 {email} 充值..."
+    state.current_action = f"正在为 {email} 在 {platform} 充值..."
     state._patch_prints()
 
     import threading
@@ -467,9 +481,14 @@ def open_account_browser():
     if not account:
         return jsonify({"error": "账号不存在"}), 404
 
+    # 不在这里校验凭据：**需要哪些凭据是平台决定的**。opencode 走 GitHub OAuth 要
+    # login_password，infron 走邮箱 magic link 只要 email_verify_link，将来的平台可能
+    # 两个都不要。缺什么由 adapter.ensure_session 判断并给出可读的 detail
+    # （opencode 会说「该账号未保存登录密码，且 profile 未登录」）。
+    #
+    # 这个前置校验对 opencode 也偏严：profile 已登录但没存密码的账号本来能跑，
+    # 却被挡在门外。
     login_password = account.get('login_password')
-    if not login_password:
-        return jsonify({"error": "该账号没有保存登录密码"}), 400
 
     # 预约 profile：与任务 worker 的账号占用共用一把锁，避免同一 Chrome profile
     # 被 worker 与手动会话同时使用（会互删 Singleton 锁导致浏览器崩溃）

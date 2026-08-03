@@ -118,3 +118,39 @@ def test_deleting_account_clears_all_platform_rows(client):
 
     assert models['platform_account'].get(OC, 'a@x.com') is None
     assert models['platform_account'].get(OTHER, 'a@x.com') is None
+
+
+def test_single_account_recharge_applies_the_platform(client):
+    """单账号充值端点必须把 platform 落到 AppState。
+
+    接第二个平台时才发现的缺陷：端点收了 platform 参数却从没应用，
+    `_recharge_one_account` 读的是 `AppState.platform`，于是不管传什么都跑 opencode。
+    现象很隐蔽——日志里是另一个平台的登录流程，而请求明明指定了 infron。
+
+    把 _recharge_one_account 打桩，只验参数落地，不真的起浏览器。
+    """
+    import time
+
+    c, models = client
+    models['account'].upsert('a@x.com', login_password='pw', identity_status='registered')
+    state = c.application.config['APP_STATE']
+
+    seen = {}
+
+    def _stub(email, login_password, payment_group_id=None, **kw):
+        seen['platform'] = state.platform
+        return 'failed', 'stubbed'
+
+    state._recharge_one_account = _stub
+
+    r = c.post('/api/accounts/recharge',
+               json={'email': 'a@x.com', 'platform': 'infron', 'payment_group_id': 1})
+    assert r.status_code == 200, r.get_json()
+
+    for _ in range(50):
+        if 'platform' in seen:
+            break
+        time.sleep(0.1)
+
+    assert seen.get('platform') == 'infron', \
+        f"端点未把 platform 落到 AppState，充值时看到的是 {seen.get('platform')!r}"

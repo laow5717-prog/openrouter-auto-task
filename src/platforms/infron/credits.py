@@ -38,6 +38,27 @@ def _page_text(session):
         return ''
 
 
+def _all_frames_text(session):
+    """主文档 + 所有 frame 的可见文本拼起来。
+
+    拒付提示是渲染在 **Stripe 的 iframe 内**的（Payment Element 把错误显示在自己的
+    表单里），只读主文档看不见——那会让每一次拒付都退化成超时 `unknown`，
+    上层因此既不判废也不冷却，坏卡下一轮又被选中，白白重复拒付。
+    """
+    parts = [_page_text(session)]
+    try:
+        for fr in session.page.frames:
+            if 'chatwoot' in (fr.url or ''):
+                continue
+            try:
+                parts.append(fr.evaluate(_TEXT_JS) or '')
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return '\n'.join(parts)
+
+
 def read_balance_from_current_page(session):
     """从当前页面抠余额，不做任何导航。读不到返回 None。
 
@@ -233,19 +254,32 @@ def detect_payment_result(session, balance_before, monitor=None, timeout=180, po
     deadline = time.time() + timeout
     saw_captcha = False
 
+    rounds = 0
     while time.time() < deadline:
         time.sleep(poll)
+        rounds += 1
 
-        # 1) 余额涨了就是成功——最可靠的信号，优先判
+        # 1) 余额涨了就是成功——最可靠的信号，优先判。
+        #
+        # 但**必须周期性重新加载页面**：付款是在弹窗里提交的，弹窗背后那个 credits 页
+        # 的余额区块是提交前渲染的，不会自己更新。只读同一份 DOM 的话，就算钱真的
+        # 到账了也永远读不出变化，最后退化成 unknown ——而 unknown 会让上层换下一张卡
+        # 再付一次，那就是**重复扣款**。
+        # 不每轮都刷是因为刷新会打断可能正在进行的 3DS 跳转，所以隔几轮刷一次。
+        if rounds % 5 == 0:
+            try:
+                session.get(CREDITS_URL)
+                time.sleep(4)
+            except Exception:
+                pass
+
         after = read_balance_from_current_page(session)
-        if after is None:
-            # 弹窗盖着 credits 页时读不到，去页面文本里再找一次
-            after = read_balance_from_current_page(session)
         if after is not None and after > baseline + 1e-6:
             _step(monitor, session, f'余额已增加：{baseline} → {after}')
             return 'success', f'余额 {baseline} → {after}', after
 
-        text = (_page_text(session) or '').lower()
+        # 拒付提示在 Stripe 的 iframe 内，必须扫全部 frame
+        text = (_all_frames_text(session) or '').lower()
 
         # 2) 明确拒付
         hit = next((h for h in _DECLINE_HINTS if h in text), None)
@@ -254,11 +288,16 @@ def detect_payment_result(session, balance_before, monitor=None, timeout=180, po
             return 'failed', f'拒付：{hit}', None
 
         # 3) 3DS：失败弹窗算拒付；交互挑战则关掉后继续等
+        #
+        # ⚠️ _threeds_failure_modal 返回的是**元组** (frame, message)，与同一模块里
+        # 其余判定函数（返回 frame 或 None）不同。曾把它当单值用 —— 元组 (None, '')
+        # 永远不是 None，于是**每一笔付款都被立刻误判成 3DS 失败并判废**，好卡被白白
+        # 废掉，而日志看起来完全正常。解包再判，别信「返回值大概是 frame」。
         try:
-            fr = _threeds_failure_modal(session)
+            fr, msg = _threeds_failure_modal(session)
             if fr is not None:
                 _close_threeds_modal(fr, session, monitor)
-                return 'failed', '3DS 认证失败', None
+                return 'failed', f'3DS 认证失败：{msg}' if msg else '3DS 认证失败', None
             fr = _threeds_challenge_lightbox(session)
             if fr is not None:
                 _close_challenge_lightbox(fr, session, monitor)

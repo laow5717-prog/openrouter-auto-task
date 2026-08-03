@@ -312,23 +312,70 @@ def fill_card_and_address(session, card, monitor):
 # Element 用 Field-*Input 命名、对 Checkout 用裸名，两套都覆盖比赌一套稳；真跑时
 # 哪套命中会记进 steps，据此再收敛。
 _CARD_FIELD_CANDIDATES = {
-    "number": ("#Field-numberInput", "#cardNumber", "input[name='cardnumber']"),
-    "expiry": ("#Field-expiryInput", "#cardExpiry", "input[name='exp-date']"),
-    "cvc": ("#Field-cvcInput", "#cardCvc", "input[name='cvc']"),
-    "name": ("#Field-nameInput", "#billingName"),
+    # 顺序按实测命中率排：infron 的 Payment Element 用**裸 name 属性**
+    # （实测 cvc 命中 input[name='cvc']），所以那一组放最前。
+    "number": ("input[name='number']", "#Field-numberInput", "#cardNumber",
+               "input[name='cardnumber']"),
+    "expiry": ("input[name='expiry']", "#Field-expiryInput", "#cardExpiry",
+               "input[name='exp-date']"),
+    "cvc": ("input[name='cvc']", "#Field-cvcInput", "#cardCvc"),
+    # 持卡人姓名：Payment Element 未必渲染这个字段（取决于集成方的配置），
+    # 所以它不进 ok 判据。
+    "name": ("input[name='name']", "#Field-nameInput", "#billingName"),
 }
+# 地址字段同样把**裸 name** 放最前——Payment Element 用的就是这套命名
+# （实测 number/expiry/cvc 均命中裸 name）。此前只给了 Checkout 那套 ID，
+# 结果邮编等字段全部填不进去。
 _ADDR_FIELD_CANDIDATES = {
-    "country": ("#Field-countryInput", "#billingCountry"),
-    "line1": ("#Field-addressLine1Input", "#billingAddressLine1"),
-    "line2": ("#Field-addressLine2Input", "#billingAddressLine2"),
-    "city": ("#Field-localityInput", "#billingLocality"),
-    "zip": ("#Field-postalCodeInput", "#billingPostalCode"),
-    "state": ("#Field-administrativeAreaInput", "#billingAdministrativeArea"),
+    "country": ("select[name='country']", "#Field-countryInput", "#billingCountry"),
+    "line1": ("input[name='addressLine1']", "#Field-addressLine1Input", "#billingAddressLine1"),
+    "line2": ("input[name='addressLine2']", "#Field-addressLine2Input", "#billingAddressLine2"),
+    "city": ("input[name='locality']", "#Field-localityInput", "#billingLocality"),
+    "zip": ("input[name='postalCode']", "#Field-postalCodeInput", "#billingPostalCode"),
+    "state": ("select[name='administrativeArea']", "#Field-administrativeAreaInput",
+              "#billingAdministrativeArea"),
 }
+
+
+def _digits(text):
+    return "".join(ch for ch in str(text or "") if ch.isdigit())
+
+
+def _type_and_verify(loc, value, delay=90, timeout=4000, attempts=3):
+    """逐字符输入并**回读校验**，短了就清空重来。全部尝试后仍不完整返回 False。
+
+    校验不是多余的谨慎，是必需的：Stripe 的字段边输入边重排 DOM（做卡号分组、
+    卡种识别、自动跳到下一格），元素在输入途中被 detach 时**剩余字符会静默丢掉**——
+    没有异常、没有报错，只是卡号少了几位。表现出来是「付款莫名失败」，而日志里
+    这一步是成功的，极难定位。实测就撞上过：卡号没填完就去填下一个字段。
+
+    用 press_sequentially 而不是废弃的 type()：前者发真实按键事件，Stripe 的
+    受控输入才认。
+    """
+    want = str(value)
+    for _ in range(max(1, attempts)):
+        loc.click(timeout=timeout)
+        try:
+            loc.fill("", timeout=timeout)       # 先清空，避免重试时叠加
+        except Exception:
+            pass
+        loc.press_sequentially(want, delay=delay)
+        time.sleep(0.3)
+        try:
+            got = loc.input_value(timeout=timeout)
+        except Exception:
+            return True     # 读不回来（受控组件可能不暴露 value），按成功处理
+        # Stripe 会把卡号格式化成分组（"4111 1111 1111 1111"），只比数字
+        if _digits(got) == _digits(want) or got.strip() == want.strip():
+            return True
+    return False
 
 
 def _type_first(page, selectors, value, delay=90, timeout=4000):
-    """按顺序试多个选择器，第一个能填进去的算成功。返回命中的选择器或 None。"""
+    """按顺序试多个选择器，第一个能**完整填入**的算成功。返回命中的选择器或 None。
+
+    注意「填进去了」与「填完整了」不是一回事——见 _type_and_verify。
+    """
     if value in (None, ""):
         return None
     for sel in selectors:
@@ -336,9 +383,8 @@ def _type_first(page, selectors, value, delay=90, timeout=4000):
             loc = page.locator(sel).first
             if not loc.count():
                 continue
-            loc.click(timeout=timeout)
-            loc.type(str(value), delay=delay)
-            return sel
+            if _type_and_verify(loc, value, delay=delay, timeout=timeout):
+                return sel
         except Exception:
             continue
     return None
@@ -418,13 +464,21 @@ def fill_payment_element_card(session, card, monitor, mark=ELEMENT_MARK):
                 break
         except Exception:
             continue
+    addr_hits, addr_misses = [], []
     for key, value in (("line1", card.get("address")),
                        ("city", card.get("city")),
                        ("zip", card.get("zip")),
                        ("line2", card.get("address2"))):
-        _type_first(fr, _ADDR_FIELD_CANDIDATES[key], value, delay=60)
+        if not value:
+            continue
+        sel = _type_first(fr, _ADDR_FIELD_CANDIDATES[key], value, delay=60)
+        (addr_hits if sel else addr_misses).append(key)
     _select_first(fr, _ADDR_FIELD_CANDIDATES["state"], card.get("state"))
-    _step(monitor, session, "账单地址填写完成")
+    # 地址字段的命中情况也要报出来。此前只报卡字段，于是「邮编没填进去」这种事
+    # 完全看不见——付款失败了还以为是卡的问题。
+    _step(monitor, session,
+          f"账单地址：填上 {addr_hits or '无'}" +
+          (f"，未命中 {addr_misses}" if addr_misses else ""))
 
     filled = {h.split("=")[0] for h in hits}
     ok = {"number", "expiry", "cvc"} <= filled
