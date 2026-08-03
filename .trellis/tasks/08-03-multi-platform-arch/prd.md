@@ -87,15 +87,35 @@
 
 - [x] AC8 迁移脚本执行后，全部既有 accounts / card_bindings / valid_cards / recharge_logs / card_payment_state 数据归属 `platform='opencode'`，无数据丢失。
 - [x] AC9 迁移可在生产库副本上重复执行且幂等。
-- [ ] AC10 迁移后 opencode 每日充值流水线与订阅流水线端到端行为与迁移前一致（至少各跑通一个账号）。
+- [x] AC10 迁移后 opencode 每日充值流水线与订阅流水线端到端行为与迁移前一致（至少各跑通一个账号）。
 
-  **未验证，需要你来跑。** 这条要真实浏览器、AdsPower 客户端在线、真实 GitHub 账号
-  与会扣款的信用卡，我无法代跑。已完成的替代验证：迁移在生产库上执行完毕且数据逐条
-  核对无误（身份状态映射、3 条平台账号、2054 张卡的状态归属、四张表的 platform 列）；
-  应用能在真实库上启动，`/api/platforms`、`/api/status`、`/api/accounts` 返回正常。
+  **2026-08-03 20:30 在生产环境实跑验证通过。** AdsPower 在线、真实账号、真实信用卡。
 
-  跑之前建议先把 `config.yaml` 的 `adspower.reclaim_batch` 临时降到 1（见 AC 之后的
-  Stage 4 清单），观察一轮回收行为——环境回收判据这次改动最大，误删会丢登录态。
+  充值链路（`cunninghamh22@hotmail.com`，分组 6）：AdsPower 环境接管并复用登录态 →
+  `adapter.ensure_session` 检出已登录 → `adapter.read_balance` 未达归档阈值 →
+  逐卡 `adapter.top_up` 走 Stripe Checkout。试满 8 张停手（上限来自 adapter 而非硬编码），
+  7 张真实拒付判废、1 张 `unknown`（120s 未确认）**未被消耗**。
+
+  订阅链路（同账号 + `jot763@hotmail.com`）：`adapter.ensure_session` → capabilities
+  含 subscribe → 逐卡 `adapter.subscribe`，5 张全部 `unknown`（200s 未确认订阅结果），
+  **一张都没被消耗**，账号转 `registered_only` 后正常轮转到下一个；手动停止后
+  worker、代理、AdsPower 环境全部干净释放。
+
+  逐条核对结果：
+  - 判废写的是 `card_platform_state(卡号,'opencode')`，不是全局 `card_pool.status`
+  - `unknown` 既不写平台状态也不进冷却（AC13 在真实数据上成立，两条链路都验了）
+  - 身份层 `identity_status` 全程未被平台流程改动
+  - 付款未成功则不建 `platform_accounts` 行
+  - **跨平台隔离**：两轮共判废 9 张卡后，opencode 视角分组 6 可选 432 张，
+    另一平台视角仍是 971 张——这 9 张判废对它零影响
+  - 启动门与流水线的账号筛选数一致（都是 33），旧的「启动说 N 个跑起来 M 个」已消失
+
+  未覆盖：没有一笔**成功**付款（卡池里的卡当前全部拒付或超时），所以
+  `outcome='success'` 的分支——标 `paid`、写 `valid_cards`、置 `recharged`、
+  回写余额——只有单元测试覆盖，没有真实付款印证。有能付通的卡时值得再跑一次确认。
+
+  另：`adspower.reclaim_batch` 本次未调低观察，因为两轮都没触发配额回收
+  （环境是复用的）。首次真正撞配额时仍建议按 Stage 4.4 小步观察。
 
 ### 抽象层
 
