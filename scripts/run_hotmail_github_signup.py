@@ -84,7 +84,9 @@ def _persist_result(account_model, acc, result):
 
 def _run_one(account_model, acc):
     print(f"\n{'#'*60}\n# 注册 {acc.email}\n{'#'*60}")
-    result = signup_one(headless=False, semi_auto=True, account=acc, then_opencode=True)
+    import src.platforms as platforms
+    result = signup_one(headless=False, semi_auto=True, account=acc,
+                        post_provision=platforms.get('opencode'))
     print("\n结果:")
     print(json.dumps({k: result.get(k) for k in
                       ("ok", "email", "outcome", "reason", "final_url")},

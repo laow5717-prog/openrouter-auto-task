@@ -1045,7 +1045,7 @@ class AppState:
         self.set_action(worker, f"{email} 未注册，尝试 GitHub 注册（Arkose 弹则跳过）")
         # auto_skip_captcha：不弹 Arkose 自动收码完成注册；弹了立即跳过不等人工（全自动）。
         r = signup_one(headless=False, semi_auto=False, account=hacc,
-                       then_opencode=False, auto_skip_captcha=True, proxy=proxy,
+                       post_provision=None, auto_skip_captcha=True, proxy=proxy,
                        browser_factory=self.browser_factory())
         oc = r.get('outcome')
         if oc == 'reached_captcha':
@@ -1077,13 +1077,16 @@ class AppState:
         跑在 worker 线程；InterruptedError 向上抛供轮转感知停止。account 排他由外层 claim 保证。
         """
         from src.browser.driver import create_driver_vanilla, close_driver
-        from src.platforms.opencode.login import login_and_open_own_go
-        from src.platforms.opencode.subscribe import subscribe_via_stripe
         from src.services import captcha as captcha_solver
+        import src.platforms as platforms
+        from src.platforms.base import CAP_SUBSCRIBE, Credentials
 
         models = self.models
         worker = worker or self.primary_worker
         platform = self.platform
+        adapter = platforms.get(platform)
+        if CAP_SUBSCRIBE not in adapter.capabilities:
+            return "skipped", f"{adapter.display_name} 不支持订阅"
         email = acct['email']
         identity_status = (acct.get('identity_status') or '')
 
@@ -1114,23 +1117,32 @@ class AppState:
             if captcha_solver.is_available():
                 captcha_solver.install_hcaptcha_hook(session)
 
-            lg = login_and_open_own_go(session)
-            if not lg.get('ok'):
-                if lg.get('flagged'):
-                    # 被 GitHub flag，无法授权任何第三方 OAuth → 标**身份层** flagged。
-                    # 这是 GitHub 侧的封禁，对所有平台一致，不是本平台的状态。
+            sess = adapter.ensure_session(
+                session,
+                Credentials(email=email,
+                            login_password=acct.get('login_password'),
+                            verify_link=acct.get('email_verify_link')),
+                monitor=monitor,
+            )
+            if not sess.ok:
+                if sess.blocked_by_identity:
+                    # 身份供给侧被封（GitHub 反滥用 flag，无法授权任何第三方 OAuth）
+                    # → 标**身份层** flagged，对所有平台一致，不是本平台的状态。
                     models['account'].update_identity_status(email, 'flagged')
                     self.set_action(worker, f"{email} GitHub 被 flagged，跳过")
                     return "skipped", "GitHub 账号被 flagged，无法授权"
-                self.set_action(worker, f"{email} 登录失败: {lg.get('detail','')[:60]}")
-                return "failed", f"登录失败: {lg.get('detail')}"
-            wid = lg['wid']
+                self.set_action(worker, f"{email} 登录失败: {sess.detail[:60]}")
+                return "failed", f"登录失败: {sess.detail}"
+            wid = sess.tenant_id
 
             # 账号内逐卡试付，成功即止（快照迭代；拒付卡已被标 invalid 退出后续可选集）
             cards = self._eligible_cards(payment_group_id) if payment_group_id else []
             if not cards:
                 return "registered_only", "无可选卡"
-            cards = cards[:self.SUBSCRIBE_MAX_CARDS_PER_ACCOUNT]   # 单次卡数上限，避免坏卡卡死
+            # 单次卡数上限，避免坏卡卡死单账号。各平台自定——订阅拒付对账号的伤害
+            # 比充值更大，所以这个值通常比 max_card_attempts 更保守。
+            cards = cards[:getattr(adapter, 'max_subscribe_attempts',
+                                   self.SUBSCRIBE_MAX_CARDS_PER_ACCOUNT)]
             for i, card in enumerate(cards, 1):
                 if self.stop_requested:
                     raise InterruptedError("用户请求停止")
@@ -1139,9 +1151,10 @@ class AppState:
                 self.set_action(worker, f"{email} 订阅试卡 ****{last4}")
                 self.add_log(f"{email} 订阅试卡 ****{last4}（第 {i}/{len(cards)} 张）")
                 log_id = models['recharge_log'].create(platform, email, num, amount=5)
-                res = subscribe_via_stripe(session, card, wid, monitor=monitor,
-                                           should_stop=lambda: self.stop_requested, dry=False)
-                oc = res.get('outcome')
+                pay = adapter.subscribe(session, wid, card, monitor=monitor,
+                                        should_stop=lambda: self.stop_requested, dry=False)
+                res = vars(pay)
+                oc = pay.outcome
                 if oc == 'success':
                     models['card_pool'].mark_status_by_number(platform, num, 'paid')
                     try:
@@ -1339,9 +1352,13 @@ class AppState:
             browser_module.print = hooked
         except Exception:
             pass
-        # 订阅链路各模块的 print 也劫持，便于 Web 日志捕获
-        for _mod in ('src.platforms.opencode.subscribe', 'src.platforms.opencode.login',
-                     'src.platforms.opencode.billing', 'src.services.github_signup_service'):
+        # 平台适配器与身份供给各模块的 print 也劫持，便于 Web 日志捕获。
+        # 模块名由 adapter 自报——加平台时不用回来改这份硬编码列表。
+        import src.platforms as platforms
+        mods = ['src.services.github_signup_service']
+        for _slug in platforms.all_slugs():
+            mods.extend(platforms.get(_slug).module_names())
+        for _mod in mods:
             try:
                 import importlib
                 importlib.import_module(_mod).print = hooked

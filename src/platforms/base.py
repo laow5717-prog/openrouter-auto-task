@@ -1,0 +1,139 @@
+"""平台适配器协议。
+
+一个「平台」是我们要在上面开账号、充值/订阅的目标站点（opencode、infron.ai …）。
+适配器负责该站点特有的那部分：怎么登录、租户 id 长什么样、余额在哪读、充值入口怎么
+点、以及**怎么判断这笔款到底付成没有**。付款表单本身归支付供应商层
+（src.payments.stripe_checkout），身份供给归 src.identity。
+
+## 接口为什么只有 7 个方法
+
+调研时列过一份 12 个方法的候选清单，其中 auth_entry_urls / click_oauth_entry /
+balance_url / start_payment / detect_payment_outcome / detect_subscription_outcome
+全部只被 ensure_session / top_up / subscribe 这三个编排方法在内部调用，没有外部
+调用者。把它们暴露成接口，等于强迫第二个平台按 opencode 的内部步骤分解自己的流程
+——那正是抽象要避免的事。它们留作各适配器的私有实现细节。
+
+唯一的例外是 read_balance_from_current_page：它确实被 API 层跨模块直接调用
+（手动开浏览器时轮询余额落库），所以必须进接口。
+
+## outcome 的语义不可改动
+
+PaymentResult.outcome 的六个取值直接决定编排层「这张卡消耗不消耗」，每一条都是
+线上事故换来的：
+
+    success      付款成功
+    failed       明确拒付 → 卡按「本平台是否成功过」判冷却或判废
+    needs_captcha 账号级风控拦截 → 立即停手，**不消耗卡**
+    error        付款**前**的页面故障 → **不消耗卡**
+    unknown      未定案 → **不消耗卡**
+    dry_ready    演练模式：填完卡未提交
+
+后三者「不消耗卡」是硬约束。新平台的适配器必须按同样的语义归类自己的失败，
+否则一次网络抖动就会把好卡判成废卡。
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional, Protocol, runtime_checkable
+
+# 能力标记。编排层据此跳过平台不支持的流程，而不是靠捕获 AttributeError。
+CAP_TOPUP = 'topup'          # 支持按金额充值
+CAP_SUBSCRIBE = 'subscribe'  # 支持订阅套餐
+
+# outcome 取值
+OUTCOME_SUCCESS = 'success'
+OUTCOME_FAILED = 'failed'
+OUTCOME_NEEDS_CAPTCHA = 'needs_captcha'
+OUTCOME_ERROR = 'error'
+OUTCOME_UNKNOWN = 'unknown'
+OUTCOME_DRY_READY = 'dry_ready'
+
+# 不消耗卡的 outcome：不是这张卡的问题，别动它的状态。
+OUTCOMES_KEEPING_CARD = (OUTCOME_NEEDS_CAPTCHA, OUTCOME_ERROR, OUTCOME_UNKNOWN)
+
+
+@dataclass
+class SessionResult:
+    """建立平台会话的结果。
+
+    blocked_by_identity 表示卡在**身份供给**那一层而不是平台这一层——opencode 的
+    "account is flagged" 就是 GitHub 侧的反滥用标记，换哪个平台都授权不了。编排层
+    据此写 accounts.identity_status 而不是平台状态。
+    """
+    ok: bool
+    tenant_id: Optional[str] = None
+    blocked_by_identity: bool = False
+    detail: str = ''
+
+
+@dataclass
+class PaymentResult:
+    ok: bool
+    outcome: str
+    err: str = ''
+    last4: str = ''
+    mode: Optional[str] = None
+    balance_after: Optional[float] = None
+    steps: list = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d):
+        """把既有浏览器层返回的 dict 收敛成 dataclass。
+
+        适配器内部仍可沿用原来的 dict 流程，只在出口处转一次——这样收编现有实现
+        不需要改动那些踩坑换来的判定逻辑。
+        """
+        d = d or {}
+        return cls(
+            ok=bool(d.get('ok')),
+            outcome=d.get('outcome') or OUTCOME_UNKNOWN,
+            err=d.get('err') or '',
+            last4=d.get('last4') or '',
+            mode=d.get('mode'),
+            balance_after=d.get('balance_after'),
+            steps=list(d.get('steps') or []),
+        )
+
+    @property
+    def keeps_card(self):
+        """本次结果是否**不该**消耗这张卡。"""
+        return self.outcome in OUTCOMES_KEEPING_CARD
+
+
+@dataclass
+class Credentials:
+    """建立会话所需的凭据。字段全部来自身份层（accounts 表）。"""
+    email: str
+    login_password: Optional[str] = None   # OAuth 平台是 GitHub 密码；独立注册的平台是自家密码
+    email_password: Optional[str] = None
+    verify_link: Optional[str] = None      # 若安收信链接，用于自动过新设备邮箱验证
+
+
+@runtime_checkable
+class PlatformAdapter(Protocol):
+    slug: str
+    display_name: str
+    capabilities: frozenset
+
+    # 平台参数。原先散落在 OPENCODE_* 环境变量里，各平台的风控阈值本就不同。
+    max_card_attempts: int        # 单账号单次最多试几张卡（防 velocity 风控）
+    recharge_skip_balance: float  # 登录后实时余额 ≥ 此值即跳过充值并归档
+    default_topup_amount: float
+
+    def module_names(self) -> list:
+        """本适配器涉及的模块名，供日志劫持（AppState._patch_prints）使用。"""
+        ...
+
+    def extract_tenant_id(self, url: str): ...
+
+    def ensure_session(self, session, creds: Credentials, monitor=None,
+                       timeout: int = 240) -> SessionResult: ...
+
+    def read_balance(self, session, tenant_id, monitor=None): ...
+
+    def read_balance_from_current_page(self, session): ...
+
+    def top_up(self, session, tenant_id, card, amount=None, monitor=None,
+               should_stop=None) -> PaymentResult: ...
+
+    def subscribe(self, session, tenant_id, card, monitor=None, should_stop=None,
+                  dry: bool = False) -> PaymentResult: ...

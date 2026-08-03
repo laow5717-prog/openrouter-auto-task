@@ -470,23 +470,31 @@ def open_account_browser():
 
     def _do_open():
         from src.browser.driver import create_driver, close_driver
-        from src.platforms.opencode import billing as ob
+        import src.platforms as platforms
+        from src.platforms.base import Credentials
+        adapter = platforms.get(platform)
         driver = None
         try:
             driver = create_driver(headless=False, profile_id=email)
 
-            # 复用充值按钮的访问+登录流程：走 opencode.ai OAuth（GitHub），
-            # 与 registration.recharge_account 用的是同一套 ensure_opencode_session。
-            # 遇 GitHub 新设备验证等人工环节，该函数会保持浏览器打开等待人工完成。
+            # 复用充值流程用的同一套会话建立逻辑（adapter.ensure_session）。
+            # 遇新设备验证等人工环节，该流程会保持浏览器打开等待人工完成。
             def _monitor(_drv, step):
                 if step:
                     state.add_log(f"{email}: {step}")
 
-            wid, detail = ob.ensure_opencode_session(driver, _monitor, login_password, email)
-            if wid:
-                state.add_log(f"{email} 已登录 opencode（{detail}），workspace={wid}")
+            sess = adapter.ensure_session(
+                driver,
+                Credentials(email=email, login_password=login_password,
+                            verify_link=account.get('email_verify_link')),
+                monitor=_monitor,
+            )
+            if sess.ok:
+                state.add_log(f"{email} 已登录 {adapter.display_name}"
+                              f"（{sess.detail}），租户={sess.tenant_id}")
             else:
-                state.add_log(f"{email} 未能自动登录 opencode：{detail}，请在浏览器手动操作")
+                state.add_log(f"{email} 未能自动登录 {adapter.display_name}："
+                              f"{sess.detail}，请在浏览器手动操作")
 
             # 等待用户手动关闭浏览器；期间轮询 billing 页 Current Balance，
             # 用户进入结算页时读到即落库刷新余额（driver.title 触发事件派发保活）。
@@ -495,7 +503,7 @@ def open_account_browser():
             while True:
                 try:
                     _ = driver.title
-                    bal = ob._read_balance(driver)
+                    bal = adapter.read_balance_from_current_page(driver)
                     if bal is not None and bal != last_persisted:
                         try:
                             models['platform_account'].update_balance(platform, email, bal)

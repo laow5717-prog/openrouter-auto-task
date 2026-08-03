@@ -23,7 +23,6 @@ from src.services.adspower import AdsPowerError
 from src.browser import github_signup as gh
 from src.services.email import create_temp_email, wait_for_github_launch_code
 from src.services.hotmail_inbox import wait_for_github_launch_code_ruoanzhu
-from src.platforms.opencode.login import login_and_open_own_go
 
 _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -157,9 +156,13 @@ def _finish_semi_auto(session, fetch_code, result):
 
 
 def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
-               then_opencode=False, auto_skip_captcha=False, proxy=None,
+               post_provision=None, auto_skip_captcha=False, proxy=None,
                browser_factory=None):
     """执行一次 GitHub 注册。
+
+    本模块是**身份供给层**：产出的是一个通用 GitHub 账号，任何走 GitHub OAuth 的平台
+    都能复用同一个身份。它不知道有哪些平台存在——要在注册完顺手预热某平台的会话，
+    由调用方把那个平台的 adapter 传进 post_provision。
 
     semi_auto=False：只跑到 Arkose 验证码出现为止（outcome=reached_captcha）。
     semi_auto=True：跑到验证码后**暂停等人工手动过码**，通过后自动收验证邮件、
@@ -171,8 +174,9 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
              - None（默认）：走原 mail.tm 临时邮箱路径，收码走 mail.tm API。
              - 提供时：用该 hotmail 邮箱注册，收码走 ruoanzhu 收信链接，浏览器用
                以 email 命名的持久 profile（固定指纹环境，降挂起风险）。
-    then_opencode：注册成功（signup_complete）后，在同一浏览器 session 里续上 opencode
-             GitHub-OAuth 登录，并进入该账号自己的 /go 页。结果写入 result['opencode']。
+    post_provision：可选 PlatformAdapter。注册成功（signup_complete）后在同一浏览器
+             session 里顺手建立该平台的会话（省一次冷启动），结果写入
+             result['post_provision']。传 None 则只注册 GitHub。
     browser_factory：可选 callable(email) -> BrowserSession，用于替换默认的本地
              Chrome 启动方式（AdsPower 指纹浏览器接入即走这里）。为 None 时行为不变。
              proxy 参数在有 factory 时被忽略——代理由 factory 那一侧绑定。
@@ -193,7 +197,7 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
     result = {
         "ok": False, "email": None, "email_password": None, "github_password": None,
         "username": None, "outcome": "error", "reason": "", "screenshot": None,
-        "final_url": None, "opencode": None,
+        "final_url": None, "post_provision": None,
     }
 
     use_hotmail = account is not None
@@ -312,20 +316,28 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
             result["reason"] = term["detail"]
             print(f"  ⚠️ 未知终态：{term['detail']}")
 
-        # 注册成功后可选：同一 session 续上 opencode 登录，进自己的 /go 页
-        if then_opencode and result["ok"] and result["outcome"] == "signup_complete":
-            print("=== 续接：登录 opencode 并进自己的 /go 页 ===")
+        # 注册成功后可选：同一 session 顺手把目标平台的会话也建好（省一次冷启动）。
+        # 平台由调用方注入——身份供给层不该知道有哪些平台存在。
+        if post_provision is not None and result["ok"] and result["outcome"] == "signup_complete":
+            print(f"=== 续接：建立 {post_provision.display_name} 会话 ===")
             try:
-                oc = login_and_open_own_go(session)
-                result["opencode"] = oc
-                if oc.get("ok"):
+                from src.platforms.base import Credentials
+                sess = post_provision.ensure_session(
+                    session,
+                    Credentials(email=result["email"],
+                                login_password=result["github_password"]),
+                )
+                result["post_provision"] = {"ok": sess.ok, "detail": sess.detail,
+                                            "tenant_id": sess.tenant_id}
+                if sess.ok:
                     result["final_url"] = session.current_url
-                    print(f"  ✅ opencode：{oc.get('detail')}")
+                    print(f"  ✅ {post_provision.slug}：{sess.detail}")
                 else:
-                    print(f"  ⚠️ opencode 登录未完成：{oc.get('detail')}")
+                    print(f"  ⚠️ {post_provision.slug} 会话未建立：{sess.detail}")
             except Exception as e:
-                result["opencode"] = {"ok": False, "detail": f"opencode 登录异常: {type(e).__name__}: {str(e)[:150]}"}
-                print(f"  ⚠️ {result['opencode']['detail']}")
+                detail = f"{post_provision.slug} 会话异常: {type(e).__name__}: {str(e)[:150]}"
+                result["post_provision"] = {"ok": False, "detail": detail}
+                print(f"  ⚠️ {detail}")
 
         return result
 

@@ -1,31 +1,19 @@
-"""
-注册 & 绑卡 / 充值核心业务逻辑 —— 站点流程存根（占位）。
+"""充值编排 —— **平台无关**。
 
-项目名为 openrouter-auto-task，**目标自动化站点为 https://opencode.ai**。
-本模块原为 Cloudflare 站点的注册/绑卡/充值编排。改造后 Cloudflare 专属的页面流程
-（注册页、Turnstile、Stripe 绑卡、AI Gateway 充值等）已从编排层剥离。以下 4 个公共
-函数保留原有签名与返回契约说明，供 app.py / routes.py 的上层编排与并发调度继续
-import 与调用；函数体统一抛 NotImplementedError，等待按 opencode.ai 实际流程逐个接入。
+recharge_account 是本模块唯一活着的函数，也是整个抽象改造的收益点：余额预检 →
+逐卡试付 → 按 outcome 分派 → 卡状态与记账，这套骨架不含任何站点知识。平台特有的
+动作（登录、读余额、点付款、判结果）全部经 PlatformAdapter 转接，接第二个平台
+不需要改这里一行。
 
-接入时对照 design.md / prd.md 的站点耦合面，把 driver.py 中标记为
-`LEGACY Cloudflare-specific` 的浏览器方法替换为 opencode.ai 版实现，再在此填充编排。
-原 Cloudflare 实现保留在本文件的 git 历史中，可作为接入参考。
+另外三个函数（register_one_account / register_and_bind_cards /
+bind_cards_to_existing_account）是 Cloudflare 时代绑卡编排的存根，保留签名供上层
+import；对应的浏览器实现已在前置清理里删除，要接新流程时按 PlatformAdapter 重写。
 """
 
 _NOT_IMPLEMENTED = (
-    "opencode.ai 站点流程待接入：{name}。当前为框架存根，尚未实现 opencode.ai 的"
-    "注册/绑卡/充值页面自动化。"
+    "站点流程待接入：{name}。当前为框架存根——原 Cloudflare 绑卡编排已随浏览器层"
+    "一并删除，新流程应按 PlatformAdapter 接口实现。"
 )
-
-
-def _recharge_skip_balance():
-    """充值跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并把账号归档。
-    默认 20，可用环境变量 OPENCODE_RECHARGE_SKIP_BALANCE 覆盖。"""
-    import os
-    try:
-        return float(os.environ.get("OPENCODE_RECHARGE_SKIP_BALANCE", "20"))
-    except ValueError:
-        return 20.0
 
 
 def register_one_account(db, account_model, card_info_list=None, login_password=None,
@@ -67,16 +55,18 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      payment_registry=None, captcha_api_key=None,
                      captcha_server="api.multibot.cloud", proxy=None,
                      browser_factory=None, verify_link=None,
-                     platform='opencode', platform_account_model=None):
-    """登录 opencode 账号并在 zen 控制台 Stripe Checkout 充值（美元，$20 credits）。
+                     platform='opencode', platform_account_model=None, adapter=None):
+    """登录目标平台并逐卡尝试付款充值。
 
-    编排：create_driver_vanilla(profile_id=email)（原生 Playwright 栈，hCaptcha token 注入
-    仅在原生栈生效；与 create_driver 复用同一 profile 目录，登录态不丢）→ 装 hCaptcha hook →
-    确保 opencode 登录 → 登录后读实时余额，≥ RECHARGE_SKIP_BALANCE（默认 $20）则跳过充值并
-    把账号归档（status='archived'）→ 否则从 payment_cards 逐张尝试 Stripe 付款，付成一张即返回。
-    沿途把明确拒付的卡标为 invalid、逐卡写 recharge_logs（成功/失败+原因）。支付页遇 hCaptcha 时
-    用 multibot/2captcha 自动解（最多 3 次，见 opencode_billing.detect_payment_result）；3DS 记冷却。
-    浏览器操作见 browser/opencode_billing。
+    **本函数是平台无关的编排骨架**：余额预检 → 逐卡试付 → 按 outcome 分派 → 卡状态与
+    记账。平台特有的动作（怎么登录、余额在哪读、付款怎么点、结果怎么判）全部经
+    adapter 转接，本函数不知道也不需要知道目标是哪个站点。
+
+    编排：建浏览器会话（原生 Playwright 栈，hCaptcha token 注入仅在原生栈生效；与
+    create_driver 复用同一 profile 目录，登录态不丢）→ 装 hCaptcha hook →
+    adapter.ensure_session → 读实时余额，≥ adapter.recharge_skip_balance 则跳过充值并
+    归档 → 否则从 payment_cards 逐张 adapter.top_up，付成一张即返回。
+    沿途把明确拒付的卡标为 invalid、逐卡写 recharge_logs（成功/失败+原因）。
 
     captcha_api_key: 传入则 init_solver(key, server=captcha_server) 并装 hook 自动解 hCaptcha；
                      不传则退化为旧行为（检测到 hCaptcha 提示人工、超时 needs_captcha）。
@@ -88,6 +78,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      邮箱验证用它自动收码回填；不传则退回等人工。指纹浏览器下每个账号
                      都是全新环境，新设备验证几乎必然触发，缺它会让流水线停下来等人。
 
+    adapter:         PlatformAdapter；省略时按 platform 从注册表解析。
     platform / platform_account_model: 目标平台 slug 与平台账号模型。归档、充值成功、
                      余额落库都写到 platform_accounts 的 (platform, email) 那一行，
                      所以同一邮箱在别的平台的进度不受影响。GitHub 被 flag 是例外——
@@ -102,11 +93,15 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     再预建占位 log。payment_registry 传入时对每张卡做 in-flight 排他（并发安全网）。
     """
     from src.browser.driver import create_driver_vanilla, close_driver
-    from src.platforms.opencode import billing as ob
     from src.services import captcha as captcha_solver
+    import src.platforms as platforms
+    from src.platforms.base import Credentials
 
-    # 余额跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并归档账号。
-    skip_balance = _recharge_skip_balance()
+    if adapter is None:
+        adapter = platforms.get(platform)
+
+    # 余额跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并归档账号。各平台不同。
+    skip_balance = adapter.recharge_skip_balance
 
     responses = []
 
@@ -160,24 +155,29 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
         if captcha_solver.is_available():
             captcha_solver.install_hcaptcha_hook(session)
 
-        wid, detail = ob.ensure_opencode_session(session, monitor_callback, login_password,
-                                                 email, verify_link=verify_link)
-        if not wid:
-            if "flagged" in (detail or ""):
-                # GitHub 账号被 flag，无法授权 opencode OAuth——账号级终态（与订阅管线的
-                # flagged 处理一致）：标记后由上层退出每日轮转，不再每轮空开浏览器。
+        sess = adapter.ensure_session(
+            session,
+            Credentials(email=email, login_password=login_password, verify_link=verify_link),
+            monitor=monitor_callback,
+        )
+        wid, detail = sess.tenant_id, sess.detail
+        if not sess.ok:
+            if sess.blocked_by_identity:
+                # 身份供给侧被封（opencode 的场景是 GitHub 反滥用 flag，无法授权任何
+                # 第三方 OAuth）——这是跨平台通用的终态：标记后由上层退出每日轮转，
+                # 不再每轮空开浏览器。
                 if account_model:
                     try:
                         account_model.update_identity_status(email, "flagged")
                     except Exception:
                         pass
-                return (False, f"opencode 未登录：{detail}", responses, last4, "flagged")
-            return (False, f"opencode 未登录：{detail}", responses, last4, "failed")
+                return (False, f"{platform} 未登录：{detail}", responses, last4, "flagged")
+            return (False, f"{platform} 未登录：{detail}", responses, last4, "failed")
 
         # R2 归档预检：登录后读实时余额，≥ 阈值即跳过充值并归档（不试任何卡、不扣款）。
         # 以实时余额为准——DB 余额会随 credits 消耗过时，不可作归档依据。
         try:
-            cur_bal = ob.read_current_balance(session, wid, monitor_callback)
+            cur_bal = adapter.read_balance(session, wid, monitor_callback)
         except Exception:
             cur_bal = None
         if cur_bal is not None and cur_bal >= skip_balance:
@@ -194,15 +194,10 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                     responses, last4, "archived")
 
         # 单次充值最多尝试的卡数上限：卡池可能上千张，若不设限，一批坏卡会在同一
-        # workspace 上连续制造大量拒付，极易触发 Stripe/opencode 的反欺诈 velocity
-        # 风控（拒付率过高 → 临时封锁 workspace 或要求人工验证）。达到上限即停手，
-        # 保护账号可用性，剩余卡留待下次。可用环境变量 OPENCODE_RECHARGE_MAX_ATTEMPTS 调。
-        import os
-        try:
-            max_attempts = int(os.environ.get("OPENCODE_RECHARGE_MAX_ATTEMPTS", "8"))
-        except ValueError:
-            max_attempts = 8
-        max_attempts = max(1, max_attempts)
+        # 租户上连续制造大量拒付，极易触发支付方的反欺诈 velocity 风控（拒付率过高
+        # → 临时封锁租户或要求人工验证）。达到上限即停手，保护账号可用性，剩余卡留待
+        # 下次。阈值由各平台自己定——风控松紧本就因平台而异。
+        max_attempts = adapter.max_card_attempts
 
         errs = []
         attempts = 0
@@ -225,11 +220,12 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                 card_last4 = str(num)[-4:]
                 last4 = card_last4
 
-                result = ob.recharge_via_stripe(session, card, wid,
-                                                monitor=monitor_callback, should_stop=should_stop)
+                pay = adapter.top_up(session, wid, card,
+                                     monitor=monitor_callback, should_stop=should_stop)
+                result = vars(pay)
                 responses.append({"card_last4": card_last4, **result})
 
-                if result["ok"]:
+                if pay.ok:
                     # 支付成功：标 paid + 记有效卡 + 账号状态 + 逐卡记账。
                     # 注意：paid 卡「不」永久消耗——paid 不在 NOT_SELECTABLE 内，后续仍可复选
                     # 复用；仅当这张曾成功的卡再次被拒时才进入 24h 速率冷却（见下方 else 分支）。
