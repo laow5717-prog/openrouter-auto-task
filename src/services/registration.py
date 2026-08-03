@@ -102,7 +102,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     再预建占位 log。payment_registry 传入时对每张卡做 in-flight 排他（并发安全网）。
     """
     from src.browser.driver import create_driver_vanilla, close_driver
-    from src.browser import opencode_billing as ob
+    from src.platforms.opencode import billing as ob
     from src.services import captcha as captcha_solver
 
     # 余额跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并归档账号。

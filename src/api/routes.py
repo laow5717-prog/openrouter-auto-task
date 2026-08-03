@@ -470,7 +470,7 @@ def open_account_browser():
 
     def _do_open():
         from src.browser.driver import create_driver, close_driver
-        from src.browser import opencode_billing as ob
+        from src.platforms.opencode import billing as ob
         driver = None
         try:
             driver = create_driver(headless=False, profile_id=email)

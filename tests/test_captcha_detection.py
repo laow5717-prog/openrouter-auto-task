@@ -10,8 +10,11 @@
 
 import pytest
 
-from src.browser import opencode_billing as ob
-from src.browser import opencode_login as ol
+from src.payments.stripe_checkout import (
+    _captcha_challenge_present, _captcha_frames_debug, _CAPTCHA_TEXT_HINTS,
+)
+from src.platforms.opencode import billing as ob
+from src.platforms.opencode import login as ol
 
 
 class FakeFrame:
@@ -58,32 +61,32 @@ def test_checkbox_frame_alone_is_not_a_challenge():
 
     这正是那次事故的形态——页面上什么都没有，检测器却一直报有挑战。
     """
-    assert ob._captcha_challenge_present(FakeSession([CHECKBOX])) is None
+    assert _captcha_challenge_present(FakeSession([CHECKBOX])) is None
 
 
 def test_i_am_human_is_not_a_trigger_word():
     """'i am human' 必须已从关键词表移除——它是 checkbox 帧的标签，不是挑战特征。"""
-    assert "i am human" not in ob._CAPTCHA_TEXT_HINTS
+    assert "i am human" not in _CAPTCHA_TEXT_HINTS
 
 
 def test_real_challenge_is_detected():
     """真的弹出图像挑战时必须能识别到（不能矫枉过正把真挑战也漏掉）。"""
-    fr = ob._captcha_challenge_present(FakeSession([CHECKBOX, CHALLENGE]))
+    fr = _captcha_challenge_present(FakeSession([CHECKBOX, CHALLENGE]))
     assert fr is CHALLENGE
 
 
 def test_empty_challenge_shell_is_not_a_challenge():
     """挑战帧存在但没渲染题目时不算——只看 URL 会在题目出现前就误判。"""
-    assert ob._captcha_challenge_present(FakeSession([CHECKBOX, CHALLENGE_EMPTY])) is None
+    assert _captcha_challenge_present(FakeSession([CHECKBOX, CHALLENGE_EMPTY])) is None
 
 
 def test_no_hcaptcha_frames_at_all():
-    assert ob._captcha_challenge_present(FakeSession([])) is None
+    assert _captcha_challenge_present(FakeSession([])) is None
 
 
 def test_frame_debug_lists_url_fragments():
     """诊断函数要能列出帧片段——判据收紧后，真挑战若失配是「静默不解题」，靠它留痕。"""
-    marks = ob._captcha_frames_debug(FakeSession([CHECKBOX, CHALLENGE]))
+    marks = _captcha_frames_debug(FakeSession([CHECKBOX, CHALLENGE]))
     assert any("frame=checkbox" in m for m in marks)
     assert any("frame=challenge" in m for m in marks)
 

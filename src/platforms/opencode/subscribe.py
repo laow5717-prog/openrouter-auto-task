@@ -13,8 +13,9 @@
 import re
 import time
 
-from src.browser.opencode_billing import (
-    _stripe_frame, _step,
+from src.browser.monitor import step as _step
+from src.payments.stripe_checkout import (
+    _stripe_frame,
     pick_currency_usd, select_card_method, fill_card_and_address,
     fill_phone_if_present, uncheck_save_info, check_ai_agent_consent,
     _captcha_challenge_present, _threeds_challenge_present,
@@ -22,7 +23,7 @@ from src.browser.opencode_billing import (
     _threeds_challenge_lightbox, _close_challenge_lightbox, _THREEDS_CHALLENGE_GRACE_SEC,
     _DECLINE_HINTS,
 )
-from src.browser.opencode_login import login_and_open_own_go, _extract_wid
+from src.platforms.opencode.login import login_and_open_own_go, _extract_wid
 from src.services import captcha as captcha_solver
 
 

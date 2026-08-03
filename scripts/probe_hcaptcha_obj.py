@@ -18,9 +18,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.browser.driver import create_driver, close_driver
-from src.browser.opencode_login import login_and_open_own_go
-from src.browser.opencode_subscribe import start_subscribe_go, select_usd_subscribe
-from src.browser.opencode_billing import (
+from src.platforms.opencode.login import login_and_open_own_go
+from src.platforms.opencode.subscribe import start_subscribe_go, select_usd_subscribe
+from src.platforms.opencode.billing import (
     select_card_method, fill_card_and_address, fill_phone_if_present,
     uncheck_save_info, check_ai_agent_consent)
 from src.models.database import Database

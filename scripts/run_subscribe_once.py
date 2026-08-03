@@ -15,8 +15,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.browser.driver import create_driver, create_driver_vanilla, close_driver
-from src.browser.opencode_login import login_and_open_own_go
-from src.browser.opencode_subscribe import subscribe_via_stripe
+from src.platforms.opencode.login import login_and_open_own_go
+from src.platforms.opencode.subscribe import subscribe_via_stripe
 from src.services import captcha as captcha_solver
 from src.config import cfg
 from src.models.database import Database

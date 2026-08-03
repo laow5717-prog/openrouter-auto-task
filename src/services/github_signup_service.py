@@ -23,7 +23,7 @@ from src.services.adspower import AdsPowerError
 from src.browser import github_signup as gh
 from src.services.email import create_temp_email, wait_for_github_launch_code
 from src.services.hotmail_inbox import wait_for_github_launch_code_ruoanzhu
-from src.browser.opencode_login import login_and_open_own_go
+from src.platforms.opencode.login import login_and_open_own_go
 
 _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

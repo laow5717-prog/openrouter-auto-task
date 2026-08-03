@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.browser.driver import create_driver, close_driver  # noqa: E402
-from src.browser import opencode_billing as ob  # noqa: E402
+from src.platforms.opencode import billing as ob  # noqa: E402
 from src.models.database import Database  # noqa: E402
 from src.models.card_pool import CardPoolModel  # noqa: E402
 

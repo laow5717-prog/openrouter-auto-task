@@ -16,10 +16,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.services.captcha import _HCAPTCHA_HOOK_JS
 from src.browser.cdp_inject import CDPPreInjector
 from src.browser.driver import create_driver, close_driver
-from src.browser.opencode_login import login_and_open_own_go
-from src.browser.opencode_subscribe import (
+from src.platforms.opencode.login import login_and_open_own_go
+from src.platforms.opencode.subscribe import (
     start_subscribe_go, select_usd_subscribe, click_subscribe)
-from src.browser.opencode_billing import (
+from src.platforms.opencode.billing import (
     select_card_method, fill_card_and_address, fill_phone_if_present,
     uncheck_save_info, check_ai_agent_consent, _captcha_challenge_present)
 from src.models.database import Database

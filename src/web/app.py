@@ -1077,8 +1077,8 @@ class AppState:
         跑在 worker 线程；InterruptedError 向上抛供轮转感知停止。account 排他由外层 claim 保证。
         """
         from src.browser.driver import create_driver_vanilla, close_driver
-        from src.browser.opencode_login import login_and_open_own_go
-        from src.browser.opencode_subscribe import subscribe_via_stripe
+        from src.platforms.opencode.login import login_and_open_own_go
+        from src.platforms.opencode.subscribe import subscribe_via_stripe
         from src.services import captcha as captcha_solver
 
         models = self.models
@@ -1340,8 +1340,8 @@ class AppState:
         except Exception:
             pass
         # 订阅链路各模块的 print 也劫持，便于 Web 日志捕获
-        for _mod in ('src.browser.opencode_subscribe', 'src.browser.opencode_login',
-                     'src.browser.opencode_billing', 'src.services.github_signup_service'):
+        for _mod in ('src.platforms.opencode.subscribe', 'src.platforms.opencode.login',
+                     'src.platforms.opencode.billing', 'src.services.github_signup_service'):
             try:
                 import importlib
                 importlib.import_module(_mod).print = hooked

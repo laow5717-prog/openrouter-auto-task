@@ -4,7 +4,7 @@
 import argparse, json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.browser.driver import create_driver, close_driver
-from src.browser.opencode_login import login_and_open_own_go
+from src.platforms.opencode.login import login_and_open_own_go
 
 _DUMP = r"""() => {
   const txt = el => (el.innerText||el.textContent||'').trim().replace(/\s+/g,' ').slice(0,60);
