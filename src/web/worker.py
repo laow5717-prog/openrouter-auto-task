@@ -113,17 +113,38 @@ class PaymentCardRegistry:
 
     本注册表补的正是"判定合格"到"写入结果"之间的时间差窗口，与 DB 派生规则叠加
     使用（双闸门）。内存态，进程崩溃即丢，此时 DB 规则仍是第二道闸。
+
+    两级排他：
+      _in_flight —— "此刻正在刷"，用完即放，防两个 worker 同时刷同一张卡；
+      _used      —— "本轮已被某账号试过"，整轮才清，防一张卡在同一轮里被第二个账号重刷。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._in_flight = {}               # card_number -> email
+        self._in_flight = {}               # card_number -> email（正在刷）
+        # card_number -> 首个试过它的 email。release 后仍保留，整轮结束才清空。
+        #
+        # 为什么需要它：_eligible_cards 是每个账号**进入时的一次性快照**，两个 worker
+        # 从同一个有序列表的头部出发，只差几十秒。只有 in_flight 排他时，A 刷完某张卡
+        # 立刻释放，B 随后原样再刷一遍——2026-08-03 实测一轮里 5 张卡被两个账号各刷一次，
+        # 且第二次必然失败（第一次已被拒并标 invalid，只是 B 的快照早于那次标记）。
+        # 白烧一次拒付、给账号叠加风控 velocity，还拖慢整轮。
+        #
+        # 它只作为**选卡时的排除依据**（AppState._eligible_cards），不参与 try_acquire 的
+        # 准入判断——理由见 try_acquire 的注释。
+        self._used = {}
 
     def try_acquire(self, card_number, email):
-        """占用一张支付卡。已被其它账号占用则返回 False。
+        """占用一张支付卡。已被其它账号**正在使用**则返回 False。
 
         同一账号重复占用同一张卡视为成功（幂等），因为串行路径内允许一张卡
-        为同一账号支付多笔。"""
+        为同一账号支付多笔。
+
+        注意这里**只做并发排他**，不管「本轮是否已被别的账号试过」——那是选卡策略，
+        由 AppState._eligible_cards 过滤（带「全被用过就放行」的兜底）。若在这里硬拦，
+        卡池偏紧时其它 worker 会一张都拿不到，被 registration 误判成「卡池已耗尽」而
+        永久放弃账号——这个坑早先踩过，见 test_release_lets_a_waiting_worker_proceed。
+        """
         if not card_number:
             return False
         with self._lock:
@@ -131,9 +152,11 @@ class PaymentCardRegistry:
             if holder is not None and holder != email:
                 return False
             self._in_flight[card_number] = email
+            self._used.setdefault(card_number, email)
             return True
 
     def release(self, card_number):
+        """结束一次刷卡，放开 in-flight。本轮归属（_used）保留到 release_all。"""
         with self._lock:
             self._in_flight.pop(card_number, None)
 
@@ -141,9 +164,15 @@ class PaymentCardRegistry:
         with self._lock:
             return set(self._in_flight)
 
+    def used_numbers(self):
+        """本轮已被某个账号试过的卡号集合。"""
+        with self._lock:
+            return set(self._used)
+
     def release_all(self):
         with self._lock:
             self._in_flight.clear()
+            self._used.clear()
 
 
 class ProxyRegistry:

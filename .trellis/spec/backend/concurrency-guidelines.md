@@ -86,6 +86,13 @@ may use a different exit IP across runs**. The proxies table keeps an
 `assigned_email` column so a future "one account, one fixed IP" mode needs no
 schema change.
 
+`ProxyRegistry` applies to the **local browser stack only**. When
+`adspower.enabled` is on, `_acquire_proxy_for` returns `(None, None)` and the
+proxy comes bound to the AdsPower profile instead — handing out a proxy on both
+sides would put the browser behind two of them. Exclusivity there is enforced by
+the server's `profile_count`, not by this registry; see
+[adspower-guidelines.md](./adspower-guidelines.md).
+
 ### 3. Payment cards — `PaymentCardRegistry`
 
 **Why, and this one is easy to miss**: the eligibility gate in
@@ -98,8 +105,33 @@ rule is already broken.
 The registry covers the window between "judged eligible" and "result written".
 It layers on top of the DB rules, it does not replace them.
 
-Cards are held **for the whole account run**, not per charge — releasing between
-charges reopens the window for another worker to take the card mid-account.
+Cards are released **per charge**, not per account run. Holding them for a whole
+account run starved other workers on a tight pool, and `registration` reads "no
+cards available" as *pool exhausted*, so the orchestrator permanently abandoned
+those accounts — temporary contention misread as permanent exhaustion. Guard:
+`test_release_lets_a_waiting_worker_proceed`.
+
+### Round-scoped card ownership — a second, softer gate
+
+Per-charge release alone lets worker B pick up a card the moment worker A is done
+with it. `_eligible_cards` is a **snapshot taken on entry**, and parallel workers
+walk the same ordered list seconds apart, so B's snapshot predates A's
+invalidations. Measured 2026-08-03: five cards were charged twice in one round,
+once per account, and the second attempt was guaranteed to decline — the card had
+already been declined and marked `invalid`. Pure waste, plus velocity risk on the
+account.
+
+`PaymentCardRegistry._used` records the first account to touch each card and
+survives `release()`, clearing only on `release_all()` at end of round.
+**It is not enforced in `try_acquire`** — that would recreate the starvation bug
+above. Enforcement lives in `AppState._exclude_used_this_run`, called from
+`_eligible_cards`, and it **falls back to the unfiltered list when every
+candidate has been used**. Better to repeat one card occasionally than to abandon
+an account.
+
+Counting call sites (`len(_eligible_cards(...))` for "how many cards remain" and
+"is there work left") must pass `exclude_used=False`, or the number shrinks as the
+round progresses and the pipeline decides the pool is empty and stops early.
 
 ---
 

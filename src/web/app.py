@@ -24,6 +24,8 @@ from src.models.valid_card import ValidCardModel
 from src.models.card_payment_state import CardPaymentStateModel
 from src.models.invoice_payment_state import InvoicePaymentStateModel
 from src.models.proxy import ProxyModel
+from src.models.adspower_profile import AdsPowerProfileModel
+from src.services.adspower import AdsPowerError
 from src.services import registration, card as card_service
 from src.api.routes import api
 from src.web.worker import (
@@ -96,6 +98,84 @@ class AppState:
         self.account_registry = AccountRegistry(self)
         self.payment_registry = PaymentCardRegistry()
         self.proxy_registry = ProxyRegistry()
+
+        # AdsPower 指纹浏览器接入（cfg.adspower.enabled 为假时恒为 None，全链路不受影响）。
+        # 惰性构造：启动时不去连 AdsPower，免得客户端没开就起不来服务。
+        self._adspower_pool = None
+        self._adspower_client = None
+        self._adspower_lock = threading.Lock()
+        # 本次运行启动过的环境（profile_id）。任务收尾时逐个 stop，避免用户点停止或
+        # 任务异常退出后留下一堆开着的浏览器（每个都吃几百 MB 内存）。
+        self._adspower_started = set()
+
+    # ---------- AdsPower 环境池 ----------
+
+    @property
+    def adspower_enabled(self):
+        return bool(cfg.adspower.enabled)
+
+    def _ensure_adspower(self):
+        """惰性创建 AdsPower 客户端与环境池。未启用时返回 (None, None)。"""
+        if not self.adspower_enabled:
+            return None, None
+        with self._adspower_lock:
+            if self._adspower_pool is None:
+                from src.services.adspower import AdsPowerClient
+                from src.browser.adspower_driver import AdsPowerProfilePool
+                self._adspower_client = AdsPowerClient(
+                    cfg.adspower.base_url, cfg.adspower.api_key)
+                self._adspower_pool = AdsPowerProfilePool(
+                    self._adspower_client,
+                    self.models['adspower_profile'],
+                    group_id=cfg.adspower.group_id,
+                    reclaim_batch=cfg.adspower.reclaim_batch,
+                    ua_systems=cfg.adspower.ua_systems,
+                    log=self.add_log,
+                    # 回收时跳过正在被 worker 使用的账号——删掉正在用的环境
+                    # 会让那个 worker 的浏览器凭空消失。
+                    is_busy=self.account_registry.is_claimed,
+                )
+            return self._adspower_client, self._adspower_pool
+
+    def browser_factory(self):
+        """返回 callable(email) -> BrowserSession；未启用 AdsPower 时返回 None。
+
+        下游（registration.recharge_account / signup_one / _subscribe_one_account）
+        统一以「factory 为 None 就走原路径」的方式接入，因此关掉开关时代码路径
+        与接入前完全一致。
+        """
+        client, pool = self._ensure_adspower()
+        if pool is None:
+            return None
+        from src.browser.adspower_driver import create_driver_adspower
+
+        def _factory(email):
+            session = create_driver_adspower(email, pool, client)
+            pid = getattr(session, 'adspower_profile_id', None)
+            if pid:
+                with self._adspower_lock:
+                    self._adspower_started.add(pid)
+            return session
+
+        return _factory
+
+    def _stop_started_adspower(self):
+        """收尾：关掉本次运行启动过的所有环境（幂等，异常不外溢）。"""
+        with self._adspower_lock:
+            pending = list(self._adspower_started)
+            self._adspower_started.clear()
+            client = self._adspower_client
+        if not pending or client is None:
+            return
+        closed = 0
+        for pid in pending:
+            try:
+                client.stop_profile(pid)
+                closed += 1
+            except Exception:
+                pass   # 已经关掉的会报错，属正常
+        if closed:
+            self.add_log(f"[AdsPower] 收尾关闭了 {closed} 个浏览器环境")
 
     # ---------- worker 管理 ----------
 
@@ -404,14 +484,46 @@ class AppState:
         elif not self.stop_requested:
             self._hooked_print("所有卡已处理完毕！")
 
-    def _eligible_cards(self, group_id):
+    @staticmethod
+    def _card_key(number):
+        """卡号比对键：去空格。卡池里的卡号可能带内部空格，登记表里存的是原样字符串。"""
+        return str(number or '').replace(' ', '')
+
+    def _exclude_used_this_run(self, cards):
+        """剔除本轮已被**其它账号**试过的卡；全被试过时原样返回。
+
+        为什么要剔除：_eligible_cards 是每个账号进入时的一次性快照，并行 worker 从同一
+        有序列表头部出发，不去重就会让同一张卡在一轮里被两个账号各刷一次（2026-08-03
+        实测 5 张）。第二次注定失败——第一次已被拒并标 invalid，只是后者的快照更早——
+        纯属白烧一次拒付并给账号叠加风控 velocity。
+
+        为什么留兜底：卡池偏紧时若硬性排除，后来的账号会一张卡都选不到，而
+        registration 把「无可用支付卡」当作卡池耗尽、编排层据此永久放弃该账号——
+        把**暂时的争用**误判成**永久的耗尽**。这个坑早先踩过（见
+        tests/test_registry.py::test_release_lets_a_waiting_worker_proceed），
+        宁可偶尔重复一张，也不能让账号被误弃。
+        """
+        used = self.payment_registry.used_numbers()
+        if not used:
+            return cards
+        used_keys = {self._card_key(n) for n in used}
+        unused = [c for c in cards if self._card_key(c.get('number')) not in used_keys]
+        if unused:
+            return unused
+        self.add_log("[选卡] 本轮可选卡已全部被其它账号试过，放开重复限制以免账号被误弃")
+        return cards
+
+    def _eligible_cards(self, group_id, exclude_used=True):
         """返回该分组当前「可选」的卡，有序：新卡优先，再复用好卡。
 
         可选 = get_usable_cards_as_list（已排除 expired/invalid/bound）且不处于临时冷却
         （3DS / 「曾成功卡本次被拒」的速率冷却）中。排序：
           - 新卡（从未成功付款过）优先，先把卡池的新卡消耗掉；
           - 之后才复用已成功过的好卡（paid 卡可反复支付）。
-        成功卡不被永久消耗，只有被拒（好卡→冷却，坏卡→无效）或过期才退出可选集。"""
+        成功卡不被永久消耗，只有被拒（好卡→冷却，坏卡→无效）或过期才退出可选集。
+
+        exclude_used=True 时再剔除本轮已被其它账号试过的卡（见 _exclude_used_this_run）。
+        统计用途（启动前算「分组有多少可选卡」）应传 False，否则数字会随本轮进度缩水。"""
         models = self.models
         usable, _ = models['card_pool'].get_usable_cards_as_list(group_id)
         cooldown_map = {}
@@ -431,11 +543,13 @@ class AppState:
             # success_nums 已去空格（all_success_card_numbers 内 replace），此处比对键同样
             # 去空格，保证「新卡/好卡」分类与记账口径一致（卡号含内部空格时也不误判）。
             (good if num.replace(' ', '') in success_nums else fresh).append(c)
-        return fresh + good
+        cards = fresh + good
+        return self._exclude_used_this_run(cards) if exclude_used else cards
 
     def _recharge_one_account(self, email, login_password, payment_group_id=None,
                               worker=None, captcha_api_key=None,
-                              captcha_server="api.multibot.cloud", proxy=None):
+                              captcha_server="api.multibot.cloud", proxy=None,
+                              verify_link=None):
         """为单个账号执行一次充值访问，返回 (result, err)，
         result ∈ {"success", "failed", "archived"(余额≥$20 已归档、未扣款)}。
 
@@ -474,6 +588,8 @@ class AppState:
                 captcha_api_key=captcha_api_key,
                 captcha_server=captcha_server,
                 proxy=proxy,
+                browser_factory=self.browser_factory(),
+                verify_link=verify_link,
             )
 
             if outcome == "topup":
@@ -510,8 +626,14 @@ class AppState:
         """每日充值任务：卡池驱动的账号轮转充值，串行跑在单个后台线程。
 
         选定一个卡池分组，用账号列表逐账号轮转充值：一个账号在其会话内充成 1 张卡后即轮转
-        到下一个账号；所有账号轮完一遍后若还有可选卡，回到第一个账号继续下一轮，直到无可选
-        卡 / 用户停止 / 整轮零进展兜底。
+        到下一个账号。**以刷完卡池为第一标准**：只要分组还有可选卡且还有账号可用就继续跑；
+        充值失败的账号只跳过**本轮**，一轮轮完（所有账号都试过一遍）后清空失败名单、
+        回到头部开下一轮重试（A 失败→换 B→…→下一轮再试 A）。停止条件（满足其一）：
+          1. 分组可选卡耗尽（全部无效/过期或冷却中）；
+          2. 无账号可用：payable + imported 都领不到，且连续两整轮零进展
+             （没付成一张卡、可选卡集合也没变化——再轮转只会原样重复，防死循环兜底；
+             容忍一轮零进展是为了吸收登录/网络类瞬时抖动）；
+          3. 用户手动停止。
 
         选卡资格（见 _eligible_cards）：新卡优先，付款成功过的好卡可反复复用；只有从未成功
         的坏卡被拒（判无效）、好卡被拒（24h 速率冷却）或过期，才退出可选集。逐卡的卡状态
@@ -542,8 +664,11 @@ class AppState:
 
         # 结果计数（收尾摘要用）。self.success_count/fail_count 另供前端进度条。
         stats = {'paid': 0, 'fail': 0, 'archived': 0, 'flagged': 0, 'registered': 0}
-        # 本次运行已终结（recharged/archived/flagged/注册未成）不再领的 email。
+        # 本次运行**永久终结**（archived/flagged/注册未成，状态已离开可充值集）的 email。
+        # 注意：充值失败不入 done——失败账号只禁本轮（failed_this_round），下一轮重试。
         done = set()
+        # 本轮已失败、暂不重领的 email。整轮轮完（无人在飞且领不到新账号）后清空重来。
+        failed_this_round = set()
         produce_lock = threading.Lock()   # 「找账号 + claim」原子领取
         state_lock = threading.Lock()     # 护 done + stats 的读写
 
@@ -582,7 +707,12 @@ class AppState:
             def _acquire_proxy_for(account_id):
                 """领一个空闲代理(排他)。全忙(100≫worker 数,几乎不触发)则按
                 account_id 取模兜底(不排他,满足「循环复用」)。返回 (pw_dict, proxy_key);
-                proxy_key 为 None 表示取模兜底或无代理,_do 不 release。"""
+                proxy_key 为 None 表示取模兜底或无代理,_do 不 release。
+
+                AdsPower 模式下代理由环境自带（建环境时用 proxyid 绑定，一绑长期有效），
+                本地代理池完全不参与——两边都发代理会让浏览器走双层代理。"""
+                if self.adspower_enabled:
+                    return None, None
                 usable = proxy_model.get_usable_list()
                 if not usable:
                     return None, None
@@ -595,12 +725,16 @@ class AppState:
 
             accounts = _payable_now()
             imported_pending = len(_registerable_imported())
-            eligible = len(self._eligible_cards(group_id))
-            proxy_count = proxy_model.count()
+            eligible = len(self._eligible_cards(group_id, exclude_used=False))
+            if self.adspower_enabled:
+                proxy_note = "浏览器走 AdsPower 指纹环境，代理由环境绑定"
+            else:
+                proxy_count = proxy_model.count()
+                proxy_note = (f"代理 {proxy_count} 个"
+                              f"{'（未配置代理，直连）' if not proxy_count else ''}")
             self._hooked_print(
                 f"可充值账号 {len(accounts)} 个，待注册 imported {imported_pending} 个，"
-                f"分组可选卡 {eligible} 张，代理 {proxy_count} 个"
-                f"{'（未配置代理，直连）' if not proxy_count else ''}")
+                f"分组可选卡 {eligible} 张，{proxy_note}")
             if not eligible:
                 self._hooked_print("分组内无可选卡（全部无效/过期或冷却中），无事可做")
                 return
@@ -608,34 +742,107 @@ class AppState:
                 self._hooked_print("无可充值账号且无 imported 可注册，任务结束")
                 return
 
-            # ── 生产者：每个 worker 反复原子领一个账号。优先充值现有可充账号，无则领一个
-            #    待注册 imported。produce_lock 让「找账号 + claim」原子，两 worker 绝不领同一个
-            #    （参照 _register_bind_loop._produce 的 state_lock + claim_batch）。领到即用
-            #    account_registry 占坑，消费者 finally 释放。返回 None 表示无活可领、worker 退出。
+            # ── 生产者：每个 worker 反复原子领一个账号，按「轮」轮转。优先充值现有可充
+            #    账号（跳过本轮已失败的），无则领一个待注册 imported。都领不到时分三种情况：
+            #      wait —— 还有账号在其它 worker 手上，本轮胜负未分，睡 5s 再看（不能直接
+            #              退出：在飞账号失败后会回到轮转池，退出会白白减员）；
+            #      开新一轮 —— 无人在飞且本轮有失败账号、且上一轮有进展（付成过或可选卡
+            #              集合变过），清空失败名单从头重试，并清掉「本轮已试过的卡」标记；
+            #      done —— 卡池耗尽 / 无账号可用 / 整轮零进展（再轮只会原样重复），收敛。
+            #    produce_lock 让「找账号 + claim + 轮转判定」原子，两 worker 绝不领同一个。
+            #    领到即用 account_registry 占坑，消费者 finally 释放。返回 None 表示任务收敛。
+            round_state = {
+                'no': 1,
+                'paid_at_start': 0,
+                'cards_at_start': None,   # 本轮开始时的可选卡键集合，判「零进展」用
+                'zero_rounds': 0,         # 连续零进展轮数；≥2 才停（容忍一轮瞬时抖动）
+            }
+            end_logged = [False]          # 收敛原因只打一次（多 worker 会各拿到一次 done）
+
+            def _card_keys_now():
+                return frozenset(
+                    self._card_key(c.get('number'))
+                    for c in self._eligible_cards(group_id, exclude_used=False))
+
+            round_state['cards_at_start'] = _card_keys_now()
+
+            def _try_claim():
+                """一次领取尝试（须在 produce_lock 内调用）。
+                返回 ('item', 工作项) / ('wait', None) / ('retry', None 已开新一轮) /
+                ('done', 收敛原因)。"""
+                if not self._eligible_cards(group_id, exclude_used=False):
+                    return 'done', "分组可选卡已耗尽（全部无效/过期或冷却中）"
+                for a in _payable_now():
+                    if a['email'] in failed_this_round:
+                        continue
+                    if self.account_registry.claim(a['email']):
+                        proxy, pkey = _acquire_proxy_for(a.get('id', 0))
+                        return 'item', ('recharge', a, proxy, pkey)
+                for a in _registerable_imported():
+                    if self.account_registry.claim(a['email']):
+                        proxy, pkey = _acquire_proxy_for(a.get('id', 0))
+                        return 'item', ('register', a, proxy, pkey)
+                if self.account_registry.snapshot():
+                    return 'wait', None
+                if not failed_this_round:
+                    return 'done', "无可充值账号且无 imported 可注册"
+                # ── 轮转边界：所有账号都试过一遍且无人在飞。有进展就开下一轮重试失败账号
+                with state_lock:
+                    paid_now = stats['paid']
+                cards_now = _card_keys_now()
+                progressed = (paid_now > round_state['paid_at_start']
+                              or cards_now != round_state['cards_at_start'])
+                if progressed:
+                    round_state['zero_rounds'] = 0
+                else:
+                    round_state['zero_rounds'] += 1
+                    if round_state['zero_rounds'] >= 2:
+                        return 'done', (f"连续 {round_state['zero_rounds']} 轮零进展"
+                                        "（未付成一张卡且可选卡集合未变化），账号已全部试尽")
+                retrying = len(failed_this_round)
+                round_state['no'] += 1
+                round_state['paid_at_start'] = paid_now
+                round_state['cards_at_start'] = cards_now
+                with state_lock:
+                    failed_this_round.clear()
+                self.payment_registry.release_all()   # 「本轮已被试过的卡」标记随轮清零
+                zero_note = ("，上轮零进展（容忍一轮，可能是瞬时抖动）"
+                             if round_state['zero_rounds'] else "")
+                self._hooked_print(
+                    f"\n一轮轮转完毕仍有可选卡 {len(cards_now)} 张，"
+                    f"开始第 {round_state['no']} 轮（重试 {retrying} 个上轮失败账号{zero_note}）")
+                return 'retry', None
+
             def _produce():
-                if self.stop_requested:
-                    return None
-                with produce_lock:
-                    if not self._eligible_cards(group_id):
+                while True:
+                    if self.stop_requested:
                         return None
-                    for a in _payable_now():
-                        if self.account_registry.claim(a['email']):
-                            proxy, pkey = _acquire_proxy_for(a.get('id', 0))
-                            return ('recharge', a, proxy, pkey)
-                    for a in _registerable_imported():
-                        if self.account_registry.claim(a['email']):
-                            proxy, pkey = _acquire_proxy_for(a.get('id', 0))
-                            return ('register', a, proxy, pkey)
-                    return None
+                    with produce_lock:
+                        verdict, payload = _try_claim()
+                        if verdict == 'done' and not end_logged[0]:
+                            end_logged[0] = True
+                            self._hooked_print(f"\n{payload}，任务收敛")
+                    if verdict == 'item':
+                        return payload
+                    if verdict == 'done':
+                        return None
+                    if verdict == 'wait':
+                        time.sleep(5)
+                    # 'retry'：已开新一轮，立刻回头再领
 
             # ── 消费者：跑在 worker 线程。注册成功者「不入 done」——释放后会被（自己或另一个
             #    worker）当作 payable 领来充值，实现「注册→登录→充值」闭环且可跨 worker 并行；
-            #    充值成功记 success，归档/flagged/充值失败/注册未成入 done（本次不再领），
-            #    其中充值失败入 done 替代原 done_emails+progressed 兜底，防卡全拒账号被无限重领。
+            #    充值成功记 success；归档/flagged/注册未成入 done（终态，永久退出）；
+            #    充值失败只入 failed_this_round（本轮跳过，下一轮重试）——防无限重领的职责
+            #    移交给 _try_claim 的「整轮零进展」判定，卡池刷完前失败账号可循环使用。
             def _do(worker, item):
                 kind, acct, proxy, pkey = item
                 email = acct['email']
-                proxy_note = f"（代理 {proxy['server'].split('//')[-1]}）" if proxy else "（直连）"
+                if self.adspower_enabled:
+                    proxy_note = "（AdsPower 环境，代理随环境）"
+                else:
+                    proxy_note = (f"（代理 {proxy['server'].split('//')[-1]}）"
+                                  if proxy else "（直连）")
                 try:
                     if kind == 'register':
                         self.set_action(worker, f"账号耗尽，注册补号 {email}")
@@ -654,7 +861,10 @@ class AppState:
                             email, login_password or acct.get('login_password'),
                             payment_group_id=group_id, worker=worker,
                             captcha_api_key=captcha_api_key, captcha_server=captcha_server,
-                            proxy=proxy)
+                            proxy=proxy,
+                            # GitHub 新设备验证自动收码要用；指纹浏览器下每个账号都是
+                            # 全新环境，这一关几乎必然触发。
+                            verify_link=acct.get('email_verify_link'))
                         with state_lock:
                             if result == "success":
                                 stats['paid'] += 1
@@ -668,23 +878,34 @@ class AppState:
                             else:
                                 stats['fail'] += 1
                                 self.fail_count += 1
-                                done.add(email)   # 本次不再重领，防卡全拒无限重试
+                                failed_this_round.add(email)   # 只禁本轮，下一轮重试
                 except InterruptedError:
                     self._hooked_print("充值阶段被中断")
                     raise
+                except AdsPowerError as e:
+                    # 浏览器起不来（配额满 / 客户端没开 / Key 无效）。这不是账号的问题，
+                    # 所以**不动账号状态**——标 failed 会让 imported 账号退出补号池永不重试。
+                    # 也不必逐个账号重试：环境配额是全局的，下一个账号必然撞同一堵墙，
+                    # 整批立刻收敛才能让「配额已满」这条关键信息留在日志顶端而不被淹掉。
+                    with state_lock:
+                        done.add(email)   # 本轮不再重领，但账号状态保持原样
+                    self.stop_requested = True
+                    self._hooked_print(f"AdsPower 环境不可用，终止本次任务: {e}")
                 except Exception as e:
                     with state_lock:
                         stats['fail'] += 1
                         self.fail_count += 1
-                        done.add(email)
+                        # 异常（浏览器崩溃等）多为瞬时问题，同充值失败：只禁本轮
+                        failed_this_round.add(email)
                     self._hooked_print(f"处理 {email} 出错: {e}")
                 finally:
                     self.account_registry.release(email)
                     if pkey:
                         self.proxy_registry.release(pkey)   # 排他领取的代理释放回池
 
-            # 收敛：每个账号最终 recharged/archived/flagged 或入 done，imported 与 payable
-            # 均有限，_produce 终会领空 → 所有 worker 退出。无 round，故无需 MAX_ROUNDS 兜底。
+            # 收敛：每轮要么有进展（付成 / 可选卡集合缩小——卡被标 invalid/冷却，集合有限
+            # 单调消耗），要么零进展被 _try_claim 判停。账号可跨轮循环使用但轮数有界，
+            # _produce 终会返回 None → 所有 worker 退出。
             pool.run_until_empty(_produce, _do)
 
         except Exception as e:
@@ -699,11 +920,12 @@ class AppState:
             self.account_registry.release_all()
             self.payment_registry.release_all()
             self.proxy_registry.release_all()
+            self._stop_started_adspower()
             self.parallel_mode = False
             self.is_running = False
 
             try:
-                remaining = len(self._eligible_cards(group_id))
+                remaining = len(self._eligible_cards(group_id, exclude_used=False))
             except Exception:
                 remaining = '?'
             self.current_action = (
@@ -770,6 +992,10 @@ class AppState:
         供订阅任务（_subscribe_one_account）与充值任务（run_daily_pipeline 补号）共用，
         保证两条流水线注册行为一致。跑在 worker 线程；account 排他由外层 claim 保证。
         signup_one 内部用 create_driver(Patchright)，返回时其 session 已关。
+
+        AdsPowerError（配额满 / 客户端没开）**向上抛出、不改账号状态**：浏览器都没起来，
+        谈不上「这个账号注册失败」。若在此标 failed，账号会退出 imported 池永不重试——
+        2026-08-03 一次配额耗尽就这样误废了 30 个刚导入的账号。
         """
         models = self.models
         worker = worker or self.primary_worker
@@ -783,7 +1009,8 @@ class AppState:
         self.set_action(worker, f"{email} 未注册，尝试 GitHub 注册（Arkose 弹则跳过）")
         # auto_skip_captcha：不弹 Arkose 自动收码完成注册；弹了立即跳过不等人工（全自动）。
         r = signup_one(headless=False, semi_auto=False, account=hacc,
-                       then_opencode=False, auto_skip_captcha=True, proxy=proxy)
+                       then_opencode=False, auto_skip_captcha=True, proxy=proxy,
+                       browser_factory=self.browser_factory())
         oc = r.get('outcome')
         if oc == 'reached_captcha':
             models['account'].update_status(email, 'pending')
@@ -832,7 +1059,9 @@ class AppState:
         if captcha_api_key:
             captcha_solver.init_solver(captcha_api_key, server=captcha_server)
 
-        session = create_driver_vanilla(profile_id=email, proxy=proxy)
+        factory = self.browser_factory()
+        session = (factory(email) if factory is not None
+                   else create_driver_vanilla(profile_id=email, proxy=proxy))
         monitor = worker.make_monitor(self)
         worker.set_active_driver(session)
         try:
@@ -939,7 +1168,7 @@ class AppState:
             self._hooked_print("每日订阅任务开始（账号轮转：注册/登录 + Stripe 订阅）")
             self._hooked_print(f"{'#' * 50}")
 
-            eligible = len(self._eligible_cards(group_id))
+            eligible = len(self._eligible_cards(group_id, exclude_used=False))
             self._hooked_print(f"分组可选卡 {eligible} 张")
             if not eligible:
                 self._hooked_print("分组内无可选卡，无事可做")
@@ -958,7 +1187,7 @@ class AppState:
                 if self.stop_requested:
                     self._hooked_print("用户停止了任务")
                     break
-                remaining = len(self._eligible_cards(group_id))
+                remaining = len(self._eligible_cards(group_id, exclude_used=False))
                 if not remaining:
                     self._hooked_print("已无可选卡，任务结束")
                     break
@@ -973,7 +1202,7 @@ class AppState:
 
                 def _do(worker, acct):
                     email = acct['email']
-                    if self.stop_requested or not self._eligible_cards(group_id):
+                    if self.stop_requested or not self._eligible_cards(group_id, exclude_used=False):
                         return
                     if not self.account_registry.claim(email):
                         self._hooked_print(f"{email} 正被占用，本轮跳过")
@@ -995,6 +1224,11 @@ class AppState:
                     except InterruptedError:
                         self._hooked_print("订阅阶段被中断")
                         raise
+                    except AdsPowerError as e:
+                        # 与充值管线同理：浏览器起不来是全局故障，不是这个账号的问题。
+                        # 下一个账号必然撞同一堵墙，整批立刻收敛。
+                        self.stop_requested = True
+                        self._hooked_print(f"AdsPower 环境不可用，终止本次任务: {e}")
                     except Exception as e:
                         with round_lock:
                             round_stats['other'] += 1
@@ -1008,7 +1242,7 @@ class AppState:
                 fail_total += round_stats['other']
 
                 # 进展 = 本轮有订阅成功，或可选卡减少（拒付标无效）。零进展兜底防死循环。
-                after = len(self._eligible_cards(group_id))
+                after = len(self._eligible_cards(group_id, exclude_used=False))
                 progressed = round_stats['subscribed'] > 0 or after < remaining
                 if not progressed and not self.stop_requested:
                     self._hooked_print("整轮无订阅成功且无卡被消耗，结束任务（兜底防死循环）")
@@ -1025,10 +1259,11 @@ class AppState:
             self.account_registry.release_all()
             self.payment_registry.release_all()
             self.proxy_registry.release_all()
+            self._stop_started_adspower()
             self.parallel_mode = False
             self.is_running = False
             try:
-                remaining = len(self._eligible_cards(group_id))
+                remaining = len(self._eligible_cards(group_id, exclude_used=False))
             except Exception:
                 remaining = '?'
             self.current_action = (f"每日订阅任务完成（订阅成功 {subscribed_total} 个 / "
@@ -1111,6 +1346,7 @@ def create_app(db_path=None):
         'card_state': CardPaymentStateModel(db),
         'invoice_state': InvoicePaymentStateModel(db),
         'proxy': ProxyModel(db),
+        'adspower_profile': AdsPowerProfileModel(db),
     }
 
     # 创建应用状态

@@ -197,3 +197,70 @@ def test_in_flight_set_empties_after_each_attempt():
         reg.try_acquire(num, 'a@example.com')
         reg.release(num)
     assert reg.in_flight_numbers() == set()
+
+
+def test_used_numbers_survives_release():
+    """本轮归属在 release 后仍保留——它是选卡层去重的依据，不能随 in-flight 一起消失。"""
+    reg = _state().payment_registry
+    reg.try_acquire('4444', 'a@example.com')
+    reg.release('4444')
+    assert '4444' in reg.used_numbers()
+    assert '4444' not in reg.in_flight_numbers()
+
+
+def test_release_all_clears_round_ownership():
+    """整轮结束后归属清空，下一轮这张卡可以给别的账号用。"""
+    reg = _state().payment_registry
+    reg.try_acquire('4333', 'a@example.com')
+    reg.release('4333')
+    reg.release_all()
+    assert reg.used_numbers() == set()
+
+
+def test_used_records_first_account_only():
+    """归属记首个使用者；同一账号重复取不改归属。"""
+    reg = _state().payment_registry
+    reg.try_acquire('4555', 'a@example.com')
+    reg.release('4555')
+    reg.try_acquire('4555', 'a@example.com')
+    assert reg._used['4555'] == 'a@example.com'
+
+
+# ==================== 选卡层：同一轮不重复用卡 ====================
+
+
+def _cards(*numbers):
+    return [{'number': n} for n in numbers]
+
+
+def test_eligible_cards_excludes_cards_used_by_other_accounts():
+    """核心回归：本轮已被别的账号试过的卡，不再发给下一个账号。
+
+    2026-08-03 实测：_eligible_cards 是每账号进入时的快照，两个 worker 从同一有序列表
+    头部出发只差几十秒，一轮里 5 张卡被两个账号各刷一次；第二次注定失败（第一次已被拒
+    并标 invalid，只是后者的快照更早），白烧一次拒付还叠加风控 velocity。
+    """
+    state = _state()
+    state.payment_registry.try_acquire('4111', 'a@example.com')
+    state.payment_registry.release('4111')
+    left = state._exclude_used_this_run(_cards('4111', '4222', '4333'))
+    assert [c['number'] for c in left] == ['4222', '4333']
+
+
+def test_eligible_cards_falls_back_when_all_used():
+    """全被试过时必须放行，否则「暂时争用」会被 registration 误判成「卡池耗尽」，
+    编排层据此永久放弃该账号——这个坑早先踩过。"""
+    state = _state()
+    for n in ('4111', '4222'):
+        state.payment_registry.try_acquire(n, 'a@example.com')
+        state.payment_registry.release(n)
+    left = state._exclude_used_this_run(_cards('4111', '4222'))
+    assert [c['number'] for c in left] == ['4111', '4222']
+
+
+def test_exclude_used_normalises_spaces_in_card_numbers():
+    """卡池里的卡号可能带空格，登记表存的是原样串，比对必须去空格后再比。"""
+    state = _state()
+    state.payment_registry.try_acquire('4111222233334444', 'a@example.com')
+    left = state._exclude_used_this_run(_cards('4111 2222 3333 4444', '4222'))
+    assert [c['number'] for c in left] == ['4222']

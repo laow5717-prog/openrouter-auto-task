@@ -89,6 +89,46 @@ class _Tracker:
             self._exit(email)
 
 
+class _FlakyOnceTracker(_Tracker):
+    """每个账号第一次充值失败并烧掉一张卡（模拟被拒后标 invalid），第二次成功。
+
+    验证轮转重试：失败账号不再永久入 done，一轮轮完后开新一轮重来（A 失败→
+    换 B→…→下一轮再试 A），直到充成。"""
+
+    def recharge(self, email, login_password, **kw):
+        self._enter(email)
+        try:
+            with self.lock:
+                self.recharged_calls.append(email)
+                first = self.recharged_calls.count(email) == 1
+            threading.Event().wait(self.delay)
+            if first:
+                # 烧掉一张可用卡：可选卡集合变化 → 轮转判定视为「有进展」
+                self.db.execute(
+                    "UPDATE card_pool SET status='invalid' WHERE id IN ("
+                    "SELECT id FROM card_pool "
+                    "WHERE COALESCE(status,'') NOT IN ('invalid','expired') LIMIT 1)")
+                return "failed", "declined"
+            self.db.execute("UPDATE accounts SET status='recharged' WHERE email=?", (email,))
+            return "success", ""
+        finally:
+            self._exit(email)
+
+
+class _AlwaysFailTracker(_Tracker):
+    """充值永远失败且不动卡池（模拟登录类故障）——验证连续两轮零进展后收敛，不死循环。"""
+
+    def recharge(self, email, login_password, **kw):
+        self._enter(email)
+        try:
+            with self.lock:
+                self.recharged_calls.append(email)
+            threading.Event().wait(self.delay)
+            return "failed", "login error"
+        finally:
+            self._exit(email)
+
+
 @pytest.fixture
 def no_browser(monkeypatch):
     def _explode(*a, **kw):
@@ -97,7 +137,7 @@ def no_browser(monkeypatch):
     monkeypatch.setattr(driver_module, 'create_driver_vanilla', _explode)
 
 
-def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16):
+def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls=_Tracker):
     path = tempfile.mktemp(suffix='.db')
     db = Database(path)
     models = {
@@ -118,7 +158,7 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16):
                    (f'imp{i}@example.com', 'ep', 'https://ruoanzhu.example/s?e=x', 'imported'))
 
     state = AppState(db, models)
-    tracker = _Tracker(db)
+    tracker = tracker_cls(db)
     state._register_one_account = tracker.register
     state._recharge_one_account = tracker.recharge
 
@@ -133,8 +173,11 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16):
     for row in db.fetchall("SELECT status, COUNT(*) c FROM accounts GROUP BY status"):
         status_counts[row['status']] = row['c']
 
+    usable_left, _ = models['card_pool'].get_usable_cards_as_list(gid)
+
     result = {
         'status_counts': status_counts,
+        'usable_cards_left': len(usable_left),
         'recharged_calls': list(tracker.recharged_calls),
         'registered_calls': list(tracker.registered_calls),
         'overlapping': list(tracker.overlapping),
@@ -190,3 +233,33 @@ def test_serial_and_parallel_same_ledger(no_browser):
     assert serial['status_counts'].get('recharged') == parallel['status_counts'].get('recharged') == 5
     assert sorted(serial['recharged_calls']) == sorted(parallel['recharged_calls'])
     assert len(serial['registered_calls']) == len(parallel['registered_calls']) == 3
+
+
+def test_failed_accounts_retried_next_round(no_browser):
+    """失败账号跨轮循环使用：每个账号第一次失败（烧一张卡），下一轮重试后充成。
+
+    旧行为下失败即永久入 done，一轮全败后卡池还有卡任务就提前结束——本测试
+    锁死修复：以刷完卡为第一标准，只要有进展就开新一轮重试失败账号。"""
+    r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=8,
+                      tracker_cls=_FlakyOnceTracker)
+    assert r['status_counts'].get('recharged') == 2, "失败账号未被下一轮重试充成"
+    # 每个账号恰好被试了两次：第一轮失败 + 第二轮成功
+    calls = sorted(r['recharged_calls'])
+    assert calls == ['reg0@example.com'] * 2 + ['reg1@example.com'] * 2
+    # 每次失败烧掉一张卡，其余卡保持可用
+    assert r['usable_cards_left'] == 8 - 2
+    assert r['is_running'] is False
+
+
+def test_zero_progress_two_rounds_then_stop(no_browser):
+    """连续两轮零进展（不付成、不动卡）才收敛——既不死循环，也不因一轮抖动早退。"""
+    r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=8,
+                      tracker_cls=_AlwaysFailTracker)
+    # 每个账号恰好被试了两轮，之后判「账号已全部试尽」收敛
+    calls = sorted(r['recharged_calls'])
+    assert calls == ['reg0@example.com'] * 2 + ['reg1@example.com'] * 2
+    assert r['status_counts'].get('recharged') is None
+    # 卡池原样未动——证明收敛原因是账号试尽，而非卡耗尽
+    assert r['usable_cards_left'] == 8
+    assert r['is_running'] is False
+    assert r['claims_left'] == 0 and r['in_flight_cards'] == 0
