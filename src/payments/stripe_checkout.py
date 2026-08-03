@@ -41,6 +41,23 @@ _FIND_USD_JS = r"""
 # again"），宽泛词会把「需人机验证」误判成「拒付」进而错误标卡无效。
 
 
+# Stripe **客户端表单校验**的提示——与拒付有本质区别：卡根本没提交给银行。
+#
+# 触发原因只有两类，两类都不该判废这张卡：
+#   a) 我们没把字段填完整（输入被 DOM 重排吞字符，见 _type_and_verify）；
+#   b) 该 Stripe 账户没启用这个卡种，于是位数对不上——实测 14 位 Diners 在
+#      infron 的 Payment Element 上就报 "Your card number is incomplete."
+#
+# 必须**先于** _DECLINE_HINTS 判定：后者含裸词 "incorrect" 与 "card number is"，
+# 会把这两句一并吞掉判成拒付。实跑中两张好 Diners 就是这么被误废的，而判废不可逆。
+_INPUT_INVALID_HINTS = [
+    "card number is incomplete", "card number is incorrect", "card number is invalid",
+    "security code is incomplete", "security code is invalid",
+    "expiration date is incomplete", "expiration date is invalid",
+    "postal code is incomplete", "postal code is invalid",
+    "zip code is incomplete",
+]
+
 _DECLINE_HINTS = [
     "declined", "was declined", "insufficient", "incorrect",
     "card number is", "security code is", "expired", "not be processed",

@@ -434,8 +434,15 @@ def recharge_account():
     # guidelines），两条流水线入口也是这么做的。
     state.platform = platform
 
-    # 标记为运行中，在后台线程执行充值
+    # 标记为运行中，在后台线程执行充值。
+    #
+    # stop_requested 必须跟着一起复位：它是**跨任务残留**的。上一次任务被用户停止、
+    # 或某个 worker 抛 InterruptedError（worker.py 会置全局 stop_requested 让其它
+    # worker 一起收敛）之后，这个标志一直是 True；不复位的话，下一次充值会在第一个
+    # 检查点就自杀，日志只留一句「收到停止请求，正在中断」——看起来像用户又点了停止，
+    # 极难往「上一轮的残留」上想。三条流水线入口都成对复位了，只有这里漏了。
     state.is_running = True
+    state.stop_requested = False
     state.current_action = f"正在为 {email} 在 {platform} 充值..."
     state._patch_prints()
 

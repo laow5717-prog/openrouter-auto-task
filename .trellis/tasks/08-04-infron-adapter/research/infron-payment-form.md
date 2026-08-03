@@ -137,21 +137,34 @@ name    未命中 —— Payment Element 默认不渲染持卡人字段
 `billingAddressCollection` 只要邮编）。所以它们"未命中"是正常的，不是 bug，
 也因此不进 ok 判据。
 
-### ⚠️ infron 不接受 Amex / Diners
+### 卡种：Amex 可用，Diners 不可用
 
-分组 6 里有 83 张 Amex（15 位）与 2 张 Diners（14 位），Luhn 全部合法，opencode 那边
-能拿到真实银行拒付。但在 infron 上，Payment Element 一律报
-**"Your card number is incorrect"** —— 那是**客户端 BIN 校验失败**，不是银行拒付，
-说明 infron 的 Stripe 账户没启用这些卡种。
+⚠️ **本节曾写错，2026-08-04 二次实跑后更正。** 之前断言「infron 不接受 Amex/Diners」，
+依据是两者都报 "Your card number is incorrect"。但那批 Amex 是在**卡号截断 bug 修好之前**
+跑的——报错来自没填完的卡号，不是卡种。
 
-对照实验：同一批流程换一张 16 位 Visa（****6263），得到的是 `declined`
-——真实银行拒付。**这证明填卡链路本身是对的**，之前那些"格式错误"是卡种问题。
+修好后的实测：
 
-这件事有个好性质：卡种不兼容会被记成**该平台**的判废，opencode 那边照常可用。
-隔离机制恰好把「平台特有的卡兼容性」也正确处理了，不需要额外做什么。
+| 卡种 | 位数 | 前缀 | 结果 |
+|---|---|---|---|
+| Visa | 16 | 4 | `declined` —— 真实银行拒付 |
+| Amex | 15 | 34 | `declined` —— 真实银行拒付，**卡种是支持的** |
+| Diners | 14 | 30 | `Your card number is incomplete.` —— 客户端校验 |
 
-但要注意：infron 上跑 Amex/Diners 会白白消耗试卡次数（每张都必然失败）。
-若后续要优化，可以在 infron 的选卡侧按 BIN 预过滤——**不过那属于优化，不是正确性问题**。
+Diners 报 **incomplete**（不是 incorrect）：Payment Element 没把这个 BIN 认成 Diners，
+于是按 16 位的通用规则要求补齐。这说明 infron 的 Stripe 账户没启用 Diners。
+
+### ⚠️ "incomplete" / "incorrect" 是表单校验，**不是拒付**
+
+这两句都发生在**卡提交给银行之前**，成因只有两类——我们没填完整，或该卡种没启用。
+两类都不能说明「这张卡是坏的」，因此必须归 `error`（不消耗卡），不能归 `failed`。
+
+实跑事故：`_DECLINE_HINTS` 里有裸词 `incorrect` 与 `card number is`，把
+"Your card number is incomplete." 一并吞掉判成拒付，两张好 Diners 被判废——而判废不可逆。
+修法是加一张 `_INPUT_INVALID_HINTS`，并**先于**拒付表判定（顺序有回归测试钉住）。
+
+分组 6 里只有 2 张 Diners，所以没有再做 BIN 预过滤：走到 incomplete 会正确归 error
+并保留卡，代价只是一次约 40 秒的弹窗往返。若将来 Diners 占比变大，再在选卡侧按 BIN 预过滤。
 
 ### 拒付检测的扫描范围：只扫主文档 + 付款表单帧
 

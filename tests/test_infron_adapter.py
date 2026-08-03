@@ -4,6 +4,8 @@
 出错的地方——闸门写错会静默用上旧链接，余额解析把 0 当成读不到会让归档判断走错。
 """
 
+import inspect
+import re
 from datetime import datetime, timedelta
 
 import pytest
@@ -326,6 +328,110 @@ def test_address_candidates_include_bare_names():
     from src.payments.stripe_checkout import _ADDR_FIELD_CANDIDATES
     assert _ADDR_FIELD_CANDIDATES['zip'][0] == "input[name='postalCode']"
     assert _ADDR_FIELD_CANDIDATES['city'][0] == "input[name='locality']"
+
+
+# ---------- 3DS 挑战：先等宽限，别一见就关 ----------
+
+def test_threeds_challenge_gets_a_grace_period_before_cancel():
+    """3DS 挑战不能一出现就 Cancel —— 很多挑战几十秒内会自动放行。
+
+    实跑事故：立刻 Cancel 等于亲手作废一笔本可成功的付款，而且关掉后还不返回，
+    白等满整个 timeout 才得出 unknown。5 张卡有 3 张栽在这里。
+    语义与 opencode 对齐：宽限期内等它自己过，仍在才关并判 failed。
+    """
+    src = inspect.getsource(ic.detect_payment_result)
+    assert '_THREEDS_CHALLENGE_GRACE_SEC' in src, '缺少宽限期，挑战会被立刻掐掉'
+    # 关闭动作必须在宽限判断之后，且关闭后要有明确结论（return failed）
+    i_grace = src.index('_THREEDS_CHALLENGE_GRACE_SEC')
+    i_close = src.index('_close_challenge_lightbox')
+    assert i_grace < i_close, '必须先判宽限期再关挑战'
+    tail = src[i_close:i_close + 400]
+    assert 'return' in tail and 'failed' in tail, '关掉挑战后必须立即判 failed，不能继续空等'
+
+
+def test_page_is_not_reloaded_while_a_challenge_is_open():
+    """挑战开着时绝不能重载页面 —— 重载会把挑战连同待授权的付款一起冲掉。
+
+    轮询里每 5 轮刷一次余额页是必要的（弹窗背后的余额不会自更新），但漏掉
+    「挑战期间不刷」这个条件，等于每 30 秒亲手掐死一次正在进行的 3DS。
+    """
+    src = inspect.getsource(ic.detect_payment_result)
+    m = re.search(r'if rounds % 5 == 0([^:]*):', src)
+    assert m, '找不到周期性重载的条件'
+    assert 'challenge_since is None' in m.group(1), \
+        '周期性重载没有排除「3DS 挑战正开着」的情况'
+
+
+# ---------- 不支持的卡种直接短路 ----------
+
+def test_unsupported_brand_short_circuits_without_touching_the_browser():
+    """14 位 Diners 在 infron 必然走不通，直接短路，不必花 40 秒走完流程。
+
+    关键是归 error（不消耗卡）—— 卡本身没问题，只是这个平台没启用该卡种。
+    用 _DeadSession 保证真的没碰浏览器：碰了就会抛异常。
+    """
+    a = platforms.get('infron')
+    r = a.top_up(_DeadSession(), None, {'number': '30569309025904'}, amount=50)
+    assert r.outcome == 'error'
+    assert r.keeps_card is True
+    assert 'skipped_unsupported_brand' in (r.steps or []), '应在碰浏览器之前就短路'
+
+
+@pytest.mark.parametrize('number,digits', [
+    ('4111111111111111', 16),        # Visa —— 实测能拿到真实拒付
+    ('341154807281004', 15),         # Amex —— 实测能拿到真实拒付
+])
+def test_supported_brands_are_not_short_circuited(number, digits):
+    """15/16 位实测都能走到银行，绝不能被短路挡掉——那会让整个卡池作废。"""
+    assert len(number) == digits
+    a = platforms.get('infron')
+    r = a.top_up(_DeadSession(), None, {'number': number}, amount=50)
+    # 走进了真实流程（因而被 _DeadSession 打挂），而不是被短路
+    assert 'skipped_unsupported_brand' not in (r.steps or [])
+
+
+# ---------- 表单校验 ≠ 拒付 ----------
+
+def test_input_validation_is_checked_before_decline():
+    """"card number is incomplete" 必须归 error（不消耗卡），不能归拒付。
+
+    实跑事故：Payment Element 报 "Your card number is incomplete."（客户端校验，
+    卡根本没提交给银行），却被 _DECLINE_HINTS 里的裸词 "card number is" 吞掉判成
+    拒付 —— 两张好 Diners 被判废，而判废不可逆。
+
+    这条同时钉住**判定顺序**：input-invalid 必须先于 decline，否则裸词又会抢先命中。
+    """
+    from src.payments.stripe_checkout import _DECLINE_HINTS, _INPUT_INVALID_HINTS
+
+    text = 'your card number is incomplete.'
+    assert any(h in text for h in _INPUT_INVALID_HINTS), '表单校验表应能命中'
+    assert any(h in text for h in _DECLINE_HINTS), \
+        '拒付表也会命中同一句 —— 正因如此，顺序不能颠倒'
+
+    # 只比对真正的判定语句，不要撞上注释里提到的同名标识符
+    src = inspect.getsource(ic.detect_payment_result)
+    order = re.findall(r'next\(\(h for h in (_\w+_HINTS)', src)
+    assert order[:2] == ['_INPUT_INVALID_HINTS', '_DECLINE_HINTS'], \
+        f'判定顺序错了：{order}。表单校验必须先判，否则拒付表的裸词会抢先命中'
+
+
+def test_real_decline_is_still_failed():
+    """真实银行拒付仍归 failed —— 上面的修复不能把拒付也放过。"""
+    from src.payments.stripe_checkout import _DECLINE_HINTS, _INPUT_INVALID_HINTS
+
+    text = 'your card was declined.'
+    assert not any(h in text for h in _INPUT_INVALID_HINTS)
+    assert any(h in text for h in _DECLINE_HINTS)
+
+
+def test_expired_card_is_a_decline_not_an_input_error():
+    """「卡已过期」是卡的属性，仍归拒付；只有 "expiration date is incomplete" 才是填写问题。"""
+    from src.payments.stripe_checkout import _DECLINE_HINTS, _INPUT_INVALID_HINTS
+
+    assert not any(h in 'your card has expired.' for h in _INPUT_INVALID_HINTS)
+    assert any(h in 'your card has expired.' for h in _DECLINE_HINTS)
+    assert any(h in "your card's expiration date is incomplete."
+               for h in _INPUT_INVALID_HINTS)
 
 
 def test_threeds_failure_modal_returns_a_tuple_not_a_frame():

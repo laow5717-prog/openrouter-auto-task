@@ -174,3 +174,93 @@ Stage 1 单独成一个「只有文档」的 commit 是有意的：它记录的�
   被触发（此前只有单元测试覆盖）。第一次撞配额时值得盯一眼，
   `config.yaml` 的 `reclaim_batch` 可临时降到 1。
 - 手续费实际是 3% + ($0.35 + 2%)，与官方文档的 5% + $0.35 对不上。不要按文档硬算金额。
+
+---
+
+## Stage 4 走查结果（2026-08-04）
+
+### 逐条 AC
+
+| AC | 结论 | 依据 |
+|---|---|---|
+| AC1 协议与 capabilities | ✅ | `isinstance(adapter, PlatformAdapter)` 为真，`capabilities == {CAP_TOPUP}` |
+| AC2 编排层未改 | ⚠️ 见下 | `registration.py`/`app.py`/`worker.py`/`models/` **零改动**，但 diff 溢出到 3 个文件 |
+| AC3 无订阅按 capabilities 跳过 | ✅ | infron 不满足 `SubscribingAdapter`，opencode 满足；协议已拆分，不抛异常 |
+| AC4 magic link 首登 | ✅ | Stage 2 实跑，落地 `/dashboard`；infron 无租户概念，`tenant_id=None`（design 已说明） |
+| AC5 复用登录态不发新邮件 | ✅ | 本轮实跑 3 秒完成「已登录（复用环境登录态）」，无发信步骤 |
+| AC6 只认本次之后到达的链接 | ✅ | 单元测试覆盖：旧链接被跳过、90 秒时钟容差、超容差拒收 |
+| AC7 无 verify_link 的可读报错 | ✅ | 返回 `ok=False`，detail 为「该账号无收信链接…无法收 magic link」 |
+| AC8 走到付款并返回契约结果 | ✅ | 实跑完整链路，返回值经 `PaymentResult.from_dict` |
+| AC9 真实拒付判 failed | ✅ | 15 位 Amex（1004/1001）拿到 `declined` → `failed` → 判废，落 infron |
+| AC10 三种结果不消耗卡 | ✅ | `OUTCOMES_KEEPING_CARD` 契约 + 实跑：Diners 归 error 且日志明示「跳过不消耗此卡」 |
+| AC11 Pay 定位不依赖金额 | ✅ | 定位用 `^Pay\s` 正则，从不匹配金额 |
+| AC12 余额 0 返回 0.0 | ✅ | 单元测试钉住 `0.0 is not None` |
+| AC13 成功后回写余额 | ⚠️ 未实跑 | 代码路径正确且按 platform 隔离，但**从未有过成功付款**，仅单元测试覆盖 |
+| AC14 同邮箱两平台各一行 | ⚠️ 未实跑 | 单元测试覆盖；生产数据里 infron 尚无成功/归档，故没有真实的双平台账号行 |
+| AC15 判废互不影响 | ✅ | infron 判废 2 张后，opencode 视角 `unverified` 仍是 304，与基线完全一致 |
+| AC16 前端按平台取数 | ✅ | 同一分组 6（975 张）：opencode `{invalid:668, unverified:304, valid:3}`，infron `{invalid:6, unverified:969, valid:0}` |
+| AC17 端到端 | ✅ | 见下 |
+| AC18 测试全绿 | ✅ | 299 passed（基线 262 → 新增 37） |
+
+### AC2 的实际偏差
+
+严格形式**未达成**。除 `src/platforms/infron/` 与注册处外，还改了三个文件：
+
+- `base.py` —— 把 `subscribe` 从必需方法拆成可选的 `SubscribingAdapter`。原设计与
+  `capabilities` 机制自相矛盾：声明成必需就让纯充值制平台无法满足协议。
+- `stripe_checkout.py` —— 参数化以支持 Payment Element（opencode 是 hosted Checkout）。
+- `routes.py` —— 修了三个错误前提：platform 参数从不落地、凭据前置校验写死 GitHub 密码、
+  停止标志跨任务残留。
+
+但**精神成立**：`registration.py`、`app.py`、`worker.py`、`models/` 一行未动
+（已用 `git diff --stat` 逐路径核实，并断言路径存在——首次核查曾误用不存在的
+`src/registration.py`，空过了）。三处溢出都是「第二个平台暴露出的错误假设」，
+不是为 infron 加特例。
+
+### 本轮实跑修掉的两个真缺陷
+
+1. **表单校验被误判为拒付**（严重）。Payment Element 报
+   `Your card number is incomplete.` 时，卡**根本没提交给银行**——成因只有「我们没填完」
+   或「该卡种没启用」，都不说明卡是坏的。但 `_DECLINE_HINTS` 里的裸词 `incorrect`
+   与 `card number is` 把它一并吞掉判成拒付，**两张好 Diners 被判废**，而判废不可逆。
+   修法：新增 `_INPUT_INVALID_HINTS` 并**先于**拒付表判定，归 `error`（不消耗卡）。
+   顺序有回归测试钉住。误废的两张卡已恢复（真实拒付的 Amex 保持判废）。
+
+2. **停止标志跨任务残留**。`/api/accounts/recharge` 置 `is_running=True` 却不复位
+   `stop_requested`。上一轮被停止（或 worker 抛 InterruptedError 时置了全局标志）之后，
+   下一次充值在第一个检查点就自杀，日志只留一句「收到停止请求，正在中断」——
+   看起来像用户又点了停止。三条流水线入口都成对复位了，只有这个端点漏了。
+
+### 一并纠正的错误结论
+
+research 文档原先断言「infron 不接受 Amex/Diners」，**是错的**。那批 Amex 是在卡号截断
+bug 修好之前跑的，报错来自没填完的卡号，不是卡种。修好后实测：Amex（15 位）与
+Visa（16 位）都能拿到真实银行拒付，只有 Diners（14 位）报 incomplete。文档已更正。
+
+### 第二轮实跑又揪出的两个缺陷（3DS 相关，互相加剧）
+
+第一轮修完误判后重跑，5 张卡的结果是 2 个 `error` + 3 个 `unknown`，**零误废**——
+判废那条修好了。但 3 个 unknown 全部来自同一个根因，而且是我自己写出来的：
+
+1. **一见到 3DS 挑战就 Cancel，不给宽限。** 很多挑战会在几十秒内被发卡行被动放行；
+   立刻关掉等于亲手作废一笔本可成功的付款。opencode 早就是「先给
+   `_THREEDS_CHALLENGE_GRACE_SEC`(30s) 等它自己过，仍在才关并判 failed」，
+   我没对齐。更糟的是关掉后**不返回**，还要空等满 180s 才得出 unknown。
+
+2. **轮询里每 30 秒重载一次余额页，把正在进行的挑战冲掉。** 注释自己就写着
+   「刷新会打断可能正在进行的 3DS 跳转」，却漏了「挑战开着时一次都不能刷」这个条件。
+
+两者叠加的效果是：3DS 挑战在这条链路上**没有任何机会走完**。这很可能就是至今
+一笔成功付款都没有的原因——而不是卡的问题。
+
+修法：引入 `challenge_since` 追踪挑战存续时间，宽限期内不关也不刷页，超时才
+Cancel 并判 `failed`。两条都有回归测试钉住。
+
+### 顺带做掉的短路
+
+14 位 Diners 在 infron 必然报 incomplete，直接在 `_top_up_inner` 开头短路成 `error`，
+省掉每张约 40 秒的弹窗往返。只按**实测过的位数**挡：15 位 Amex 与 16 位 Visa 都能
+拿到真实银行拒付，绝不能一起挡掉（有测试守着）；13 位没样本，不臆测。
+
+残留：短路仍占用一次试卡额度（`max_card_attempts=5`）。要彻底不占，得给协议加
+`supports_card` 之类的钩子让选卡侧提前过滤——那是**改协议契约**，不该塞进本任务。

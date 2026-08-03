@@ -154,3 +154,38 @@ def test_single_account_recharge_applies_the_platform(client):
 
     assert seen.get('platform') == 'infron', \
         f"端点未把 platform 落到 AppState，充值时看到的是 {seen.get('platform')!r}"
+
+
+def test_recharge_clears_stale_stop_flag(client):
+    """新充值必须清掉上一轮残留的 stop_requested，否则一启动就自杀。
+
+    实跑撞到的：上一次任务被停止后 stop_requested 一直是 True（worker 抛
+    InterruptedError 时也会置它），下一次充值在第一个检查点就中断，日志只留
+    「收到停止请求，正在中断」——看起来像用户又点了停止，而不是上一轮的残留。
+    三条流水线入口都成对复位了，只有这个端点漏了。
+    """
+    import time
+
+    c, models = client
+    models['account'].upsert('a@x.com', login_password='pw', identity_status='registered')
+    state = c.application.config['APP_STATE']
+    state.stop_requested = True          # 模拟上一轮停止后的残留
+
+    seen = {}
+
+    def _stub(email, login_password, payment_group_id=None, **kw):
+        seen['stop'] = state.stop_requested
+        return 'failed', 'stubbed'
+
+    state._recharge_one_account = _stub
+
+    r = c.post('/api/accounts/recharge',
+               json={'email': 'a@x.com', 'platform': 'infron', 'payment_group_id': 1})
+    assert r.status_code == 200, r.get_json()
+
+    for _ in range(50):
+        if 'stop' in seen:
+            break
+        time.sleep(0.1)
+
+    assert seen.get('stop') is False, '残留的停止标志没被清掉，本次充值会立刻中断'

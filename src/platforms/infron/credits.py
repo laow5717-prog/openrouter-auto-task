@@ -18,6 +18,8 @@ from src.payments.stripe_checkout import (
     _threeds_challenge_present,
     _threeds_failure_modal,
     _DECLINE_HINTS,
+    _INPUT_INVALID_HINTS,
+    _THREEDS_CHALLENGE_GRACE_SEC,
     fill_payment_element_card,
     select_card_tab,
 )
@@ -266,6 +268,7 @@ def detect_payment_result(session, balance_before, monitor=None, timeout=180, po
     saw_captcha = False
 
     rounds = 0
+    challenge_since = None       # 3DS 挑战首次出现的时刻；None = 当前没有挑战在开着
     while time.time() < deadline:
         time.sleep(poll)
         rounds += 1
@@ -276,8 +279,10 @@ def detect_payment_result(session, balance_before, monitor=None, timeout=180, po
         # 的余额区块是提交前渲染的，不会自己更新。只读同一份 DOM 的话，就算钱真的
         # 到账了也永远读不出变化，最后退化成 unknown ——而 unknown 会让上层换下一张卡
         # 再付一次，那就是**重复扣款**。
-        # 不每轮都刷是因为刷新会打断可能正在进行的 3DS 跳转，所以隔几轮刷一次。
-        if rounds % 5 == 0:
+        # 不每轮都刷是因为刷新会打断可能正在进行的 3DS 跳转，所以隔几轮刷一次；
+        # 且**挑战正开着时一次都不能刷**——重载会直接把挑战弹窗连同那笔待授权的付款
+        # 一起冲掉。此前漏了这个条件，等于每 30 秒亲手掐死一次正在进行的 3DS。
+        if rounds % 5 == 0 and challenge_since is None:
             try:
                 session.get(CREDITS_URL)
                 time.sleep(4)
@@ -292,7 +297,18 @@ def detect_payment_result(session, balance_before, monitor=None, timeout=180, po
         # 拒付提示在 Stripe 的 iframe 内，必须扫全部 frame
         text = (_payment_text(session) or '').lower()
 
-        # 2) 明确拒付
+        # 2) 表单校验没过 —— **必须先于拒付判定**，且归 error（不消耗卡）。
+        #
+        # "Your card number is incomplete." 这类是 Stripe 客户端校验，卡压根没提交给
+        # 银行，说明的是「我们没填对」或「这个卡种该账户没启用」，都不是「卡是坏的」。
+        # 而 _DECLINE_HINTS 里的裸词 "incorrect" / "card number is" 会把它一并吞掉判成
+        # 拒付 —— 实跑中两张好 Diners 就是这么被误废的。
+        bad = next((h for h in _INPUT_INVALID_HINTS if h in text), None)
+        if bad:
+            _step(monitor, session, f'表单校验未通过（未提交给银行）：{bad}')
+            return 'error', f'表单校验未通过：{bad}', None
+
+        # 3) 明确拒付
         hit = next((h for h in _DECLINE_HINTS if h in text), None)
         if hit:
             _step(monitor, session, f'检测到拒付：{hit}')
@@ -309,9 +325,25 @@ def detect_payment_result(session, balance_before, monitor=None, timeout=180, po
             if fr is not None:
                 _close_threeds_modal(fr, session, monitor)
                 return 'failed', f'3DS 认证失败：{msg}' if msg else '3DS 认证失败', None
+            # 3DS 交互挑战 Lightbox：需持卡人在发卡行侧点确认，自动化下无人可点。
+            # 但**不能一见到就关**——很多挑战会在几十秒内自动放行（发卡行的被动认证），
+            # 关掉就等于亲手作废一笔本可成功的付款。语义与 opencode 对齐：先给
+            # _THREEDS_CHALLENGE_GRACE_SEC 宽限等它自己过，仍在才 Cancel 并判 failed。
+            #
+            # 此前是「立刻 Cancel 且不返回」，双重损失：既掐掉了可能成功的付款，
+            # 又白等满整个 timeout 才得出 unknown。实跑 5 张卡有 3 张栽在这里。
             fr = _threeds_challenge_lightbox(session)
             if fr is not None:
-                _close_challenge_lightbox(fr, session, monitor)
+                if challenge_since is None:
+                    challenge_since = time.time()
+                    _step(monitor, session, '检测到 3DS 挑战弹窗，等待其自动放行…')
+                elif time.time() - challenge_since > _THREEDS_CHALLENGE_GRACE_SEC:
+                    _close_challenge_lightbox(fr, session, monitor)
+                    return ('failed',
+                            f'3DS 挑战 {_THREEDS_CHALLENGE_GRACE_SEC}s 内未自动通过'
+                            '（需持卡人验证），已关闭换卡', None)
+            else:
+                challenge_since = None      # 挑战自行消失（放行）→ 复位，交回余额判定
         except Exception:
             pass
 
@@ -357,6 +389,21 @@ def _top_up_inner(session, card, amount, monitor=None, should_stop=None):
     def _fail(detail):
         return {'ok': False, 'outcome': 'error', 'err': detail,
                 'last4': last4, 'steps': steps}
+
+    # 14 位卡（Diners）在 infron 必然走不通：该 Stripe 账户没启用这个卡种，
+    # Payment Element 认不出 BIN，就按 16 位通用规则要求补齐，报
+    # "Your card number is incomplete."。与其花 40 秒开弹窗、填卡、等判定再得到
+    # 同一个结论，不如在这里直接短路——归 error（不消耗卡），语义与走完流程一致。
+    #
+    # 只按**实测过的位数**短路：15 位 Amex 与 16 位 Visa 都能拿到真实银行拒付，
+    # 说明卡种是通的，绝不能一起挡掉。13 位没有样本，故不臆测，让它照常走流程
+    # （真不行也会正确归 error）。
+    digits = ''.join(ch for ch in str(card.get('number', '')) if ch.isdigit())
+    if len(digits) == 14:
+        return {'ok': False, 'outcome': 'error',
+                # 结尾不写「跳过不消耗此卡」——编排层会自己追加这句说明，写了会重复
+                'err': 'infron 未启用该卡种（14 位 Diners）',
+                'last4': last4, 'steps': ['skipped_unsupported_brand']}
 
     balance_before = read_balance(session, monitor)
     steps.append(f'balance_before={balance_before}')

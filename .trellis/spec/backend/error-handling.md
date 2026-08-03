@@ -82,3 +82,31 @@ Questions to answer:
 
 `[Stripe字段错误]` 类的卡则相反——那是卡数据本身填不进表单，换哪个平台都一样，所以
 `get_stripe_field_error_card_numbers()` 刻意**不按平台过滤**。
+
+### 客户端表单校验 ≠ 拒付
+
+Stripe 的这几句是**提交给银行之前**的前端校验，与拒付有本质区别：
+
+```
+Your card number is incomplete.      Your card number is incorrect.
+Your card's security code is incomplete.    Your card's expiration date is incomplete.
+```
+
+成因只有两类，两类都不说明「这张卡是坏的」：
+
+1. 我们没把字段填完整（Stripe 的受控输入会在 DOM 重排时吞字符，
+   见 `_type_and_verify` 的逐字符输入 + 回读校验）；
+2. 该 Stripe 账户没启用这个卡种，位数对不上——实测 14 位 Diners 在 infron 的
+   Payment Element 上就报 incomplete。
+
+所以必须归 `error`（不消耗卡），不能归 `failed`。
+
+⚠️ **`_INPUT_INVALID_HINTS` 必须先于 `_DECLINE_HINTS` 判定。** 后者含裸词
+`incorrect` 与 `card number is`，会把上面这几句一并吞掉判成拒付。infron 实跑中
+两张好 Diners 就是这么被判废的，而判废不可逆。判定顺序有回归测试钉住
+（`tests/test_infron_adapter.py::test_input_validation_is_checked_before_decline`）。
+
+同一个坑的另一面：**拒付文案不要扫全部 frame**。`_DECLINE_HINTS` 里的裸词是按
+hosted Checkout 主文档那个收敛范围挑的；页面上还挂着 hCaptcha 帧、Stripe 控制帧、
+站点自己的 UI，任意一处出现 `expired` 都会被误判。只扫主文档 + 付款表单帧
+（`elements-inner-payment*`）。代价是有时退化成 `unknown`——那是安全的一侧。

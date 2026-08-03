@@ -104,3 +104,26 @@ React 状态渲染，只改 checked 属性不派发事件不生效）。
 
 判定就绪只能以**卡号字段可定位**为准。「弹窗内 iframe ≥ 2 个」只是容器已渲染的
 弱判据，据此返回就绪会把问题掩盖到填写阶段才暴露。
+
+## 跨站点复用时的两处补充（infron.ai 实测，2026-08-04）
+
+**用裸 `name` 选择器，不要依赖 `id`。** 本文开头那张表的 `id` 前缀（`payment-`）
+是**该站点的 element 名字**，换个站点就变。infron 的 Payment Element 上
+`input[id$="-numberInput"]` 命中不了，`input[name='number']` / `expiry` / `cvc`
+稳定命中。地址字段同理：`input[name='postalCode']`。
+
+`name` 是 Stripe 自己的字段契约，跨站点稳定；`id` 由集成方的 element 命名决定。
+候选列表把裸 `name` 排在最前。
+
+**支付方式默认不一定是 Card。** infron 的 tab 顺序是
+`Alipay | Card | Afterpay | US bank account | Cash App Pay | More`，**默认选中 Alipay**，
+不先点 Card 卡号字段根本不渲染。opencode 的 hosted Checkout 用的是 accordion
+（`#payment-method-accordion-item-title-card`），两套定位不通用。
+
+**账单地址按卡的国家动态渲染。** 美国卡只渲染邮编，`line1`/`city`/`line2` 根本不存在。
+把"未命中"当成失败会误判——地址字段的命中与否不该进 ok 判据。
+
+**卡种未启用时报的是 `incomplete` 而不是"不支持"。** Payment Element 认不出该 BIN，
+就按 16 位通用规则要求补齐，于是 14 位 Diners 报 `Your card number is incomplete.`。
+这与"我们没填完"的报错**一字不差**，无法从文案区分——两者都必须归 `error`
+（不消耗卡），理由见 `error-handling.md` 的「客户端表单校验 ≠ 拒付」。
