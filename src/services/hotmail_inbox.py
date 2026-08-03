@@ -15,6 +15,7 @@ import html
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from src.config import cfg
 from src.utils import http_session, extract_verification_code
@@ -172,13 +173,46 @@ def fetch_ruoanzhu_emails(link, use_api=True):
     return parse_ruoanzhu_emails(fetch_ruoanzhu_html(link, use_api=use_api))
 
 
-def extract_github_code_from_emails(emails):
-    """从邮件列表里找 GitHub 验证码。
+# 收信页的时间格式（实测 ruoanzhu：'2026-08-03 05:34:23'，本机本地时区，列表最新在前）。
+_MAIL_TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
-    过滤规则：主题或正文里出现 'github'（大小写不敏感）。GitHub 注册确认邮件
-    主题形如 "Your GitHub launch code"，正文/主题含 8 位数字码。命中后先从主题
-    提码，取不到再从正文提。返回 (code, matched_email) 或 (None, None)。
+# 时间比较的容差（秒）。收信服务的时钟未必与本机严丝合缝，卡得太死会把刚到的新邮件
+# 判成旧邮件而永远收不到码。90 秒足够吸收常见时钟漂移，又远小于「上一次收码」与
+# 「这一次收码」的实际间隔（跨轮次，通常几十分钟以上），不会把旧码放进来。
+_MAIL_TIME_TOLERANCE_SEC = 90
+
+
+def parse_mail_time(value):
+    """把收信页的时间字符串解析成 naive datetime（本地时区）。解析不了返回 None。"""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, _MAIL_TIME_FMT)
+    except ValueError:
+        return None
+
+
+def extract_github_code_from_emails(emails, since=None):
+    """从邮件列表里找 GitHub 验证码，返回 (code, matched_email) 或 (None, None)。
+
+    识别规则：主题或正文含 'github'（大小写不敏感），从中提 8 位码——注册确认邮件主题
+    形如 "Your GitHub launch code"，新设备验证邮件主题形如
+    "[GitHub] Please verify your device"，两者同样是 8 位码。
+
+    since：只认这个时刻之后到达的邮件（带 _MAIL_TIME_TOLERANCE_SEC 容差）。**必须传**，
+    除非确定收件箱是全新的。原因是这些 hotmail 是长期真实邮箱：注册时收过一封 GitHub 码，
+    之后再做新设备验证时那封旧邮件还在收件箱里，不过滤就会取到旧码去填新表单，
+    表现为「收到了验证码但验证不通过」，且每轮都稳定复现。
+
+    命中多封时取**最新的一封**（不是列表里的第一封）——页面通常已按时间倒序，但不该
+    依赖页面顺序。
+
+    时间全都解析不出来时（页面结构变了）会退化为不过滤并打印告警：宁可冒一次取到旧码
+    的风险，也好过因为解析不了时间而永远收不到码。
     """
+    hits = []
+    undated = []
     for em in emails:
         subject = em.get("subject", "") or ""
         body = em.get("body", "") or ""
@@ -186,18 +220,39 @@ def extract_github_code_from_emails(emails):
         if "github" not in blob:
             continue
         code = extract_verification_code(subject) or extract_verification_code(body)
-        if code:
-            return code, em
+        if not code:
+            continue
+        ts = parse_mail_time(em.get("time"))
+        if ts is None:
+            undated.append((code, em))
+        else:
+            hits.append((ts, code, em))
+
+    if since is not None and hits:
+        cutoff = since - timedelta(seconds=_MAIL_TIME_TOLERANCE_SEC)
+        fresh = [h for h in hits if h[0] >= cutoff]
+        if not fresh:
+            return None, None       # 只有旧码，继续等新邮件
+        hits = fresh
+    if hits:
+        hits.sort(key=lambda h: h[0], reverse=True)
+        return hits[0][1], hits[0][2]
+
+    if undated:
+        if since is not None:
+            print("  ⚠️ 邮件时间无法解析（收信页结构可能已变），本次跳过时间过滤")
+        return undated[0]
     return None, None
 
 
-def wait_for_github_launch_code_ruoanzhu(link, timeout=None, poll_interval=None):
-    """轮询 ruoanzhu 收信页，等 GitHub launch code。
+def wait_for_github_launch_code_ruoanzhu(link, timeout=None, poll_interval=None, since=None):
+    """轮询 ruoanzhu 收信页，等 GitHub 验证码（注册 launch code / 新设备验证码通用）。
 
-    与 email.py::wait_for_github_launch_code 同构的 drop-in 替换，签名不同：
-    这里用收信链接而非 mail.tm token，且不做 since_ts 时间过滤——hotmail 是真实
-    长期邮箱，可能有历史邮件。调用方须保证发信前收件箱内没有会误命中的旧 GitHub
-    码（本项目内每个 hotmail 首次注册使用，风险低）；如需更强隔离，后续可加时间过滤。
+    since：naive 本地 datetime，只接受此刻之后到达的邮件。**调用方应在触发发信之前**
+    取这个时刻（例如提交登录表单前），否则新邮件可能早于 since 而被过滤掉。
+
+    不传 since 会退回旧行为——接受收件箱里任意一封 GitHub 码邮件。这些 hotmail 是长期
+    真实邮箱，注册时收过的旧码一直留在收件箱里，所以除非确定是全新邮箱，否则都要传。
 
     返回 str | None。
     """
@@ -206,13 +261,15 @@ def wait_for_github_launch_code_ruoanzhu(link, timeout=None, poll_interval=None)
     if poll_interval is None:
         poll_interval = cfg.email.poll_interval
 
-    print(f"等待 GitHub 验证码邮件（ruoanzhu，最长 {timeout} 秒）...")
+    since_note = f"，只收 {since.strftime(_MAIL_TIME_FMT)} 之后的邮件" if since else "，不做时间过滤"
+    print(f"等待 GitHub 验证码邮件（ruoanzhu，最长 {timeout} 秒{since_note}）...")
     start = time.time()
     while time.time() - start < timeout:
         emails = fetch_ruoanzhu_emails(link) or []
-        code, matched = extract_github_code_from_emails(emails)
+        code, matched = extract_github_code_from_emails(emails, since=since)
         if code:
-            print(f"\n收到 GitHub 验证码: {code}（邮件主题: {matched.get('subject','')[:60]}）")
+            print(f"\n收到 GitHub 验证码: {code}"
+                  f"（{matched.get('time','?')} · {matched.get('subject','')[:50]}）")
             return code
         elapsed = int(time.time() - start)
         print(f"  等待中... ({elapsed}秒, 已解析 {len(emails)} 封)", end="\r")

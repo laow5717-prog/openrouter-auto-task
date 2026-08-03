@@ -55,9 +55,11 @@ def _mask(pw):
 def _import_all(account_model, accounts):
     print(f"导入 {len(accounts)} 个 hotmail 账号到 accounts 表（status='imported'）...")
     for acc in accounts:
-        # login_password 此时未知（GitHub 注册才生成）；email_password 存 hotmail 密码。
+        # login_password 此时未知（GitHub 注册才生成）；email_password 存 hotmail 密码；
+        # email_verify_link 存 ruoanzhu 收信链接，导入时一并落库。
         account_model.upsert(acc.email, login_password=None,
-                             email_password=acc.password, status="imported")
+                             email_password=acc.password, status="imported",
+                             email_verify_link=acc.link)
         print(f"  ✓ {acc.email}  pw={_mask(acc.password)}")
     print("导入完成。")
 

@@ -1,5 +1,50 @@
 # Email Verification Guidelines
 
+## hotmail inboxes are long-lived — always filter by time
+
+The ruoanzhu-backed hotmail accounts are **real, permanent mailboxes**, not
+throwaway mail.tm ones. A GitHub code from an earlier run stays in the inbox
+forever, and both emails that matter look alike to the extractor:
+
+- registration → `Your GitHub launch code`
+- device verification → `[GitHub] Please verify your device`
+
+Both carry an 8-digit code and both contain the word "github". Without a time
+filter, `extract_github_code_from_emails` returns whichever it finds first — in
+practice the stale one. The failure presents as *"we received a code but
+verification failed"*, and it reproduces on every run, which makes it read like a
+selector or form bug rather than a data-freshness one.
+
+Observed 2026-08-03 in `cunninghamh22@hotmail.com`:
+
+```
+2026-08-03 05:34:23  [GitHub] Please verify your device-GitHub    ← previous run
+2026-08-02 18:56:34  这是一封测试账号是否正常的邮件
+```
+
+Rules:
+
+- Pass `since=` to `wait_for_github_launch_code_ruoanzhu`. Capture it **before
+  the action that triggers the send** (before submitting the login form, before
+  submitting the signup form) — taking it afterwards can filter out the very mail
+  you are waiting for.
+- `since` is a **naive local `datetime`**. The page renders
+  `%Y-%m-%d %H:%M:%S` in local time; do not hand it the UTC-aware `since_ts` the
+  mail.tm path uses.
+- When several GitHub mails qualify, the **newest** wins. The page happens to be
+  ordered newest-first, but the extractor sorts by parsed time rather than trust
+  that.
+- `_MAIL_TIME_TOLERANCE_SEC` (90s) absorbs clock skew between the mail service
+  and this machine. It is deliberately far smaller than the gap between two runs,
+  so it never lets a previous run's code back in.
+- If **no** mail has a parseable timestamp, the filter degrades to off with a
+  warning. Risking one stale code beats never finding any code if the page
+  structure changes.
+
+Regression coverage: `tests/test_mail_code_freshness.py`.
+
+---
+
 > mail.tm 收码与 Cloudflare 邮箱验证的约定。踩过的坑都在这里。
 
 ---
