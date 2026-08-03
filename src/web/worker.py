@@ -48,13 +48,20 @@ class AccountRegistry:
 
     def __init__(self, app_state):
         self._lock = threading.Lock()
-        self._claimed = {}                 # email -> worker_id
+        # email -> (worker_id, owner)。owner 是平台 slug，多平台并发时用来区分
+        # 「谁占的」——见 snapshot / release_all 的 owner 参数。
+        self._claimed = {}
         self._app_state = app_state        # 读 open_browsers（用户手动打开的会话）
 
-    def claim(self, email):
+    def claim(self, email, owner=None):
         """尝试独占一个账号。成功返回 True。
 
-        与用户手动打开的浏览器（open_browsers）互斥：那也是同一个 profile 目录。"""
+        与用户手动打开的浏览器（open_browsers）互斥：那也是同一个 profile 目录。
+
+        **排他判定不看 owner**：同一个 email 不能同时在两个平台跑，这是物理约束
+        （Chrome profile 目录按 email 命名，AdsPower 环境也按 email 分配）。
+        owner 只用于登记归属，供 snapshot(owner) / release_all(owner) 过滤。
+        """
         if not email:
             return False
         with self._lock:
@@ -63,7 +70,7 @@ class AccountRegistry:
             if email in self._app_state.open_browsers:
                 return False
             holder = _current_worker.get()
-            self._claimed[email] = holder.worker_id if holder else '-'
+            self._claimed[email] = (holder.worker_id if holder else '-', owner)
             return True
 
     def release(self, email):
@@ -80,27 +87,54 @@ class AccountRegistry:
             return False, "未指定账号"
         with self._lock:
             if email in self._claimed:
-                return False, f"{email} 正在被任务 worker 使用（{self._claimed[email]}），请等待其完成"
+                wid, owner = self._claimed[email]
+                where = f"{owner} 的 {wid}" if owner else wid
+                return False, f"{email} 正在被任务 worker 使用（{where}），请等待其完成"
             if email in self._app_state.open_browsers:
                 return False, f"{email} 已有浏览器打开"
             self._app_state.open_browsers.add(email)
             return True, ""
 
     def is_claimed(self, email):
+        """这个账号被占了吗。**刻意不带 owner**——排他是全局的。"""
         with self._lock:
             return email in self._claimed
 
     def holder_of(self, email):
         with self._lock:
-            return self._claimed.get(email)
+            got = self._claimed.get(email)
+            return got[0] if got else None
 
-    def release_all(self):
+    def owner_of(self, email):
         with self._lock:
-            self._claimed.clear()
+            got = self._claimed.get(email)
+            return got[1] if got else None
 
-    def snapshot(self):
+    def release_all(self, owner=None):
+        """释放占用。owner=None 时全清（进程退出 / 单平台时代的行为）。
+
+        ⚠️ 多平台并发时**必须传 owner**。一个平台跑完就无差别全清，会把另一个平台
+        正在持有的账号一起放掉——它的排他保护瞬间蒸发，两个 worker 会同时用同一个
+        Chrome profile，互删对方的 Singleton 锁导致浏览器随机崩溃。
+        """
         with self._lock:
-            return dict(self._claimed)
+            if owner is None:
+                self._claimed.clear()
+                return
+            for email in [e for e, (_w, o) in self._claimed.items() if o == owner]:
+                del self._claimed[email]
+
+    def snapshot(self, owner=None):
+        """当前占用快照 email -> worker_id。owner 非 None 时只看该平台的。
+
+        ⚠️ 流水线用它判断「本轮还有没有账号在飞」，那个用法**必须传 owner**：
+        registry 是跨平台共享的，不过滤的话 A 平台会把 B 平台正在跑的账号看成
+        自己这轮在飞，于是永远等下去、轮边界永不触发、失败账号永不重试——
+        任务就这么静默地不收敛了，没有任何报错。
+        """
+        with self._lock:
+            return {e: w for e, (w, o) in self._claimed.items()
+                    if owner is None or o == owner}
 
 
 class PaymentCardRegistry:
@@ -159,10 +193,10 @@ class PaymentCardRegistry:
         if not card_number:
             return False
         with self._lock:
-            holder = self._in_flight.get(card_number)
-            if holder is not None and holder != email:
+            got = self._in_flight.get(card_number)
+            if got is not None and got[0] != email:
                 return False
-            self._in_flight[card_number] = email
+            self._in_flight[card_number] = (email, platform)
             self._used.setdefault((platform, card_number), email)
             return True
 
@@ -175,14 +209,29 @@ class PaymentCardRegistry:
         with self._lock:
             return set(self._in_flight)
 
+    def in_flight_owner(self, card_number):
+        with self._lock:
+            got = self._in_flight.get(card_number)
+            return got[1] if got else None
+
     def used_numbers(self, platform):
         """该平台本轮已被某个账号试过的卡号集合。"""
         with self._lock:
             return {num for (plat, num) in self._used if plat == platform}
 
-    def release_all(self, platform=None):
-        """清空占用。platform 为 None 时连同 in-flight 一并全清（任务收尾）；
-        传了平台则只清该平台的本轮归属，in-flight 不动（轮边界）。"""
+    def release_all(self, platform=None, include_in_flight=False):
+        """清空占用。三种用法，语义各不相同：
+
+          release_all()                              进程退出：全清
+          release_all(平台)                          **轮边界**：只清该平台本轮归属，
+                                                     in-flight 不动（还有卡正在刷）
+          release_all(平台, include_in_flight=True)  **该平台任务收尾**：连它的
+                                                     in-flight 一起放开
+
+        ⚠️ 多平台并发时，任务收尾**绝不能**用无参形式。那会连另一个平台正在刷的卡
+        一起从 in-flight 里抹掉，于是同一张卡可能被两个平台同时提交给发卡行——
+        叠加 velocity 风控，比单平台重复刷更容易触发拒付甚至锁卡。
+        """
         with self._lock:
             if platform is None:
                 self._in_flight.clear()
@@ -190,6 +239,9 @@ class PaymentCardRegistry:
                 return
             for key in [k for k in self._used if k[0] == platform]:
                 del self._used[key]
+            if include_in_flight:
+                for num in [n for n, (_e, p) in self._in_flight.items() if p == platform]:
+                    del self._in_flight[num]
 
 
 class ProxyRegistry:
@@ -204,28 +256,38 @@ class ProxyRegistry:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._in_flight = {}               # proxy_key -> worker_id
+        # proxy_key -> (worker_id, owner)。owner 是平台 slug。
+        #
+        # ⚠️ 持有者比对**必须带 owner**。worker_id 只是 'W1'..'W4'，每个平台各有一套，
+        # 两个平台的 W1 是不同的执行体却同名。只比 worker_id 的话，A 平台的 W1 会把
+        # B 平台的 W1 认成自己，于是**同一个出口 IP 被同时发给两个平台**——两个账号同
+        # IP 又被关联，代理就白用了。而且这个错误不报任何异常、不留任何日志。
+        self._in_flight = {}
 
     @staticmethod
     def key_of(proxy):
         """从 proxy dict（含 host/port/username）算唯一 key。"""
         return f"{proxy.get('host')}:{proxy.get('port')}:{proxy.get('username','')}"
 
-    def try_acquire(self, proxy_key, worker_id):
-        """占用一个代理。已被别的 worker 占用则返回 False。"""
+    def try_acquire(self, proxy_key, worker_id, owner=None):
+        """占用一个代理。已被**别的执行体**占用则返回 False。
+
+        执行体的身份是 (owner, worker_id) 这个二元组，不是裸 worker_id——理由见
+        __init__ 里 _in_flight 的注释。
+        """
         if not proxy_key:
             return False
         with self._lock:
             holder = self._in_flight.get(proxy_key)
-            if holder is not None and holder != worker_id:
+            if holder is not None and holder != (worker_id, owner):
                 return False
-            self._in_flight[proxy_key] = worker_id
+            self._in_flight[proxy_key] = (worker_id, owner)
             return True
 
-    def acquire_free(self, candidates, worker_id):
+    def acquire_free(self, candidates, worker_id, owner=None):
         """从候选代理列表领第一个空闲的，返回该 proxy dict；全忙返回 None。"""
         for p in candidates:
-            if self.try_acquire(self.key_of(p), worker_id):
+            if self.try_acquire(self.key_of(p), worker_id, owner):
                 return p
         return None
 
@@ -237,9 +299,22 @@ class ProxyRegistry:
         with self._lock:
             return set(self._in_flight)
 
-    def release_all(self):
+    def holder_of(self, proxy_key):
         with self._lock:
-            self._in_flight.clear()
+            return self._in_flight.get(proxy_key)
+
+    def release_all(self, owner=None):
+        """释放占用。owner=None 时全清（进程退出）。
+
+        ⚠️ 多平台并发时必须传 owner —— 一个平台跑完就全清，会把另一个平台正在用的
+        出口 IP 放回池子，随后被它自己或对方重复领取，反关联失效。
+        """
+        with self._lock:
+            if owner is None:
+                self._in_flight.clear()
+                return
+            for k in [k for k, (_w, o) in self._in_flight.items() if o == owner]:
+                del self._in_flight[k]
 
 
 class WorkerState:

@@ -844,7 +844,10 @@ class AppState:
                 if not usable:
                     return None, None
                 worker = get_current_worker() or self.primary_worker
-                p = self.proxy_registry.acquire_free(usable, worker.worker_id)
+                # owner 必须传：worker_id 只是 'W1'..'W4'，每个平台各有一套同名的，
+                # 不带 owner 会让两个平台的 W1 互相认成自己，同一个出口 IP 被同时发给
+                # 两边——反关联失效，且不报错、不留日志。
+                p = self.proxy_registry.acquire_free(usable, worker.worker_id, owner=self.platform)
                 if p is not None:
                     return _to_pw_proxy(p), self.proxy_registry.key_of(p)
                 p = usable[(account_id or 0) % len(usable)]   # 取模兜底,不排他
@@ -902,14 +905,18 @@ class AppState:
                 for a in _payable_now():
                     if a['email'] in failed_this_round:
                         continue
-                    if self.account_registry.claim(a['email']):
+                    if self.account_registry.claim(a['email'], owner=platform):
                         proxy, pkey = _acquire_proxy_for(a.get('id', 0))
                         return 'item', ('recharge', a, proxy, pkey)
                 for a in _registerable_imported():
-                    if self.account_registry.claim(a['email']):
+                    if self.account_registry.claim(a['email'], owner=platform):
                         proxy, pkey = _acquire_proxy_for(a.get('id', 0))
                         return 'item', ('register', a, proxy, pkey)
-                if self.account_registry.snapshot():
+                # 「本轮还有账号在飞吗」——**必须只看本平台**。registry 是跨平台共享的，
+                # 不过滤的话本平台会把另一个平台正在跑的账号当成自己这轮在飞，于是永远
+                # 走 'wait'、轮边界永不触发、失败账号永不重试、zero_rounds 永不递增——
+                # 任务就这么静默地不收敛了，没有任何报错。
+                if self.account_registry.snapshot(owner=platform):
                     return 'wait', None
                 if not failed_this_round:
                     return 'done', "无可充值账号且无 imported 可注册"
@@ -1046,9 +1053,14 @@ class AppState:
                 w.stop_screenshot_loop()
                 w.current_action = "空闲"
                 w.busy = False
-            self.account_registry.release_all()
-            self.payment_registry.release_all()
-            self.proxy_registry.release_all()
+            # ⚠️ 三个 registry 都是**跨平台共享**的，收尾只能释放自己那份。
+            # 无参形式是全清——一个平台跑完就把另一个平台正在持有的账号、卡、代理
+            # 全部放掉，它的排他保护瞬间蒸发：两个 worker 同用一个 Chrome profile
+            # 互删 Singleton 锁、同一张卡被两边同时提交给发卡行、同一个出口 IP 被
+            # 重复领取。三种后果都不报错。
+            self.account_registry.release_all(owner=self.platform)
+            self.payment_registry.release_all(self.platform, include_in_flight=True)
+            self.proxy_registry.release_all(owner=self.platform)
             self._stop_started_adspower()
             self.parallel_mode = False
             self.is_running = False
@@ -1370,7 +1382,7 @@ class AppState:
                     email = acct['email']
                     if self.stop_requested or not self._eligible_cards(group_id, exclude_used=False):
                         return
-                    if not self.account_registry.claim(email):
+                    if not self.account_registry.claim(email, owner=self.platform):
                         self._hooked_print(f"{email} 正被占用，本轮跳过")
                         return
                     try:
@@ -1422,9 +1434,14 @@ class AppState:
                 w.stop_screenshot_loop()
                 w.current_action = "空闲"
                 w.busy = False
-            self.account_registry.release_all()
-            self.payment_registry.release_all()
-            self.proxy_registry.release_all()
+            # ⚠️ 三个 registry 都是**跨平台共享**的，收尾只能释放自己那份。
+            # 无参形式是全清——一个平台跑完就把另一个平台正在持有的账号、卡、代理
+            # 全部放掉，它的排他保护瞬间蒸发：两个 worker 同用一个 Chrome profile
+            # 互删 Singleton 锁、同一张卡被两边同时提交给发卡行、同一个出口 IP 被
+            # 重复领取。三种后果都不报错。
+            self.account_registry.release_all(owner=self.platform)
+            self.payment_registry.release_all(self.platform, include_in_flight=True)
+            self.proxy_registry.release_all(owner=self.platform)
             self._stop_started_adspower()
             self.parallel_mode = False
             self.is_running = False
