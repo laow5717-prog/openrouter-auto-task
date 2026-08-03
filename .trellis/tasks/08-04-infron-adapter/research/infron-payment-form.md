@@ -111,3 +111,55 @@ infron 另有独立的账单地址页 `/dashboard/user/payments?tab=paymentsSett
 
 若 Stage 3 发现 Element 要求账单地址而弹窗里没有，可能需要**先去那个页面填一次**。
 届时那会变成 `ensure_session` 之后、`top_up` 之前的一次性准备步骤。
+
+
+---
+
+## 实跑补充（2026-08-04，Stage 3/4）
+
+### 卡号字段：Payment Element 用**裸 name 属性**
+
+实测命中的选择器：
+
+```
+number  input[name='number']
+expiry  input[name='expiry']
+cvc     input[name='cvc']
+name    未命中 —— Payment Element 默认不渲染持卡人字段
+```
+
+不是 `#Field-*Input`，也不是 hosted Checkout 的 `#cardNumber` 那套。
+地址字段同理：邮编是 `input[name='postalCode']`。
+
+### 账单地址：美国卡默认只收邮编
+
+`line1` / `city` / `line2` 三个字段**根本不渲染**（Payment Element 对美国卡的默认
+`billingAddressCollection` 只要邮编）。所以它们"未命中"是正常的，不是 bug，
+也因此不进 ok 判据。
+
+### ⚠️ infron 不接受 Amex / Diners
+
+分组 6 里有 83 张 Amex（15 位）与 2 张 Diners（14 位），Luhn 全部合法，opencode 那边
+能拿到真实银行拒付。但在 infron 上，Payment Element 一律报
+**"Your card number is incorrect"** —— 那是**客户端 BIN 校验失败**，不是银行拒付，
+说明 infron 的 Stripe 账户没启用这些卡种。
+
+对照实验：同一批流程换一张 16 位 Visa（****6263），得到的是 `declined`
+——真实银行拒付。**这证明填卡链路本身是对的**，之前那些"格式错误"是卡种问题。
+
+这件事有个好性质：卡种不兼容会被记成**该平台**的判废，opencode 那边照常可用。
+隔离机制恰好把「平台特有的卡兼容性」也正确处理了，不需要额外做什么。
+
+但要注意：infron 上跑 Amex/Diners 会白白消耗试卡次数（每张都必然失败）。
+若后续要优化，可以在 infron 的选卡侧按 BIN 预过滤——**不过那属于优化，不是正确性问题**。
+
+### 拒付检测的扫描范围：只扫主文档 + 付款表单帧
+
+拒付提示渲染在 Payment Element 的 iframe 内，只读主文档看不见，每次拒付都会退化成
+超时 `unknown`。但**也不能扫全部 frame**：`_DECLINE_HINTS` 里有 `expired`、`incorrect`
+这类裸词，是按 opencode hosted Checkout 主文档那个收敛范围挑的；页面上还挂着 hCaptcha
+帧、Stripe 控制帧、infron 自己的 UI，任意一处出现 "expired" 都会被误判成拒付，
+而判废不可逆。
+
+折中：只扫 `elements-inner-payment*` 帧。宁可漏判（退化成 unknown，不消耗卡），
+不可误判。

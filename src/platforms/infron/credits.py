@@ -38,17 +38,28 @@ def _page_text(session):
         return ''
 
 
-def _all_frames_text(session):
-    """主文档 + 所有 frame 的可见文本拼起来。
+# 只扫这些 frame 找拒付提示：主文档 + Stripe 的付款表单帧。
+_DECLINE_SCAN_MARKS = ('elements-inner-payment', 'elements-inner-payment-tab')
 
-    拒付提示是渲染在 **Stripe 的 iframe 内**的（Payment Element 把错误显示在自己的
-    表单里），只读主文档看不见——那会让每一次拒付都退化成超时 `unknown`，
-    上层因此既不判废也不冷却，坏卡下一轮又被选中，白白重复拒付。
+
+def _payment_text(session):
+    """主文档 + **Stripe 付款表单帧**的可见文本。
+
+    为什么要读 frame：拒付提示渲染在 Payment Element 的 iframe 内，只读主文档看不见
+    ——那会让每次拒付都退化成超时 unknown，上层既不判废也不冷却，坏卡下一轮又被选中，
+    白白重复拒付。
+
+    为什么**不能**扫全部 frame：`_DECLINE_HINTS` 里有 `expired` `incorrect` 这类裸词，
+    它们是按 opencode 的 hosted Checkout **主文档**这个收敛的文本范围挑的。页面上还挂着
+    hCaptcha 帧、Stripe 控制帧、infron 自己的 UI，其中任意一处出现 "expired"
+    （比如验证码会话过期提示）都会被误判成拒付——而拒付判废是不可逆的。
+    宁可漏判（退化成 unknown，不消耗卡），不可误判。
     """
     parts = [_page_text(session)]
     try:
         for fr in session.page.frames:
-            if 'chatwoot' in (fr.url or ''):
+            url = fr.url or ''
+            if not any(m in url for m in _DECLINE_SCAN_MARKS):
                 continue
             try:
                 parts.append(fr.evaluate(_TEXT_JS) or '')
@@ -279,7 +290,7 @@ def detect_payment_result(session, balance_before, monitor=None, timeout=180, po
             return 'success', f'余额 {baseline} → {after}', after
 
         # 拒付提示在 Stripe 的 iframe 内，必须扫全部 frame
-        text = (_all_frames_text(session) or '').lower()
+        text = (_payment_text(session) or '').lower()
 
         # 2) 明确拒付
         hit = next((h for h in _DECLINE_HINTS if h in text), None)
