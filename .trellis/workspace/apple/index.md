@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 38
-- **Last Active**: 2026-08-02
+- **Total Sessions**: 39
+- **Last Active**: 2026-08-03
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1354 | Active |
+| `journal-1.md` | ~1379 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 39 | 2026-08-03 | 每日充值任务停止条件修复 + 累积改动归档提交 | `db62285`, `4b0d965`, `08de230`, `3d97218`, `dc0b359` | `main` |
 | 38 | 2026-08-02 | 每日充值:补号收码修复 + 2-worker 并行改造 | `6551ebb`, `e24cda7`, `39cee79` | `main` |
 | 37 | 2026-07-28 | 每日充值假死排查:OAuth 链修复 + 关闭看门狗两段回收 + flagged 自动退出 | `7c77cae`, `0baef21` | `main` |
 | 36 | 2026-07-27 | 诊断充值 hCaptcha 误报根因 + briced35 GitHub 重注册(未成) | - | `main` |

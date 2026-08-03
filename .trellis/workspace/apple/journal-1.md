@@ -1352,3 +1352,28 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Next Steps
 
 - None - task complete
+
+
+## Session 39: 每日充值任务停止条件修复 + 累积改动归档提交
+
+**Date**: 2026-08-03
+**Task**: 每日充值任务停止条件修复 + 累积改动归档提交
+**Branch**: `main`
+
+### Summary
+
+修复每日充值任务提前结束：充值失败的账号原先永久入 done，导致每个账号整任务只有一次机会，所有账号各失败一次后即使卡池还有卡也直接收敛。改为按轮轮转——失败只禁本轮，一轮轮完后清空失败名单与「本轮已试卡」标记从头重试；停止条件收窄为可选卡耗尽 / 连续两轮零进展 / 手动停止，并行下有账号在飞时等待而非退出减员。新增两个回归测试（失败账号下一轮重试充成、永远失败时两轮后收敛）。同时把工作树累积的多 session 改动分 5 个逻辑提交归档：Trellis 框架 0.6.6→0.6.12、hCaptcha 判据修正、hotmail 收码新鲜度、AdsPower 指纹浏览器接入、本次轮转修复。全套 210 测试通过。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `db62285` | (see git log) |
+| `4b0d965` | (see git log) |
+| `08de230` | (see git log) |
+| `3d97218` | (see git log) |
+| `dc0b359` | (see git log) |
+
+### Status
+
+[OK] **Completed**
