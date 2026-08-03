@@ -51,6 +51,19 @@ def _req_platform(required=False):
     return get_app_state().platform
 
 
+@api.route('/api/platforms')
+def list_platforms():
+    """可用平台列表 + 当前选中平台。
+
+    真值源是代码里的适配器注册表，不是数据库——平台随代码发布变化，不是运行时数据。
+    """
+    import src.platforms as platforms
+    return jsonify({
+        "data": platforms.describe_all(),
+        "current": get_app_state().platform,
+    })
+
+
 @api.route('/api/status')
 def get_status():
     """全局状态 + 各 worker 概览。

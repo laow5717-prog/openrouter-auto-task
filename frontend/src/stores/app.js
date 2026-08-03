@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { getStatus, getWorkerLogs } from '../api'
+import { getStatus, getWorkerLogs, getPlatforms, setPlatform } from '../api'
 
 export const useAppStore = defineStore('app', () => {
   const isRunning = ref(false)
@@ -15,6 +15,33 @@ export const useAppStore = defineStore('app', () => {
   // 每个 worker: { id, currentAction, busy, logs, logIndex }
   const workers = ref([])
   const parallelMode = ref(false)
+
+  // 当前平台。账号状态、卡的占用与冷却全部按它隔离，服务端对卡池类接口要求必填。
+  // 这里只管展示与持久化，实际注入请求的是 api/index.js 的 setPlatform——
+  // 让每个调用点自己记得传参数迟早会漏，漏一处就读到错平台的数据。
+  const platforms = ref([])
+  const platform = ref(localStorage.getItem('platform') || 'opencode')
+  setPlatform(platform.value)
+
+  async function loadPlatforms() {
+    try {
+      const data = await getPlatforms()
+      platforms.value = data.data || []
+      // 本地存的平台可能已被删掉（改了代码里的注册表），回落到服务端当前值
+      if (!platforms.value.some((p) => p.slug === platform.value)) {
+        switchPlatform(data.current || platforms.value[0]?.slug || 'opencode')
+      }
+    } catch (e) {
+      console.error('平台列表加载失败:', e)
+    }
+  }
+
+  function switchPlatform(slug) {
+    if (!slug || slug === platform.value) return
+    platform.value = slug
+    localStorage.setItem('platform', slug)
+    setPlatform(slug)
+  }
 
   let pollTimer = null
 
@@ -114,6 +141,7 @@ export const useAppStore = defineStore('app', () => {
   return {
     isRunning, currentAction, successCount, failCount, totalInventory,
     logs, logIndex, workers, parallelMode,
+    platforms, platform, loadPlatforms, switchPlatform,
     startPolling, stopPolling, clearLogs, poll,
   }
 })

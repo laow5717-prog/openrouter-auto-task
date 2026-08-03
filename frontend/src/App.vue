@@ -34,9 +34,26 @@
   <main class="main-view">
     <header class="page-header">
       <h2 class="page-title">{{ pageTitle }}</h2>
-      <div class="status-badge">
-        <span class="status-dot" :class="{ running: store.isRunning }"></span>
-        <span>{{ store.isRunning ? '运行中' : '系统空闲' }}</span>
+      <div class="header-right">
+        <!-- 平台切换：账号状态与卡的占用全部按平台隔离，切了之后各列表看到的是
+             那个平台的视角。任务运行中禁止切换——AppState 是单例，一次只跑一个平台。 -->
+        <label class="platform-picker" :title="store.isRunning ? '任务运行中，无法切换平台' : '切换平台'">
+          <span class="platform-label">平台</span>
+          <select
+            class="platform-select"
+            :value="store.platform"
+            :disabled="store.isRunning"
+            @change="store.switchPlatform($event.target.value)"
+          >
+            <option v-for="p in store.platforms" :key="p.slug" :value="p.slug">
+              {{ p.display_name }}
+            </option>
+          </select>
+        </label>
+        <div class="status-badge">
+          <span class="status-dot" :class="{ running: store.isRunning }"></span>
+          <span>{{ store.isRunning ? '运行中' : '系统空闲' }}</span>
+        </div>
       </div>
     </header>
 
@@ -55,7 +72,10 @@ const route = useRoute()
 const titleMap = { workbench: '每日任务', monitor: '运行监控', cardPool: '卡片管理', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录' }
 const pageTitle = computed(() => titleMap[route.name] || '系统概览')
 
-onMounted(() => store.startPolling())
+onMounted(() => {
+  store.loadPlatforms()
+  store.startPolling()
+})
 onUnmounted(() => store.stopPolling())
 </script>
 
@@ -117,6 +137,32 @@ onUnmounted(() => store.stopPolling())
   margin-bottom: 32px;
 }
 .page-title { font-size: 24px; font-weight: 700; }
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.platform-picker {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px 5px 12px;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 13px;
+}
+.platform-label { color: var(--text-sub); font-weight: 500; }
+.platform-select {
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  outline: none;
+}
+.platform-select:disabled { cursor: not-allowed; opacity: 0.55; }
 .status-badge {
   display: flex;
   align-items: center;

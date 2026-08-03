@@ -52,6 +52,9 @@ async function postBlob(url, body = {}) {
   return res.blob()
 }
 
+// Platforms
+export const getPlatforms = () => get('/api/platforms')
+
 // Status
 export const getStatus = (logIndex = 0) => get('/api/status', { log_index: logIndex })
 export const getWorkerLogs = (workerId, index = 0) =>
