@@ -5,6 +5,15 @@
 点、以及**怎么判断这笔款到底付成没有**。付款表单本身归支付供应商层
 （src.payments.stripe_checkout），身份供给归 src.identity。
 
+## 必需接口与可选能力
+
+`PlatformAdapter` 只声明**每个平台都得有**的东西。可选能力单独拆协议
+（目前是 `SubscribingAdapter`），由 `capabilities` 声明、编排层据此判断走不走。
+
+这条是接第二个平台时才浮出来的：infron 纯充值制、没有订阅，若把 subscribe 声明成
+必需方法，它就无法满足协议——而 capabilities 机制的本意恰恰是让这类能力可选。
+将来再有「只有某些平台才有」的能力，照此办理，别往 PlatformAdapter 里塞。
+
 ## 接口为什么只有 7 个方法
 
 调研时列过一份 12 个方法的候选清单，其中 auth_entry_urls / click_oauth_entry /
@@ -142,6 +151,19 @@ class PlatformAdapter(Protocol):
 
     def top_up(self, session, tenant_id, card, amount=None, monitor=None,
                should_stop=None) -> PaymentResult: ...
+
+
+@runtime_checkable
+class SubscribingAdapter(Protocol):
+    """订阅能力。**可选**——只有 capabilities 含 CAP_SUBSCRIBE 的平台才需要实现。
+
+    单独拆出来而不是塞进 PlatformAdapter，是接第二个平台时发现的：infron 是纯充值制、
+    没有订阅，把 subscribe 声明成必需方法会让它无法满足协议，而 capabilities 这套
+    机制的本意恰恰就是让这类能力可选。两者不能同时成立。
+
+    编排层已经在调用前检查 capabilities（见 AppState._subscribe_one_account），
+    所以这里拆开不需要改编排层。
+    """
 
     def subscribe(self, session, tenant_id, card, monitor=None, should_stop=None,
                   dry: bool = False) -> PaymentResult: ...

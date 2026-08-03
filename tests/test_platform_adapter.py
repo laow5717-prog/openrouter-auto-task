@@ -258,3 +258,48 @@ def stub_free_outcome():
     """参数化用例自行注册 stub，这里只保证收尾干净。"""
     yield
     platforms.unregister(STUB)
+
+
+# ---------- 能力声明与实现必须自洽 ----------
+
+def test_every_registered_adapter_satisfies_the_required_protocol():
+    """所有注册的适配器都必须满足 PlatformAdapter。
+
+    接 infron 时这条真的挂过：协议把 subscribe 与 fetch_apikey 声明成必需方法，
+    而 infron 没有订阅、也拿不到 key 明文，于是 isinstance 返回 False。修法不是在
+    infron 里造假实现，而是把 subscribe 拆成可选的 SubscribingAdapter，
+    fetch_apikey 如实返回 None（契约里 None 就是「抓不到」）。
+    """
+    for slug in platforms.all_slugs():
+        assert isinstance(platforms.get(slug), PlatformAdapter), f"{slug} 不满足 PlatformAdapter"
+
+
+def test_subscribe_capability_matches_implementation():
+    """声明了 CAP_SUBSCRIBE 就必须真的能订阅；没声明就不该被当成能订阅。
+
+    两者脱节的后果是编排层按 capabilities 放行后调到不存在的方法，
+    或者反过来白白跳过一个其实支持订阅的平台。
+    """
+    from src.platforms.base import CAP_SUBSCRIBE, SubscribingAdapter
+    for slug in platforms.all_slugs():
+        a = platforms.get(slug)
+        declared = CAP_SUBSCRIBE in a.capabilities
+        implemented = isinstance(a, SubscribingAdapter)
+        assert declared == implemented, (
+            f"{slug} 声明订阅={declared} 但实现={implemented}")
+
+
+def test_topup_capability_matches_implementation():
+    from src.platforms.base import CAP_TOPUP
+    for slug in platforms.all_slugs():
+        a = platforms.get(slug)
+        if CAP_TOPUP in a.capabilities:
+            assert callable(getattr(a, 'top_up', None)), f"{slug} 声明充值但没有 top_up"
+
+
+def test_infron_is_registered_and_is_topup_only():
+    a = platforms.get('infron')
+    assert a.slug == 'infron'
+    assert sorted(a.capabilities) == ['topup'], 'infron 是纯充值制，不该声明订阅'
+    assert a.extract_tenant_id('https://infron.ai/dashboard') is None, 'infron 无租户 id'
+    assert a.fetch_apikey(None, None) is None, 'key 页脱敏，如实返回 None'

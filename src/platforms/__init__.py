@@ -14,6 +14,7 @@ from src.platforms.base import (  # noqa: F401  （对外统一从这里取）
     PaymentResult,
     PlatformAdapter,
     SessionResult,
+    SubscribingAdapter,
 )
 
 _REGISTRY = {}
@@ -57,7 +58,9 @@ def describe_all():
 def _bootstrap():
     """注册内置平台。放在函数里延迟执行，避免 import 期的循环依赖。"""
     from src.platforms.opencode import OpencodeAdapter
+    from src.platforms.infron import InfronAdapter
     register(OpencodeAdapter())
+    register(InfronAdapter())
 
 
 _bootstrap()
