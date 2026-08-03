@@ -1,5 +1,21 @@
-"""
-账号数据模型
+"""身份数据模型（accounts 表）
+
+本表只装**身份**，不装平台状态：
+  - 邮箱身份：email / email_password / email_verify_link
+  - GitHub 身份：login_password（就是 GitHub 密码）/ identity_status（GitHub 注册
+    与封禁结果：imported / registered / pending / failed / suspended / rejected /
+    flagged 等）
+
+平台侧的状态、余额、API key、租户 id 全部在 platform_accounts（见
+PlatformAccountModel），按 (platform, email) 隔离。同一邮箱在多个平台跑，
+共用本表这一行身份，各自持有一行平台账号。
+
+邮箱与 GitHub 账号当前是严格 1:1（每个 hotmail 邮箱恰好注册一个 GitHub 账号），
+所以两者合在一张表里，没有再拆第三张表。将来若要「一邮箱多 GitHub 账号」，
+只需拆本表，platform_accounts 不受影响。
+
+`status` 旧列仍在表上但不再被读写——保留它是回滚保险：代码回退到多平台改造前的
+版本时，那一列仍是可读的真值。新代码一律用 identity_status。
 """
 
 
@@ -7,8 +23,8 @@ class AccountModel:
     def __init__(self, db):
         self.db = db
 
-    def upsert(self, email, login_password=None, email_password=None, status='registered',
-               email_verify_link=None):
+    def upsert(self, email, login_password=None, email_password=None,
+               identity_status='registered', email_verify_link=None):
         existing = self.db.fetchone(
             "SELECT id, login_password, email_password, email_verify_link FROM accounts WHERE email = ?",
             (email,),
@@ -19,58 +35,35 @@ class AccountModel:
             # 传入非空才覆盖认证链接，否则保留原值（同 login_password 语义）
             final_link = email_verify_link if email_verify_link else existing['email_verify_link']
             self.db.execute(
-                "UPDATE accounts SET login_password=?, email_password=?, status=?, email_verify_link=?, "
-                "updated_at=datetime('now','localtime') WHERE email=?",
-                (final_pw, final_ep, status, final_link, email),
+                "UPDATE accounts SET login_password=?, email_password=?, identity_status=?, "
+                "email_verify_link=?, updated_at=datetime('now','localtime') WHERE email=?",
+                (final_pw, final_ep, identity_status, final_link, email),
             )
         else:
             self.db.execute(
-                "INSERT INTO accounts (email, login_password, email_password, status, email_verify_link) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (email, login_password, email_password, status, email_verify_link),
+                "INSERT INTO accounts (email, login_password, email_password, identity_status, "
+                "email_verify_link) VALUES (?, ?, ?, ?, ?)",
+                (email, login_password, email_password, identity_status, email_verify_link),
             )
 
-    def update_status(self, email, status):
+    def update_identity_status(self, email, identity_status):
         self.db.execute(
-            "UPDATE accounts SET status=?, updated_at=datetime('now','localtime') WHERE email=?",
-            (status, email),
+            "UPDATE accounts SET identity_status=?, updated_at=datetime('now','localtime') "
+            "WHERE email=?",
+            (identity_status, email),
         )
 
     def reset_failed_to_registered(self):
         """一次性修正：把被误标 'failed'（实际可用）的账号批量改回 'registered'。
 
-        'failed' 仅由 GitHub 注册失败分支写入（web/app._subscribe_one_account），充值流程
-        从不写它；这些账号目前实际可用，列表显示"失败"是错误的。返回受影响行数。
-        幂等：无 failed 时返回 0。
+        'failed' 仅由 GitHub 注册失败分支写入，平台流程从不写它；这些账号目前实际
+        可用，列表显示"失败"是错误的。返回受影响行数。幂等：无 failed 时返回 0。
         """
         cur = self.db.execute(
-            "UPDATE accounts SET status='registered', updated_at=datetime('now','localtime') "
-            "WHERE status='failed'"
+            "UPDATE accounts SET identity_status='registered', "
+            "updated_at=datetime('now','localtime') WHERE identity_status='failed'"
         )
         return cur.rowcount
-
-    def update_balance(self, email, balance):
-        """记录该账号最近一次读到的 AI Credits 余额（美元）"""
-        if balance is None:
-            return
-        self.db.execute(
-            "UPDATE accounts SET credits_balance=?, balance_updated_at=datetime('now','localtime'), "
-            "updated_at=datetime('now','localtime') WHERE email=?",
-            (float(balance), email),
-        )
-
-    def update_apikey(self, email, apikey):
-        """记录该账号从 opencode /keys 页抓到的 API key（明文）。
-
-        apikey 为空/None 时直接跳过，避免把抓取失败写成空值覆盖已有 key。
-        """
-        if not apikey:
-            return
-        self.db.execute(
-            "UPDATE accounts SET apikey=?, apikey_updated_at=datetime('now','localtime'), "
-            "updated_at=datetime('now','localtime') WHERE email=?",
-            (apikey, email),
-        )
 
     def backfill_email_verify_link(self, email, link):
         """回填邮箱认证链接（hotmail.xlsx 的 ruoanzhu 收信链接）。
@@ -110,15 +103,16 @@ class AccountModel:
         self.db.execute(f"DELETE FROM accounts WHERE email IN ({placeholders})", emails)
         return len(emails)
 
-    def get_paginated(self, page=1, page_size=20, keyword='', status='', date_from='', date_to=''):
+    def get_paginated(self, page=1, page_size=20, keyword='', identity_status='',
+                      date_from='', date_to=''):
         conditions = []
         params = []
         if keyword:
             conditions.append("email LIKE ?")
             params.append(f"%{keyword}%")
-        if status:
-            conditions.append("status LIKE ?")
-            params.append(f"%{status}%")
+        if identity_status:
+            conditions.append("identity_status = ?")
+            params.append(identity_status)
         if date_from:
             conditions.append("created_at >= ?")
             params.append(date_from)

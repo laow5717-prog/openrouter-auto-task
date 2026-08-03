@@ -72,8 +72,25 @@ def db():
             pass
 
 
-def _account(db, email, status):
-    db.execute("INSERT INTO accounts (email, status) VALUES (?, ?)", (email, status))
+# 平台层状态：这些不写 accounts，要落到 platform_accounts 的对应平台行上
+_PLATFORM_LAYER = ('archived', 'recharged', 'subscribed')
+
+
+def _account(db, email, status, platform='opencode'):
+    """按状态所属的层建账号。
+
+    status 传平台层的值（recharged/archived/subscribed）时，身份层记 'registered'
+    并在 platform_accounts 建一行——这正是真实流水线写出来的形状：能充值成功的账号，
+    GitHub 必然已注册好。传身份层的值则只写 accounts。
+    """
+    if status in _PLATFORM_LAYER:
+        db.execute("INSERT INTO accounts (email, identity_status) VALUES (?, 'registered')",
+                   (email,))
+        db.execute("INSERT INTO platform_accounts (platform, email, status) VALUES (?, ?, ?)",
+                   (platform, email, status))
+    else:
+        db.execute("INSERT INTO accounts (email, identity_status) VALUES (?, ?)",
+                   (email, status))
 
 
 def _pool(db, client, **kw):
@@ -244,6 +261,82 @@ def test_reclaim_without_candidates_raises(db):
     pool.ensure_profile("a@x.com")
     with pytest.raises(AdsPowerQuotaExceeded):
         pool.ensure_profile("b@x.com")
+
+
+def test_reclaim_blocked_while_any_platform_unfinished(db):
+    """多平台：只要还有**任何一个**平台没跑完，环境就不能回收。
+
+    环境是按 email 分配的（GitHub 授权态跨平台共享），所以判据必须是「所有开通过的
+    平台都到终态」。若误判成「有一个平台到终态就能删」，会把另一个平台正在用的
+    浏览器环境删掉，那个账号的 GitHub 登录态随之全丢。
+    """
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1)
+    db.execute("INSERT INTO accounts (email, identity_status) VALUES ('multi@x.com', 'registered')")
+    db.execute("INSERT INTO platform_accounts (platform, email, status) "
+               "VALUES ('opencode', 'multi@x.com', 'recharged')")      # 已跑完
+    db.execute("INSERT INTO platform_accounts (platform, email, status) "
+               "VALUES ('other', 'multi@x.com', '')")                  # 还没跑完
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("multi@x.com")
+    with pytest.raises(AdsPowerQuotaExceeded):
+        pool.ensure_profile("new@x.com")
+    assert client.deleted == [], "还有平台没跑完，环境不该被回收"
+
+
+def test_reclaim_allowed_once_all_platforms_finished(db):
+    """上一条的对照组：所有开通过的平台都到终态后，环境即可回收。"""
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1)
+    db.execute("INSERT INTO accounts (email, identity_status) VALUES ('multi@x.com', 'registered')")
+    db.execute("INSERT INTO platform_accounts (platform, email, status) "
+               "VALUES ('opencode', 'multi@x.com', 'recharged')")
+    db.execute("INSERT INTO platform_accounts (platform, email, status) "
+               "VALUES ('other', 'multi@x.com', 'subscribed')")
+    _account(db, "new@x.com", "registered")
+
+    old_pid, _, _ = pool.ensure_profile("multi@x.com")
+    pool.ensure_profile("new@x.com")
+    assert old_pid in client.deleted
+
+
+def test_registered_account_without_platform_row_is_never_reclaimed(db):
+    """已注册但还没在任何平台开通的账号，环境绝不可回收。
+
+    它的 GitHub 授权态正是下一步登录要用的东西。判据里「至少开通过一个平台」的
+    EXISTS 就是为这条存在——少了它，NOT EXISTS 对这类账号恒为真，会把刚注册好的
+    账号环境全删光。
+    """
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1)
+    _account(db, "ready@x.com", "registered")   # 无 platform_accounts 行
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("ready@x.com")
+    with pytest.raises(AdsPowerQuotaExceeded):
+        pool.ensure_profile("new@x.com")
+    assert client.deleted == []
+
+
+def test_orphan_mapping_is_reclaimed_first(db):
+    """账号已删、映射还在的孤儿环境必须能被回收，且优先级最高。
+
+    此前 reclaim_candidates 用 INNER JOIN accounts，孤儿直接被 JOIN 掉、永远进不了
+    候选集，对应的远端环境无人回收，在只有 12 格的配额里白占一格（生产库实测有一个）。
+    """
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1)
+    _account(db, "ghost@x.com", "registered")
+    _account(db, "new@x.com", "registered")
+
+    old_pid, _, _ = pool.ensure_profile("ghost@x.com")
+    db.execute("DELETE FROM accounts WHERE email='ghost@x.com'")   # 映射成孤儿
+
+    pool.ensure_profile("new@x.com")
+
+    assert old_pid in client.deleted
+    assert db.fetchone("SELECT 1 FROM adspower_profiles WHERE email='ghost@x.com'") is None
 
 
 def test_reclaim_stops_profiles_before_delete(db):

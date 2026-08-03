@@ -12,18 +12,22 @@
 
     <FilterBar>
       <input v-model="filters.keyword" class="filter-input" placeholder="搜索邮箱..." style="width:200px">
-      <select v-model="filters.status" class="filter-select">
-        <option value="">全部状态</option>
+      <select v-model="filters.identity_status" class="filter-select" title="GitHub 注册与封禁结果，跨平台一致">
+        <option value="">全部身份状态</option>
+        <option value="imported">仅导入</option>
         <option value="registered">已注册</option>
-        <option value="bound">已绑卡</option>
-        <option value="billing_page">账单页面</option>
-        <option value="interrupted">已中断</option>
-        <option value="all_bindings_failed">绑卡全部失败</option>
-        <option value="banned">已封禁</option>
+        <option value="pending">待处理</option>
+        <option value="failed">注册失败</option>
+        <option value="suspended">已挂起</option>
+        <option value="rejected">已拒绝</option>
         <option value="flagged">GitHub受限</option>
+        <option value="banned">已封禁</option>
+      </select>
+      <select v-model="filters.platform_status" class="filter-select" title="该账号在当前平台的状态">
+        <option value="">全部平台状态</option>
+        <option value="recharged">已充值</option>
+        <option value="subscribed">已订阅</option>
         <option value="archived">已归档</option>
-        <option value="failed">失败</option>
-        <option value="error">错误</option>
       </select>
       <div class="filter-sep"></div>
       <input type="date" v-model="filters.date_from" class="filter-date" title="开始日期">
@@ -44,7 +48,8 @@
             <th>邮箱账号</th>
             <th>GitHub密码</th>
             <th>邮箱密码 <a href="https://mail.tm" target="_blank" style="font-weight:normal;font-size:11px;color:var(--primary)">(mail.tm)</a></th>
-            <th style="white-space:nowrap">状态</th>
+            <th style="white-space:nowrap">身份状态</th>
+            <th style="white-space:nowrap">平台状态</th>
             <th style="white-space:nowrap">绑定卡片</th>
             <th style="white-space:nowrap">Credits 余额</th>
             <th style="white-space:nowrap">API Key</th>
@@ -55,10 +60,10 @@
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="11" class="table-loading">加载中...</td>
+            <td colspan="12" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="accounts.length === 0">
-            <td colspan="11" class="table-empty">暂无数据</td>
+            <td colspan="12" class="table-empty">暂无数据</td>
           </tr>
           <tr v-for="acc in accounts" :key="acc.email">
             <td><input type="checkbox" :checked="selected.has(acc.email)" @change="toggleSelect(acc.email, $event.target.checked)"></td>
@@ -66,7 +71,15 @@
             <td style="font-family:monospace">{{ acc.password }}</td>
             <td style="font-family:monospace">{{ acc.email_password || '-' }}</td>
             <td>
-              <span class="status-tag" :class="accStatusClass(acc.status)">{{ accStatusLabel(acc.status) }}</span>
+              <span class="status-tag" :class="accStatusClass(acc.identity_status)">
+                {{ accStatusLabel(acc.identity_status) }}
+              </span>
+            </td>
+            <td>
+              <span v-if="acc.platform_status" class="status-tag"
+                    :class="accStatusClass(acc.platform_status)"
+                    :title="`平台 ${acc.platform}`">{{ accStatusLabel(acc.platform_status) }}</span>
+              <span v-else style="color:var(--text-sub)" title="尚未在该平台开通">-</span>
             </td>
             <td>
               <span v-if="acc.card_count > 0" class="card-count-badge" @click="showCards(acc.email)">
@@ -234,7 +247,7 @@ const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
 const loading = ref(false)
-const filters = reactive({ keyword: '', status: '', date_from: '', date_to: '' })
+const filters = reactive({ keyword: '', identity_status: '', platform_status: '', date_from: '', date_to: '' })
 const selected = reactive(new Set())
 
 // 充值状态
@@ -261,30 +274,32 @@ const allChecked = computed(() => {
   return accounts.value.every(a => selected.has(a.email))
 })
 
+// 身份层（GitHub 注册与封禁结果，跨平台一致）与平台层（该账号在某平台的业务状态）
+// 共用这张映射表——两层的取值集合不重叠，不会撞。
 const statusMap = {
+  // 身份层
+  imported: '仅导入',
   registered: '已注册',
-  bound: '已绑卡',
-  failed: '失败',
-  error: '错误',
-  interrupted: '已中断',
-  billing_page: '账单页面',
-  all_bindings_failed: '绑卡全部失败',
-  banned: '已封禁',
-  flagged: 'GitHub受限',       // GitHub 反滥用 flag，无法授权第三方 OAuth，每日任务不再轮转
-  archived: '已归档',          // 余额≥阈值，每日充值跳过
+  pending: '待处理',
+  failed: '注册失败',
   suspended: '已挂起',
+  rejected: '已拒绝',
+  flagged: 'GitHub受限',       // GitHub 反滥用 flag，无法授权第三方 OAuth，所有平台通吃
+  banned: '已封禁',
+  // 平台层
+  archived: '已归档',          // 余额≥阈值，该平台的充值跳过
   subscribed: '已订阅',
   recharged: '已充值',
 }
 function accStatusLabel(s) {
-  return statusMap[s] || s
+  return statusMap[s] || s || '-'
 }
 function accStatusClass(s) {
-  if (s === 'banned' || s === 'flagged' || s === 'suspended') return 'fail'
-  if (s.includes('bound') || s === 'registered') return 'success'
+  if (s === 'banned' || s === 'flagged' || s === 'suspended' || s === 'rejected') return 'fail'
+  if (s === 'registered') return 'success'
   if (s === 'subscribed' || s === 'recharged') return 'success'
-  if (s.includes('failed') || s === 'error') return 'fail'
-  if (s === 'interrupted' || s === 'billing_page' || s === 'archived') return 'warn'
+  if (s === 'failed') return 'fail'
+  if (s === 'archived' || s === 'pending' || s === 'imported') return 'warn'
   return ''
 }
 
@@ -293,7 +308,8 @@ async function loadData() {
   try {
     const params = { page: page.value, page_size: pageSize.value }
     if (filters.keyword) params.keyword = filters.keyword
-    if (filters.status) params.status = filters.status
+    if (filters.identity_status) params.identity_status = filters.identity_status
+    if (filters.platform_status) params.platform_status = filters.platform_status
     if (filters.date_from) params.date_from = filters.date_from
     if (filters.date_to) params.date_to = filters.date_to
 
@@ -309,7 +325,8 @@ async function loadData() {
 
 function resetFilter() {
   filters.keyword = ''
-  filters.status = ''
+  filters.identity_status = ''
+  filters.platform_status = ''
   filters.date_from = ''
   filters.date_to = ''
   page.value = 1
@@ -401,7 +418,7 @@ async function handleExport(mode) {
     body.emails = Array.from(selected)
   } else {
     body.keyword = filters.keyword
-    body.status = filters.status
+    body.identity_status = filters.identity_status
     body.date_from = filters.date_from
     body.date_to = filters.date_to
   }

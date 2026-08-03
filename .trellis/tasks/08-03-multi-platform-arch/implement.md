@@ -9,13 +9,49 @@
 → 210 passed, 1 skipped, 1 warning in 34.38s
 ```
 
-那条 warning 是 `BrowserSession._force_kill` 的 teardown 竞态（`src/browser/driver.py:298` 读 `_close_finished` 时属性尚未建立），与本次改造无关，但清理 driver.py 时顺手修掉。
-
 **每个步骤结束时都要跑这条命令，通过数只能升不能降。**
+
+生产库迁移前的行数基线（AC8 比对用）：
+
+| 表 | 行数 |
+|---|---|
+| accounts | 36 |
+| card_pool | 2054 |
+| valid_cards | 17 |
+| recharge_logs | 1935 |
+| card_bindings | 0 |
+| card_payment_state | 38 |
+| adspower_profiles | 9 |
+| proxies | 100 |
+| card_groups | 4 |
+| invoice_payment_state | 0（证实是死表） |
+
+⚠️ **备份不能用 `cp`**。库开着 WAL，实测有 4MB 未合并；裸拷 `.db` 拿到的是过期快照（当时给出 accounts 39 / recharge_logs 1737，与真实的 36 / 1935 不符）。必须走 SQLite 备份 API：
+
+```python
+src = sqlite3.connect('data/openrouter_auto.db')
+dst = sqlite3.connect('data/openrouter_auto.db.bak-<日期>-<标签>')
+src.backup(dst)
+```
+
+Stage 1 在库副本上验证迁移时同样适用。
 
 ---
 
-## Stage 0 — 前置清理（独立 commit，可单独 revert）
+## Stage 0 — 前置清理 ✅ 已完成（commit `dead94d`，分支 `feat/multi-platform-arch`）
+
+实测结果：driver.py 6157 → 1009 行；pytest **211 passed，0 skipped，0 warning**；V13 在生产库副本上跑两遍幂等、九张表行数与基线逐一相符；前端构建通过；`git revert` 后恰好回到 210 passed + 1 skipped 的基线（AC16 ✅、AC17 ✅）。
+
+### 与原计划的五处偏差（后续阶段需知悉）
+
+1. **0.5 的判断是错的**。`_close_finished` 在 `BrowserSession.__init__` 里本来就初始化了，问题出在 `tests/test_close_watchdog.py` 的 `_make_session` 用 `__new__` 绕过 `__init__` 却漏设该属性。后果比一个 warning 严重：看门狗线程每次都在读它时抛 AttributeError 而提前夭折，「close 持续阻塞就强杀 node driver」这条二段回收路径**从未被真正执行过**，测试却一直是绿的。已补齐夹具属性并新增 `test_watchdog_kills_node_driver_when_close_stays_blocked` 钉住该路径。
+2. **删掉了整个 `tests/test_bind_retry.py`**（计划里只说删其中一个测试桩）。该模块在第 16 行整体 `pytest.skip`，测的全是本次删除的 Cloudflare 编排存根。留一个引用已删代码的跳过模块只会误导人。
+3. **顺带删了裁剪后失效的导入与常量**：`logging`、`timezone`、`captcha_solver`、`get_mail_token`、`wait_for_login_code`、`US_STATE_ABBR`、`ERROR_PAGE_MAX_RETRIES`、`BUTTON_CLICK_MAX_RETRIES`。
+4. **保留了三个「死但通用」的函数**：`type_slowly`、`inject_network_interceptor`、`collect_intercepted_responses`（driver.py:944-1012）。它们零调用，但位于 R6.1 划定的删除区间之外，且是适配器可能用到的通用网络拦截能力。Stage 2 若确认用不上，届时再删。
+5. `accounts` 的 `bound_card_count` / `cards_checked_at` 两列按计划**保留未删**，只删了代码路径（DROP COLUMN 不可逆）。
+
+<details>
+<summary>原始步骤清单</summary>
 
 目标：把 driver.py 从 6157 行降到约 1000 行，删掉会干扰 schema 迁移的死表死函数。**本阶段不引入任何新行为**。
 
@@ -65,6 +101,8 @@ grep -rn 'invoice_payment_state' src/ tests/  # 应无输出
 **Review Gate G0**：确认删除清单里每一项都有 grep 零调用证据；确认 `git revert <commit>` 后测试仍全绿。
 
 **Rollback**：`git revert` 本 commit。数据库侧只多了一个 V13（DROP 死表），revert 代码后 `user_version=13` 高于代码的 12，`_migrate` 的 `if current >= target: return` 会直接跳过，不会报错。
+
+</details>
 
 ---
 

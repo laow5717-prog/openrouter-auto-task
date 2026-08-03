@@ -109,7 +109,7 @@ def main():
 def _mark_status(email, status):
     db = Database()
     try:
-        AccountModel(db).update_status(email, status)
+        AccountModel(db).update_identity_status(email, status)
     except Exception as e:
         print(f"  ⚠️ 更新账号状态失败(忽略): {str(e)[:80]}")
     finally:

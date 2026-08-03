@@ -66,7 +66,8 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      should_stop=None, card_binding_model=None, card_state_model=None,
                      payment_registry=None, captcha_api_key=None,
                      captcha_server="api.multibot.cloud", proxy=None,
-                     browser_factory=None, verify_link=None):
+                     browser_factory=None, verify_link=None,
+                     platform='opencode', platform_account_model=None):
     """登录 opencode 账号并在 zen 控制台 Stripe Checkout 充值（美元，$20 credits）。
 
     编排：create_driver_vanilla(profile_id=email)（原生 Playwright 栈，hCaptcha token 注入
@@ -87,9 +88,14 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      邮箱验证用它自动收码回填；不传则退回等人工。指纹浏览器下每个账号
                      都是全新环境，新设备验证几乎必然触发，缺它会让流水线停下来等人。
 
+    platform / platform_account_model: 目标平台 slug 与平台账号模型。归档、充值成功、
+                     余额落库都写到 platform_accounts 的 (platform, email) 那一行，
+                     所以同一邮箱在别的平台的进度不受影响。GitHub 被 flag 是例外——
+                     那是身份层的封禁，写 accounts.identity_status，对所有平台生效。
+
     返回契约: (ok, err, responses, card_last4, outcome)，
     outcome ∈ {"topup"(成功), "failed", "archived"(余额≥阈值已归档、未扣款),
-               "flagged"(GitHub 账号被 flag 无法授权 OAuth，已标 status='flagged')}。
+               "flagged"(GitHub 账号被 flag 无法授权 OAuth，已标身份层 flagged)}。
 
     卡消耗与逐卡记账集中在本函数：成功→card_pool 标 paid + valid_card + recharge_logs
     success；明确拒付→card_pool 标 invalid + recharge_logs failed（带原因）。调用方无需
@@ -162,7 +168,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                 # flagged 处理一致）：标记后由上层退出每日轮转，不再每轮空开浏览器。
                 if account_model:
                     try:
-                        account_model.update_status(email, "flagged")
+                        account_model.update_identity_status(email, "flagged")
                     except Exception:
                         pass
                 return (False, f"opencode 未登录：{detail}", responses, last4, "flagged")
@@ -175,10 +181,11 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
         except Exception:
             cur_bal = None
         if cur_bal is not None and cur_bal >= skip_balance:
-            if account_model:
+            if platform_account_model:
                 try:
-                    account_model.update_status(email, "archived")
-                    account_model.update_balance(email, cur_bal)
+                    platform_account_model.update_status(platform, email, "archived")
+                    platform_account_model.update_balance(platform, email, cur_bal)
+                    platform_account_model.update_tenant_id(platform, email, wid)
                 except Exception:
                     pass
             if monitor_callback:
@@ -236,13 +243,15 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                             valid_card_model.record(card, source_type="payment", source_email=email)
                         except Exception:
                             pass
-                    if account_model:
+                    if platform_account_model:
                         try:
-                            account_model.update_status(email, "recharged")
+                            platform_account_model.update_status(platform, email, "recharged")
                             # 充值到账后把新余额写回 DB（result.balance_after 来自
                             # detect_payment_result 读到的 Current Balance）。此前只更状态不更余额，
                             # 导致列表页余额一直是旧值。None 时 update_balance 内部会安全跳过。
-                            account_model.update_balance(email, result.get("balance_after"))
+                            platform_account_model.update_balance(
+                                platform, email, result.get("balance_after"))
+                            platform_account_model.update_tenant_id(platform, email, wid)
                         except Exception:
                             pass
                     _log_card_attempt(card, True, "", result)

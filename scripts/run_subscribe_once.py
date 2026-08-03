@@ -24,6 +24,7 @@ from src.models.card_pool import CardPoolModel
 from src.models.recharge_log import RechargeLogModel
 from src.models.valid_card import ValidCardModel
 from src.models.account import AccountModel
+from src.models.platform_account import PlatformAccountModel
 
 _DUMP_JS = r"""
 () => {
@@ -56,6 +57,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--email", required=True)
     ap.add_argument("--group", type=int, default=1, help="支付卡池分组 id")
+    ap.add_argument("--platform", default="opencode", help="目标平台 slug")
     ap.add_argument("--max", type=int, default=5, help="最多尝试卡数（防风控）")
     ap.add_argument("--captcha-key", default=os.environ.get("TWOCAPTCHA_API_KEY", "") or cfg.captcha.api_key,
                     help="2captcha API key（默认取环境变量 TWOCAPTCHA_API_KEY 或 config）")
@@ -78,6 +80,7 @@ def main():
     recharge_log = RechargeLogModel(db)
     valid_card = ValidCardModel(db)
     account = AccountModel(db)
+    platform_account = PlatformAccountModel(db)
 
     usable, _ = card_pool.get_usable_cards_as_list(args.group)
     if not usable:
@@ -116,7 +119,7 @@ def main():
             if outcome == "success":
                 card_pool.mark_status_by_number(num, "paid")
                 valid_card.record(card, source_type="payment", source_email=args.email)
-                account.update_status(args.email, "subscribed")
+                platform_account.update_status(args.platform, args.email, "subscribed")
                 recharge_log.mark_success(log_id, api_response={"result": res})
                 print(f"  ✅ 订阅成功（卡 ****{last4} 标 paid，账号标 subscribed）")
                 _dump_go(session, wid, "success")

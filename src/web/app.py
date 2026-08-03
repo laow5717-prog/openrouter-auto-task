@@ -15,6 +15,7 @@ from flask import Flask, send_from_directory, Response
 from src.config import cfg, get_base_dir, get_data_dir
 from src.models.database import Database
 from src.models.account import AccountModel
+from src.models.platform_account import PlatformAccountModel
 from src.models.task import TaskModel
 from src.models.card_binding import CardBindingModel
 from src.models.recharge_log import RechargeLogModel
@@ -25,6 +26,7 @@ from src.models.card_payment_state import CardPaymentStateModel
 from src.models.proxy import ProxyModel
 from src.models.adspower_profile import AdsPowerProfileModel
 from src.services.adspower import AdsPowerError
+from src.utils import is_identity_terminal, is_platform_terminal
 from src.services import registration, card as card_service
 from src.api.routes import api
 from src.web.worker import (
@@ -64,9 +66,17 @@ class AppState:
 
     PRIMARY_WORKER_ID = 'W1'
 
+    DEFAULT_PLATFORM = 'opencode'
+
     def __init__(self, db, models):
         self.db = db
         self.models = models
+
+        # 当前流水线的目标平台。本次改造只支持「一次跑一个平台」——AppState 是
+        # 单例，is_running / 计数器 / 三个内存注册表都是全局的，两个平台同时跑
+        # 会互相清对方的占用。启动流水线时由入口显式设置，跑完不重置（列表页等
+        # 读接口沿用它作为默认平台）。
+        self.platform = self.DEFAULT_PLATFORM
 
         self.is_running = False
         self.stop_requested = False
@@ -589,6 +599,8 @@ class AppState:
                 proxy=proxy,
                 browser_factory=self.browser_factory(),
                 verify_link=verify_link,
+                platform=self.platform,
+                platform_account_model=models['platform_account'],
             )
 
             if outcome == "topup":
@@ -603,8 +615,8 @@ class AppState:
                 return "archived", err or 'archived'
 
             if outcome == "flagged":
-                # GitHub 被 flag 无法授权 OAuth：账号级终态（registration 已标
-                # status='flagged'），同 archived 语义退出后续轮转
+                # GitHub 被 flag 无法授权 OAuth：身份层终态（registration 已标
+                # identity_status='flagged'，对所有平台生效），同 archived 语义退出轮转
                 self.set_action(worker, f"{email} GitHub 被 flagged，退出轮转")
                 self.add_log(f"{email} GitHub 账号被 flagged，已标记并退出每日轮转（{err}）")
                 return "flagged", err or 'flagged'
@@ -620,9 +632,12 @@ class AppState:
             self.add_log(f"充值异常: {e}")
             return "failed", str(e)
 
-    def run_daily_pipeline(self, group_id, login_password=None, captcha_api_key=None,
+    def run_daily_pipeline(self, platform, group_id, login_password=None, captcha_api_key=None,
                            captcha_server="api.multibot.cloud"):
         """每日充值任务：卡池驱动的账号轮转充值，串行跑在单个后台线程。
+
+        platform 是目标平台 slug。账号状态、卡的占用与冷却全部按它隔离——同一邮箱、
+        同一张卡在别的平台上的记录不影响本次运行。一次只能跑一个平台（AppState 单例）。
 
         选定一个卡池分组，用账号列表逐账号轮转充值：一个账号在其会话内充成 1 张卡后即轮转
         到下一个账号。**以刷完卡池为第一标准**：只要分组还有可选卡且还有账号可用就继续跑；
@@ -640,9 +655,10 @@ class AppState:
         账号、计数与收尾。
 
         captcha_api_key/captcha_server 透传给充值流程用于自动解 hCaptcha（server 默认 Multibot）。
-        账号选取排除 banned、archived、flagged 与 recharged（充值成功过的不再重复充值）；
-        登录后实时余额 ≥$20 的账号会被归档（status='archived'）并退出后续轮转；GitHub 被 flag
-        无法授权 OAuth 的账号会被标 flagged 并退出轮转（与订阅管线一致）。
+        账号选取排除身份层终态（banned/suspended/rejected/flagged）与本平台的平台层终态
+        （archived/recharged/subscribed，见 utils 里的两组终态常量）；登录后实时余额 ≥$20
+        的账号会在本平台被归档并退出后续轮转；GitHub 被 flag 无法授权 OAuth 的账号会被标
+        身份层 flagged——那是 GitHub 侧的封禁，对所有平台一致。
 
         账号耗尽自动补号：当某轮无可充值账号时，从 imported 账号（hotmail.xlsx 有收码数据）
         取一个自动注册（复用 _register_one_account，全自动碰 Arkose 跳过），注册成功者
@@ -659,7 +675,9 @@ class AppState:
 
         self._patch_prints()
 
+        self.platform = platform
         account_model = self.models['account']
+        platform_account_model = self.models['platform_account']
 
         # 结果计数（收尾摘要用）。self.success_count/fail_count 另供前端进度条。
         stats = {'paid': 0, 'fail': 0, 'archived': 0, 'flagged': 0, 'registered': 0}
@@ -679,22 +697,27 @@ class AppState:
             self._hooked_print("每日充值任务开始（卡池驱动 + 账号轮转）")
             self._hooked_print(f"{'#' * 50}")
 
-            # 可充值账号（实时快照）：有登录密码且状态非终态。排除 recharged——充值成功过的
-            # 账号不再进入轮转（避免重复充值/空开浏览器）；排除 done——本次运行已终结的账号。
+            # 可充值账号（实时快照）：有登录密码，且身份层与本平台状态都非终态。
+            # 平台层排除 recharged/archived——本平台已充值过的账号不再进入轮转
+            # （避免重复充值/空开浏览器），但这不影响它在别的平台被选中。
+            # 排除 done——本次运行已终结的账号。
             def _payable_now():
+                platform_status = platform_account_model.map_by_email(platform)
                 return [
                     a for a in account_model.get_all(order_desc=False)
                     if (login_password or a.get('login_password'))
-                    and (a.get('status') or '') not in
-                        ('banned', 'archived', 'flagged', 'recharged')
+                    and not is_identity_terminal(a.get('identity_status'))
+                    and not is_platform_terminal(
+                        (platform_status.get(a['email']) or {}).get('status'))
                     and a['email'] not in done
                 ]
 
             # 待注册 imported 账号（有收码数据：DB 自带 link 或 xlsx 命中；未在 done）。
+            # 'imported' 是身份层状态——GitHub 都还没注册，与平台无关。
             def _registerable_imported():
                 return [
                     a for a in account_model.get_all(order_desc=False)
-                    if (a.get('status') or '') == 'imported'
+                    if (a.get('identity_status') or '') == 'imported'
                     and a['email'] not in done
                     and self._hotmail_for_account(a)
                 ]
@@ -984,9 +1007,11 @@ class AppState:
         """未注册账号跑一次 GitHub 全自动注册（Patchright，碰 Arkose 自动跳过不等人工）。
 
         返回 (result, detail)，result ∈ {"registered","skipped","failed"}：
-          registered — signup_complete：status='registered' 并存 login_password（可转订阅/充值）
-          skipped    — 无 hotmail 数据 / 碰 Arkose（status='pending'）/ 注册即挂起（status='suspended'）
-          failed     — 其它注册未完成（status='failed'）
+          registered — signup_complete：identity_status='registered' 并存 GitHub 密码
+          skipped    — 无 hotmail 数据 / 碰 Arkose（identity_status='pending'）/ 注册即挂起（'suspended'）
+          failed     — 其它注册未完成（identity_status='failed'）
+
+        写的全是**身份层**状态：GitHub 注册结果对所有平台一致，与目标平台无关。
 
         供订阅任务（_subscribe_one_account）与充值任务（run_daily_pipeline 补号）共用，
         保证两条流水线注册行为一致。跑在 worker 线程；account 排他由外层 claim 保证。
@@ -1012,18 +1037,20 @@ class AppState:
                        browser_factory=self.browser_factory())
         oc = r.get('outcome')
         if oc == 'reached_captcha':
-            models['account'].update_status(email, 'pending')
+            models['account'].update_identity_status(email, 'pending')
             return "skipped", "碰 Arkose，跳过（全自动模式不等人工）"
         if oc == 'account_suspended':
             models['account'].upsert(email, login_password=r.get('github_password'),
-                                     email_password=hacc.password, status='suspended',
+                                     email_password=hacc.password,
+                                     identity_status='suspended',
                                      email_verify_link=hacc.link)
             return "skipped", "注册即挂起"
         if oc != 'signup_complete':
-            models['account'].update_status(email, 'failed')
+            models['account'].update_identity_status(email, 'failed')
             return "failed", f"注册失败: {oc}"
         models['account'].upsert(email, login_password=r.get('github_password'),
-                                 email_password=hacc.password, status='registered',
+                                 email_password=hacc.password,
+                                 identity_status='registered',
                                  email_verify_link=hacc.link)
         self.add_log(f"{email} GitHub 注册成功")
         return "registered", "GitHub 注册成功"
@@ -1044,11 +1071,18 @@ class AppState:
 
         models = self.models
         worker = worker or self.primary_worker
+        platform = self.platform
         email = acct['email']
-        status = (acct.get('status') or '')
+        identity_status = (acct.get('identity_status') or '')
 
-        # --- A. 注册分支：未注册（非 registered/subscribed）先跑 GitHub 注册（复用共享函数）---
-        if status not in ('registered', 'subscribed'):
+        # --- A. 注册分支：GitHub 还没注册好就先注册（复用共享函数）---
+        # 判据是身份层的 identity_status，不看平台状态——账号在别的平台已订阅，
+        # 不代表它在本平台不用跑；反过来 GitHub 没注册好，哪个平台都跑不了。
+        #
+        # 顺带修掉一个旧缺陷：原判据是 status not in ('registered','subscribed')，
+        # 于是充值管线标成 'recharged' 的账号（GitHub 明明注册好了）会被当成未注册，
+        # 又跑一遍 GitHub 注册。状态分层后这类账号 identity_status 就是 'registered'。
+        if identity_status != 'registered':
             rr, rdetail = self._register_one_account(acct, worker, proxy=proxy)
             if rr != "registered":
                 return rr, rdetail
@@ -1071,8 +1105,9 @@ class AppState:
             lg = login_and_open_own_go(session)
             if not lg.get('ok'):
                 if lg.get('flagged'):
-                    # 新注册账号被 GitHub flag，无法授权 opencode OAuth → 标 flagged 永久跳过
-                    models['account'].update_status(email, 'flagged')
+                    # 被 GitHub flag，无法授权任何第三方 OAuth → 标**身份层** flagged。
+                    # 这是 GitHub 侧的封禁，对所有平台一致，不是本平台的状态。
+                    models['account'].update_identity_status(email, 'flagged')
                     self.set_action(worker, f"{email} GitHub 被 flagged，跳过")
                     return "skipped", "GitHub 账号被 flagged，无法授权"
                 self.set_action(worker, f"{email} 登录失败: {lg.get('detail','')[:60]}")
@@ -1101,7 +1136,8 @@ class AppState:
                         models['valid_card'].record(card, source_type='payment', source_email=email)
                     except Exception:
                         pass
-                    models['account'].update_status(email, 'subscribed')
+                    models['platform_account'].update_status(platform, email, 'subscribed')
+                    models['platform_account'].update_tenant_id(platform, email, wid)
                     models['recharge_log'].mark_success(log_id, api_response={"result": res})
                     self.add_log(f"{email} ✅ 订阅成功（卡 ****{last4}）")
                     return "subscribed", f"****{last4}"
@@ -1138,14 +1174,16 @@ class AppState:
             worker.clear_active_driver()
             close_driver(session)
 
-    def run_daily_subscribe_pipeline(self, group_id, captcha_api_key=None,
+    def run_daily_subscribe_pipeline(self, platform, group_id, captcha_api_key=None,
                                      captcha_server="api.multibot.cloud"):
         """每日订阅任务：账号轮转——未注册先注册、已注册登录订阅，成功即换下一个账号。
 
+        platform 是目标平台 slug，语义同 run_daily_pipeline：账号状态与卡的占用按它隔离。
+
         captcha_server: hCaptcha 求解服务，默认 Multibot（api.multibot.cloud）；可传 2captcha.com。
 
-        镜像 run_daily_pipeline 的串行轮转/停止/兜底骨架，但：待订阅账号集 = status∉(subscribed,banned)；
-        单账号动作 = _subscribe_one_account；订阅成功的账号从后续轮次剔除。
+        镜像 run_daily_pipeline 的串行轮转/停止/兜底骨架，但：待订阅账号集 = 身份层与本平台
+        状态均非终态；单账号动作 = _subscribe_one_account；订阅成功的账号从后续轮次剔除。
         停止：无可选卡 / 无待订阅账号 / 用户停止 / 整轮零进展兜底。
         """
         self.is_running = True
@@ -1156,7 +1194,9 @@ class AppState:
         self.update_frame(None)
         self._patch_prints()
 
+        self.platform = platform
         account_model = self.models['account']
+        platform_account_model = self.models['platform_account']
         subscribed_total = 0
         fail_total = 0
         pool = WorkerPool(self, 1)      # 串行
@@ -1173,12 +1213,15 @@ class AppState:
                 self._hooked_print("分组内无可选卡，无事可做")
                 return
 
-            # 待订阅 = 非终态：已订阅/封禁/挂起/被 flag 的都排除（flagged=GitHub 禁授权，无解）
-            _DONE = ('subscribed', 'banned', 'suspended', 'flagged')
-
+            # 待订阅 = 身份层与本平台状态都非终态。
+            # 身份层排除封禁/挂起/被拒/被 flag（flagged=GitHub 禁授权，无解，所有平台通吃）；
+            # 平台层排除本平台已订阅/已充值/已归档——同一邮箱在别的平台的进度不影响这里。
             def _needing():
+                platform_status = platform_account_model.map_by_email(platform)
                 return [a for a in account_model.get_all(order_desc=False)
-                        if (a.get('status') or '') not in _DONE]
+                        if not is_identity_terminal(a.get('identity_status'))
+                        and not is_platform_terminal(
+                            (platform_status.get(a['email']) or {}).get('status'))]
 
             MAX_ROUNDS = len(_needing()) * 5 + 5
             round_num = 0
@@ -1336,6 +1379,7 @@ def create_app(db_path=None):
     # 创建模型
     models = {
         'account': AccountModel(db),
+        'platform_account': PlatformAccountModel(db),
         'task': TaskModel(db),
         'card_binding': CardBindingModel(db),
         'recharge_log': RechargeLogModel(db),

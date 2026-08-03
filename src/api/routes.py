@@ -12,7 +12,7 @@ from src.config import cfg, get_data_dir
 from src.services import card as card_service
 from src.services import registration
 from src.models.card_pool import CardPoolModel
-from src.utils import is_card_expired
+from src.utils import is_card_expired, is_identity_terminal, is_platform_terminal
 
 api = Blueprint('api', __name__)
 
@@ -31,6 +31,24 @@ def get_db():
 def get_models():
     from flask import current_app
     return current_app.config['MODELS']
+
+
+def _req_platform(required=False):
+    """取本次请求的目标平台 slug。
+
+    读接口（账号/卡池列表）缺省时回落到 AppState 当前平台，让不带参数的老调用
+    仍能工作。写接口与卡池类接口应传 required=True——猜错平台会返回或写入混合
+    数据，那比直接报错糟糕得多。
+    """
+    value = (request.args.get('platform')
+             or (request.get_json(silent=True) or {}).get('platform')
+             or '')
+    value = value.strip()
+    if value:
+        return value
+    if required:
+        return None
+    return get_app_state().platform
 
 
 @api.route('/api/status')
@@ -276,37 +294,55 @@ def get_accounts():
     page = int(request.args.get('page', 1))
     page_size = int(request.args.get('page_size', 20))
     keyword = request.args.get('keyword', '')
-    status = request.args.get('status', '')
+    identity_status = request.args.get('identity_status', '')
+    platform_status = request.args.get('platform_status', '')
+    platform = _req_platform()
     date_from = request.args.get('date_from', '')
     date_to = request.args.get('date_to', '')
 
     accounts, total = models['account'].get_paginated(
         page=page, page_size=page_size,
-        keyword=keyword, status=status,
+        keyword=keyword, identity_status=identity_status,
         date_from=date_from, date_to=date_to,
     )
 
     emails = [acc['email'] for acc in accounts]
     card_counts = models['card_binding'].count_by_emails(emails)
+    pa_map = models['platform_account'].map_by_email(platform, emails)
+
+    # 平台状态过滤只能在这里做：它来自另一张表，塞不进 accounts 的分页 SQL。
+    # 代价是分页会与 total 对不齐（本页过滤掉几条，总数仍是身份层的计数）。
+    # 这是有意的折中——把平台状态并进分页查询要写成 JOIN + 动态条件，
+    # 而这个筛选平时很少用。前端在启用该筛选时提示"总数为身份层计数"。
+    if platform_status:
+        accounts = [a for a in accounts
+                    if (pa_map.get(a['email']) or {}).get('status') == platform_status]
 
     data = []
     for acc in accounts:
+        pa = pa_map.get(acc['email']) or {}
         data.append({
             "email": acc['email'],
             "password": acc.get('login_password') or '',
-            "status": acc.get('status') or '',
+            # identity_status：GitHub 注册/封禁结果，跨平台一致
+            # platform_status：该账号在当前平台的业务状态；'' 表示尚未在此平台开通
+            "identity_status": acc.get('identity_status') or '',
+            "platform": platform,
+            "platform_status": pa.get('status') or '',
             "time": acc.get('created_at') or '',
             "email_password": acc.get('email_password') or '',
             # card_count：库内 card_bindings 成功关联的卡数（可点开看明细）
             "card_count": card_counts.get(acc['email'], 0),
-            "credits_balance": acc.get('credits_balance'),
-            "balance_updated_at": acc.get('balance_updated_at') or '',
-            "apikey": acc.get('apikey') or '',
-            "apikey_updated_at": acc.get('apikey_updated_at') or '',
+            "credits_balance": pa.get('credits_balance'),
+            "balance_updated_at": pa.get('balance_updated_at') or '',
+            "apikey": pa.get('apikey') or '',
+            "apikey_updated_at": pa.get('apikey_updated_at') or '',
+            "tenant_id": pa.get('tenant_id') or '',
             "email_verify_link": acc.get('email_verify_link') or '',
         })
 
-    return jsonify({"data": data, "total": total, "page": page, "page_size": page_size})
+    return jsonify({"data": data, "total": total, "page": page, "page_size": page_size,
+                    "platform": platform})
 
 
 @api.route('/api/accounts/delete', methods=['POST'])
@@ -323,6 +359,8 @@ def delete_accounts():
         f"DELETE FROM card_bindings WHERE bound_to_email IN ({placeholders})", emails
     )
 
+    # 身份没了，它在各平台的账号行也就没有意义了——不清会留下引用不存在邮箱的孤儿行
+    models['platform_account'].delete_all_for_emails(emails)
     count = models['account'].delete_by_emails(emails)
     return jsonify({"deleted": count})
 
@@ -396,9 +434,10 @@ def recharge_account():
 
 @api.route('/api/accounts/open-browser', methods=['POST'])
 def open_account_browser():
-    """打开浏览器查看账号（OpenRouter 控制台），按账号独立，不阻塞全局任务"""
+    """打开浏览器查看账号（平台控制台），按账号独立，不阻塞全局任务"""
     state = get_app_state()
     models = get_models()
+    platform = _req_platform()
 
     data = request.json or {}
     email = data.get('email', '')
@@ -459,7 +498,7 @@ def open_account_browser():
                     bal = ob._read_balance(driver)
                     if bal is not None and bal != last_persisted:
                         try:
-                            models['account'].update_balance(email, bal)
+                            models['platform_account'].update_balance(platform, email, bal)
                             last_persisted = bal
                             state.add_log(f"{email} 检测到余额页，余额已更新: ${bal:.2f}")
                         except Exception as _e:
@@ -534,6 +573,7 @@ def get_recharge_logs_by_email(email):
 def export_accounts():
     models = get_models()
     data = request.json or {}
+    platform = _req_platform()
 
     mode = data.get('mode', 'filtered')
     selected_emails = data.get('emails', [])
@@ -548,12 +588,12 @@ def export_accounts():
                     break
     else:
         keyword = data.get('keyword', '')
-        status = data.get('status', '')
+        identity_status = data.get('identity_status', '')
         date_from = data.get('date_from', '')
         date_to = data.get('date_to', '')
         accounts, _ = models['account'].get_paginated(
             page=1, page_size=99999,
-            keyword=keyword, status=status,
+            keyword=keyword, identity_status=identity_status,
             date_from=date_from, date_to=date_to,
         )
 
@@ -564,7 +604,12 @@ def export_accounts():
     ws = wb.active
     ws.title = "Accounts"
 
-    headers = ["邮箱", "GitHub密码", "邮箱密码", "认证链接", "apikey", "余额"]
+    # apikey 与余额是平台数据，导出的是当前选定平台那一份
+    pa_map = models['platform_account'].map_by_email(
+        platform, [a['email'] for a in accounts])
+
+    headers = ["邮箱", "GitHub密码", "邮箱密码", "认证链接",
+               f"apikey({platform})", f"余额({platform})"]
     header_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
     header_font = Font(bold=True, size=11)
     for col_idx, h in enumerate(headers, 1):
@@ -574,12 +619,13 @@ def export_accounts():
 
     row_idx = 2
     for acc in accounts:
+        pa = pa_map.get(acc['email']) or {}
         ws.cell(row=row_idx, column=1, value=acc['email'])
         ws.cell(row=row_idx, column=2, value=acc.get('login_password') or '')
         ws.cell(row=row_idx, column=3, value=acc.get('email_password') or '')
         ws.cell(row=row_idx, column=4, value=acc.get('email_verify_link') or '')
-        ws.cell(row=row_idx, column=5, value=acc.get('apikey') or '')
-        ws.cell(row=row_idx, column=6, value=acc.get('credits_balance'))
+        ws.cell(row=row_idx, column=5, value=pa.get('apikey') or '')
+        ws.cell(row=row_idx, column=6, value=pa.get('credits_balance'))
         row_idx += 1
 
     for col in ws.columns:
@@ -862,15 +908,18 @@ def export_valid_cards():
     from openpyxl.utils import get_column_letter
     from datetime import datetime
     models = get_models()
+    platform = _req_platform()
     source_type = request.args.get('source_type', '')
     cards = models['valid_card'].get_all_for_export(source_type)
 
-    # 关联账号信息：source_email -> {login_password, email_password, status}
+    # 关联账号信息：身份层取密码，平台层取该平台的状态
     acct_map = {a['email']: a for a in models['account'].get_all(order_desc=False)}
+    pa_map = models['platform_account'].map_by_email(platform)
 
     headers = ['卡号', '有效期(月)', '有效期(年)', '安全码CVC', '名', '姓',
                '国家', '地址', '地址2', '城市', '州', '邮编', '公司',
-               '来源', '关联CF账号', 'CF登录密码', '邮箱密码', '账号状态',
+               '来源', '关联账号', 'GitHub密码', '邮箱密码', '身份状态',
+               f'平台状态({platform})',
                '卡状态', '累计充值次数', '当日充值次数', '验证时间']
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -889,7 +938,9 @@ def export_valid_cards():
             c.get('city', ''), c.get('state', ''), c.get('zip', ''), c.get('company', ''),
             ('绑定' if c.get('source_type') == 'bind' else '支付'),
             email, acct.get('login_password', ''), acct.get('email_password', ''),
-            acct.get('status', ''), c.get('status_text', ''),
+            acct.get('identity_status', ''),
+            (pa_map.get(email) or {}).get('status', ''),
+            c.get('status_text', ''),
             c.get('recharge_total', 0), c.get('recharge_today', 0), c.get('validated_at', ''),
         ])
 
@@ -931,29 +982,38 @@ def start_daily_pipeline():
     if not group:
         return jsonify({"error": "卡池分组不存在"}), 404
 
+    platform = _req_platform(required=True)
+    if not platform:
+        return jsonify({"error": "未指定平台"}), 400
+
     login_password = data.get('login_password') or None
     captcha_api_key = data.get('captcha_api_key')
     # 充值默认用 Multibot 解支付页 hCaptcha；可传 captcha_server='2captcha.com' 切回
     captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
 
-    # 启动门：分组要有可选卡（排除无效/过期/冷却），且要有可充值账号（有登录密码、未封禁、未归档）
+    # 启动门：分组要有可选卡（排除无效/过期/冷却），且要有可充值账号。
+    # 账号判据必须与 run_daily_pipeline._payable_now 用同一组常量——此前这里只排除
+    # ('banned','archived') 而流水线排除四项，于是「启动时说有 N 个可充值账号，
+    # 实际跑起来只有 M 个」。
     eligible = len(state._eligible_cards(group_id))
     if not eligible:
         return jsonify({"error": "该分组无可选卡（全部无效/过期或冷却中），无事可做"}), 400
 
     accts = models['account'].get_all(order_desc=False)
+    pa_map = models['platform_account'].map_by_email(platform)
     account_count = sum(
         1 for a in accts
         if (login_password or a.get('login_password'))
-        and (a.get('status') or '') not in ('banned', 'archived')
+        and not is_identity_terminal(a.get('identity_status'))
+        and not is_platform_terminal((pa_map.get(a['email']) or {}).get('status'))
     )
     if account_count == 0:
-        return jsonify({"error": "无可充值账号（需有登录密码、未封禁、未归档），无事可做"}), 400
+        return jsonify({"error": "无可充值账号（需有登录密码、身份与平台状态均非终态），无事可做"}), 400
 
     import threading
     threading.Thread(
         target=state.run_daily_pipeline,
-        args=(group_id, login_password, captcha_api_key, captcha_server),
+        args=(platform, group_id, login_password, captcha_api_key, captcha_server),
         daemon=True,
     ).start()
 
@@ -979,26 +1039,33 @@ def start_daily_subscribe_pipeline():
     if not group:
         return jsonify({"error": "卡池分组不存在"}), 404
 
+    platform = _req_platform(required=True)
+    if not platform:
+        return jsonify({"error": "未指定平台"}), 400
+
     captcha_api_key = data.get('captcha_api_key')
     # 订阅默认用 Multibot 解 hCaptcha；可传 captcha_server='2captcha.com' 切回
     captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
 
-    # 启动门：分组要有可选卡，且要有待订阅账号（status 非 subscribed/banned）
+    # 启动门：分组要有可选卡，且要有待订阅账号（判据同 _needing）
     eligible = len(state._eligible_cards(group_id))
     if not eligible:
         return jsonify({"error": "该分组无可选卡（全部无效/过期或冷却中），无事可做"}), 400
 
     accts = models['account'].get_all(order_desc=False)
-    account_count = sum(1 for a in accts
-                        if (a.get('status') or '') not in
-                        ('subscribed', 'banned', 'suspended', 'flagged'))
+    pa_map = models['platform_account'].map_by_email(platform)
+    account_count = sum(
+        1 for a in accts
+        if not is_identity_terminal(a.get('identity_status'))
+        and not is_platform_terminal((pa_map.get(a['email']) or {}).get('status'))
+    )
     if account_count == 0:
-        return jsonify({"error": "无待订阅账号（都已 subscribed/banned/suspended/flagged），无事可做"}), 400
+        return jsonify({"error": "无待订阅账号（身份或平台状态均已终态），无事可做"}), 400
 
     import threading
     threading.Thread(
         target=state.run_daily_subscribe_pipeline,
-        args=(group_id, captcha_api_key, captcha_server),
+        args=(platform, group_id, captcha_api_key, captcha_server),
         daemon=True,
     ).start()
 

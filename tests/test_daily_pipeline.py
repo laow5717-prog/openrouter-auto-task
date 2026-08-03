@@ -17,6 +17,7 @@ import pytest
 from src.browser import driver as driver_module
 from src.config import cfg
 from src.models.account import AccountModel
+from src.models.platform_account import PlatformAccountModel
 from src.models.card_group import CardGroupModel
 from src.models.card_payment_state import CardPaymentStateModel
 from src.models.card_pool import CardPoolModel
@@ -70,8 +71,8 @@ class _Tracker:
                 self.registered_calls.append(email)
             threading.Event().wait(self.delay)
             self.db.execute(
-                "UPDATE accounts SET status='registered', login_password='pw' WHERE email=?",
-                (email,))
+                "UPDATE accounts SET identity_status='registered', login_password='pw' "
+                "WHERE email=?", (email,))
             return "registered", "ok"
         finally:
             self._exit(email)
@@ -83,10 +84,16 @@ class _Tracker:
             with self.lock:
                 self.recharged_calls.append(email)
             threading.Event().wait(self.delay)
-            self.db.execute("UPDATE accounts SET status='recharged' WHERE email=?", (email,))
+            self._mark_recharged(email)
             return "success", ""
         finally:
             self._exit(email)
+
+    def _mark_recharged(self, email):
+        """充值成功是**平台层**状态，写 platform_accounts 而非 accounts。"""
+        self.db.execute(
+            "INSERT OR REPLACE INTO platform_accounts (platform, email, status) "
+            "VALUES ('opencode', ?, 'recharged')", (email,))
 
 
 class _FlakyOnceTracker(_Tracker):
@@ -109,7 +116,7 @@ class _FlakyOnceTracker(_Tracker):
                     "SELECT id FROM card_pool "
                     "WHERE COALESCE(status,'') NOT IN ('invalid','expired') LIMIT 1)")
                 return "failed", "declined"
-            self.db.execute("UPDATE accounts SET status='recharged' WHERE email=?", (email,))
+            self._mark_recharged(email)
             return "success", ""
         finally:
             self._exit(email)
@@ -141,7 +148,8 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls
     path = tempfile.mktemp(suffix='.db')
     db = Database(path)
     models = {
-        'account': AccountModel(db), 'recharge_log': RechargeLogModel(db),
+        'account': AccountModel(db), 'platform_account': PlatformAccountModel(db),
+        'recharge_log': RechargeLogModel(db),
         'card_group': CardGroupModel(db), 'card_pool': CardPoolModel(db),
         'valid_card': ValidCardModel(db), 'card_state': CardPaymentStateModel(db),
         'proxy': ProxyModel(db),
@@ -149,12 +157,12 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls
     gid = models['card_group'].create('pay-group', 'pay')
     models['card_pool'].add_cards(gid, _full_cards(n_cards))
     for i in range(n_registered):
-        db.execute("INSERT INTO accounts (email, login_password, status) VALUES (?,?,?)",
-                   (f'reg{i}@example.com', 'pw', 'registered'))
+        db.execute("INSERT INTO accounts (email, login_password, identity_status) "
+                   "VALUES (?,?,?)", (f'reg{i}@example.com', 'pw', 'registered'))
     # imported 账号自带 email_verify_link（DB 收码），故 _hotmail_for_account 可注册它们
     for i in range(n_imported):
-        db.execute("INSERT INTO accounts (email, email_password, email_verify_link, status) "
-                   "VALUES (?,?,?,?)",
+        db.execute("INSERT INTO accounts (email, email_password, email_verify_link, "
+                   "identity_status) VALUES (?,?,?,?)",
                    (f'imp{i}@example.com', 'ep', 'https://ruoanzhu.example/s?e=x', 'imported'))
 
     state = AppState(db, models)
@@ -165,13 +173,19 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls
     original = cfg.concurrency.max_workers
     cfg.concurrency.max_workers = workers
     try:
-        state.run_daily_pipeline(gid, login_password=None, captcha_api_key=None)
+        state.run_daily_pipeline('opencode', gid, login_password=None, captcha_api_key=None)
     finally:
         cfg.concurrency.max_workers = original
 
+    # 账号最终状态 = 平台状态优先（recharged 等），没有平台行则看身份状态。
+    # 两层拆分后「一个账号处于什么状态」不再是单列，这里合成出旧口径供断言复用。
     status_counts = {}
-    for row in db.fetchall("SELECT status, COUNT(*) c FROM accounts GROUP BY status"):
-        status_counts[row['status']] = row['c']
+    for row in db.fetchall(
+            "SELECT COALESCE(NULLIF(pa.status,''), a.identity_status) s, COUNT(*) c "
+            "FROM accounts a "
+            "LEFT JOIN platform_accounts pa ON pa.email = a.email AND pa.platform='opencode' "
+            "GROUP BY s"):
+        status_counts[row['s']] = row['c']
 
     usable_left, _ = models['card_pool'].get_usable_cards_as_list(gid)
 

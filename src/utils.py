@@ -32,6 +32,30 @@ CARD_STATUS_UNUSABLE = (CARD_STATUS_EXPIRED, CARD_STATUS_INVALID)
 CARD_STATUS_NOT_SELECTABLE = CARD_STATUS_UNUSABLE + (CARD_STATUS_BOUND,)
 
 
+# ---- 账号终态：分身份层与平台层两组，别再各处硬编码 ----
+# 拆成两组是多平台的必然结果：GitHub 被封是身份层的事，对所有平台一致；充值/订阅
+# 完成是平台层的事，同一邮箱在 A 平台已充值不代表 B 平台也不用跑了。
+#
+# 此前这两层混在 accounts.status 一列里，各处自行硬编码过滤集合，且已经写岔了——
+# app._payable_now 用四元组 ('banned','archived','flagged','recharged')，
+# routes.start_daily_pipeline 的启动门只用了 ('banned','archived')，于是「启动时说有
+# N 个可充值账号，实际跑起来只有 M 个」。统一到这里。
+
+# 身份层终态：GitHub 侧已不可用，任何平台都别再拿它去跑
+IDENTITY_TERMINAL_STATUSES = ('banned', 'suspended', 'rejected', 'flagged')
+
+# 平台层终态：该账号在这个平台上本轮无需再处理
+PLATFORM_TERMINAL_STATUSES = ('archived', 'recharged', 'subscribed')
+
+
+def is_identity_terminal(identity_status):
+    return (identity_status or '') in IDENTITY_TERMINAL_STATUSES
+
+
+def is_platform_terminal(platform_status):
+    return (platform_status or '') in PLATFORM_TERMINAL_STATUSES
+
+
 # ---- 绑卡失败归因：只有卡自身的问题才该把底料卡标为 invalid ----
 # 误标的代价是不可逆的：好卡被打成 invalid 后再也不会被选中。因此采用白名单，
 # 只在确信是卡的问题时才归因，拿不准一律不标。

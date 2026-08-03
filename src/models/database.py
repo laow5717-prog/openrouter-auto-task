@@ -5,6 +5,7 @@ SQLite 数据库管理模块
 
 import contextlib
 import os
+import re
 import sys
 import sqlite3
 import threading
@@ -207,6 +208,66 @@ _SCHEMA_V13 = """
 DROP TABLE IF EXISTS invoice_payment_state;
 """
 
+# 多平台改造第一步：把 accounts 拆成「身份层」与「平台层」。
+#
+# accounts 从此只装身份：邮箱（email / email_password / email_verify_link）与 GitHub
+# （login_password 实为 GitHub 密码、identity_status 是 GitHub 注册与封禁结果）。这两者
+# 当前是严格 1:1——每个 hotmail 邮箱恰好注册一个 GitHub 账号，所以不再拆第三张表；
+# 将来若要一邮箱开多个 GitHub 账号，只需再拆 accounts，platform_accounts 不受影响。
+#
+# platform_accounts 每平台一行，装该平台自己的密码、状态、余额、API key、租户 id。
+# login_password 给「用邮箱+密码注册」的平台用；opencode 走 GitHub OAuth，该列留空。
+# tenant_id 即 opencode 的 wrk_xxx，泛化为平台侧工作区标识（本次只落库，不改现有获取逻辑）。
+#
+# status 的归属按层划分：GitHub 注册结果与封禁（imported/pending/suspended/rejected/
+# failed/flagged/registered）留身份层；平台业务终态（archived/recharged/subscribed）
+# 进平台层。既有数据全部归 platform='opencode'。
+# accounts.status 旧列保留不删——代码回退到旧版本时它仍是可读的真值，这是回滚保险。
+_SCHEMA_V14 = """
+CREATE TABLE IF NOT EXISTS platform_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    email TEXT NOT NULL,
+    login_password TEXT,
+    status TEXT DEFAULT '',
+    tenant_id TEXT DEFAULT '',
+    credits_balance REAL,
+    balance_updated_at TEXT,
+    apikey TEXT,
+    apikey_updated_at TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    updated_at TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE(platform, email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pa_platform_status ON platform_accounts(platform, status);
+
+ALTER TABLE accounts ADD COLUMN identity_status TEXT DEFAULT '';
+
+UPDATE accounts SET identity_status = CASE
+    WHEN COALESCE(status,'') IN ('archived','recharged','subscribed') THEN 'registered'
+    WHEN COALESCE(status,'') LIKE 'bound_%_cards' THEN 'registered'
+    WHEN COALESCE(status,'') IN ('bound','billing_page','interrupted','all_bindings_failed','error') THEN 'registered'
+    ELSE COALESCE(status,'')
+END;
+
+INSERT OR IGNORE INTO platform_accounts
+    (platform, email, status, credits_balance, balance_updated_at,
+     apikey, apikey_updated_at, created_at, updated_at)
+SELECT 'opencode', email,
+       CASE WHEN COALESCE(status,'') IN ('archived','recharged','subscribed')
+            THEN status ELSE '' END,
+       credits_balance, balance_updated_at, apikey, apikey_updated_at,
+       COALESCE(created_at, datetime('now','localtime')),
+       datetime('now','localtime')
+FROM accounts
+WHERE COALESCE(status,'') IN ('archived','recharged','subscribed')
+   OR credits_balance IS NOT NULL
+   OR COALESCE(apikey,'') != '';
+"""
+
+_ADD_COLUMN_RE = re.compile(r'^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)', re.I)
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -221,6 +282,7 @@ _MIGRATIONS = {
     11: _SCHEMA_V11,
     12: _SCHEMA_V12,
     13: _SCHEMA_V13,
+    14: _SCHEMA_V14,
 }
 
 
@@ -258,10 +320,47 @@ class Database:
         if current >= target:
             return
         for version in range(current + 1, target + 1):
-            sql = _MIGRATIONS[version]
-            self._conn.executescript(sql)
+            self._apply_migration(_MIGRATIONS[version])
         self._conn.execute(f"PRAGMA user_version = {target}")
         self._conn.commit()
+
+    def _apply_migration(self, script):
+        """逐语句执行一个迁移脚本，`ADD COLUMN` 先查列是否已存在。
+
+        不用 executescript 是因为它整体执行：脚本里只要有一条 `ADD COLUMN` 撞上
+        已存在的列，整个迁移就失败。而这种情况是真会发生的——手工修过库、或在库
+        副本上重跑迁移做验证时。跳过已存在的列让迁移可重复执行（幂等），这是在
+        生产库副本上预演迁移的前提。
+        """
+        for stmt in self._split_statements(script):
+            m = _ADD_COLUMN_RE.match(stmt)
+            if m and self._column_exists(m.group(1), m.group(2)):
+                continue
+            self._conn.execute(stmt)
+
+    @staticmethod
+    def _split_statements(script):
+        """按语句边界切分 SQL 脚本。
+
+        用 sqlite3.complete_statement 判定边界，而不是按 ';' 硬切——后者会在
+        字符串字面量里含分号时切错。
+        """
+        statements, buf = [], ''
+        for line in script.splitlines(keepends=True):
+            buf += line
+            if sqlite3.complete_statement(buf):
+                stmt = buf.strip()
+                if stmt:
+                    statements.append(stmt)
+                buf = ''
+        tail = buf.strip()
+        if tail:
+            statements.append(tail)
+        return statements
+
+    def _column_exists(self, table, column):
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == column for r in rows)
 
     def _import_txt_if_needed(self):
         """首次运行时从 registered_accounts.txt 导入数据"""

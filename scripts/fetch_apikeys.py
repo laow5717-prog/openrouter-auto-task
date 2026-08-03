@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.database import Database
 from src.models.account import AccountModel
+from src.models.platform_account import PlatformAccountModel
 from src.browser.driver import create_driver, close_driver
 
 WID_RE = re.compile(r"wrk_[A-Za-z0-9]+")
@@ -77,10 +78,12 @@ def main():
     ap.add_argument("--all", action="store_true", help="所有账号（默认只跑 credits_balance>0）")
     ap.add_argument("--dry", action="store_true", help="只列出目标账号，不开浏览器")
     ap.add_argument("--db", default=None, help="数据库路径（默认用内置路径）")
+    ap.add_argument("--platform", default="opencode", help="目标平台 slug")
     args = ap.parse_args()
 
     db = Database(args.db)
     account = AccountModel(db)
+    platform_account = PlatformAccountModel(db)
 
     if args.email:
         targets = [args.email]
@@ -88,7 +91,10 @@ def main():
         rows = db.fetchall("SELECT email FROM accounts ORDER BY id")
         targets = [dict(r)["email"] for r in rows]
     else:
-        rows = db.fetchall("SELECT email FROM accounts WHERE credits_balance>0 ORDER BY id")
+        # 余额已搬到 platform_accounts，按平台取
+        rows = db.fetchall(
+            "SELECT email FROM platform_accounts WHERE platform=? AND credits_balance>0 "
+            "ORDER BY id", (args.platform,))
         targets = [dict(r)["email"] for r in rows]
 
     print(f"目标账号 {len(targets)} 个: {', '.join(targets)}")
@@ -100,7 +106,7 @@ def main():
         print(f"\n[{i}/{len(targets)}] {email} ...", flush=True)
         ok, detail, key = fetch_one(email)
         if ok:
-            account.update_apikey(email, key)
+            platform_account.update_apikey(args.platform, email, key)
             ok_list.append(email)
             print(f"  ✓ 落库 apikey={mask(key)}  ({detail})", flush=True)
         else:

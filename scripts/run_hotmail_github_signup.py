@@ -30,7 +30,8 @@ from src.models.account import AccountModel
 _DEFAULT_XLSX = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hotmail.xlsx")
 
-# outcome → accounts.status。signup_complete/account_suspended 时账号已建，补写 github 密码。
+# outcome → accounts.identity_status（全是 GitHub 侧结果，与平台无关）。
+# signup_complete/account_suspended 时账号已建，补写 github 密码。
 _OUTCOME_STATUS = {
     "signup_complete": "registered",
     "account_suspended": "suspended",
@@ -53,12 +54,12 @@ def _mask(pw):
 
 
 def _import_all(account_model, accounts):
-    print(f"导入 {len(accounts)} 个 hotmail 账号到 accounts 表（status='imported'）...")
+    print(f"导入 {len(accounts)} 个 hotmail 账号到 accounts 表（identity_status='imported'）...")
     for acc in accounts:
         # login_password 此时未知（GitHub 注册才生成）；email_password 存 hotmail 密码；
         # email_verify_link 存 ruoanzhu 收信链接，导入时一并落库。
         account_model.upsert(acc.email, login_password=None,
-                             email_password=acc.password, status="imported",
+                             email_password=acc.password, identity_status="imported",
                              email_verify_link=acc.link)
         print(f"  ✓ {acc.email}  pw={_mask(acc.password)}")
     print("导入完成。")
@@ -71,13 +72,13 @@ def _persist_result(account_model, acc, result):
     if outcome in _ACCOUNT_CREATED:
         account_model.upsert(acc.email,
                              login_password=result.get("github_password"),
-                             email_password=acc.password, status=status)
+                             email_password=acc.password, identity_status=status)
     else:
         # 确保行存在（可能跳过了 --import 直接注册），再更新状态。
         account_model.upsert(acc.email, login_password=None,
-                             email_password=acc.password, status="imported")
-        account_model.update_status(acc.email, status)
-    print(f"  💾 已落库：{acc.email} → status='{status}'"
+                             email_password=acc.password, identity_status="imported")
+        account_model.update_identity_status(acc.email, status)
+    print(f"  💾 已落库：{acc.email} → identity_status='{status}'"
           + ("（含 GitHub 凭据）" if outcome in _ACCOUNT_CREATED else ""))
 
 
