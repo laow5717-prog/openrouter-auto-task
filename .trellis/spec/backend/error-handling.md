@@ -50,8 +50,9 @@ Questions to answer:
 
 ### 按错误前缀归因会误杀好卡
 
-绑卡失败时会把底料卡标为 `invalid`（`card_pool.status`），此后 `get_usable_cards_as_list`
-永远不再选中它。**这个操作不可逆**，因此归因必须保守。
+支付失败时会把底料卡在**该平台**标为 `invalid`（`card_platform_state`），此后
+`get_usable_cards_as_list(platform, …)` 在那个平台上永远不再选中它。**这个操作不可逆**
+（卡在别的平台仍可用，但这个平台上废了），因此归因必须保守。
 
 错误串带分类前缀（`[外部原因]` / `[表单字段错误]` / `[操作失败]` / `[验证超时]` /
 `[浏览器中断]` / `[超时]` / `[Stripe字段错误]` / `[控制台表单错误]`），但**前缀不足以定性**：
@@ -70,3 +71,14 @@ Questions to answer:
 
 原则：**宁可漏标**。漏标的代价只是下次再试一次这张卡；误标是永久废掉一张好卡。
 新增判定规则时先补 `tests/test_card_fault.py`。
+
+### outcome 层面同样有「不消耗卡」的硬约束
+
+上面讲的是错误**文案**的归因；再往上一层，`PaymentResult.outcome` 决定这张卡是否
+被消耗。`needs_captcha` / `error` / `unknown` 三者一律**不动卡的任何状态**——分别是
+账号级风控、付款前的页面故障、提交后无定论，都不是卡的问题。常量
+`platforms.base.OUTCOMES_KEEPING_CARD` 与 `PaymentResult.keeps_card` 把这条固化下来，
+新平台的适配器必须按同样语义归类自己的失败，否则一次网络抖动就会废掉一张好卡。
+
+`[Stripe字段错误]` 类的卡则相反——那是卡数据本身填不进表单，换哪个平台都一样，所以
+`get_stripe_field_error_card_numbers()` 刻意**不按平台过滤**。

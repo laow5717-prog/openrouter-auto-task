@@ -116,14 +116,36 @@ Reclaim runs only when `create_profile` raises `AdsPowerQuotaExceeded`. There is
 no background cleaner: deleting a profile discards that account's login session,
 so proactive tidying costs sessions we may still need.
 
-Candidates come from `AdsPowerProfileModel.reclaim_candidates`, ordered
-`failed/pending/rejected → recharged → archived → subscribed →
-flagged/banned/suspended`, oldest `last_used_at` first. The ordering key is **how
-much login state the profile still holds**, not how "done" the account is —
-a registration that never completed leaves an empty profile, so those go first.
+Candidates come from `AdsPowerProfileModel.reclaim_candidates`. The ordering key
+is **how much login state the profile still holds**, not how "done" the account
+is — a registration that never completed leaves an empty profile, so those go
+first. Three tiers, oldest `last_used_at` first within each:
 
-`registered` is deliberately absent: that profile holds the GitHub session the
-very next recharge step needs.
+| Tier | Condition | Rationale |
+|---|---|---|
+| 0 | The account row is gone from `accounts` (orphaned mapping) | Nothing left to preserve |
+| 1 | `identity_status ∈ (failed, pending, rejected, flagged, banned, suspended)` | GitHub side is dead — useless on *every* platform |
+| 2 | Identity usable, **and** the mailbox has at least one `platform_accounts` row, **and** all of them are terminal | Every platform that was started is finished |
+
+Profiles are keyed by **email, not by (platform, email)** — see
+[Multi-Platform](./multi-platform-guidelines.md) for why splitting them is a net
+loss. Only the predicate is platform-aware.
+
+Three details in tier 2 that are easy to get wrong, each of which deletes a
+browser someone is using:
+
+- Use `NOT EXISTS (… non-terminal row …)`, **not** `status IN (terminal set)`.
+  With one platform finished and another still running, the `IN` form calls the
+  profile reclaimable.
+- Also require `EXISTS (… any row …)`. Without it `NOT EXISTS` is vacuously true
+  for a mailbox not yet onboarded anywhere — precisely the freshly registered
+  accounts whose GitHub session is about to be used. This replaces the older
+  "`registered` is deliberately absent from the list" rule; same protection,
+  stated as a condition instead of an omission.
+- Tier 0 needs a `LEFT JOIN accounts`. It used to be an inner join, so orphaned
+  mappings were joined away, never became candidates, and their remote profiles
+  occupied quota forever — the production database had one such profile eating
+  1 of the 12 slots.
 
 > **2026-08-03 incident.** The first version of this list omitted
 > `failed`/`pending`/`rejected`. Eleven accounts whose registration had failed

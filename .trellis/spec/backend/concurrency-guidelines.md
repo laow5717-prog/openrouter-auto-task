@@ -129,6 +129,18 @@ above. Enforcement lives in `AppState._exclude_used_this_run`, called from
 candidate has been used**. Better to repeat one card occasionally than to abandon
 an account.
 
+### The two levels have deliberately opposite platform scope
+
+| Level | Key | Scope |
+|---|---|---|
+| `_in_flight` | `card_number` | **Global.** Not a concurrency question — submitting the same card at two merchants at once stacks issuer velocity risk. The issuer sees the card, not which platform we happen to be running |
+| `_used` | `(platform, card_number)` | **Per platform.** Pure round-dedup heuristic; "tried on opencode" says nothing about another site, where the card is still untouched |
+
+`release_all()` therefore has two modes: pass a platform at a round boundary
+(clears only that platform's ownership, leaves `_in_flight` alone), pass nothing
+at task teardown (clears everything). Clearing `_in_flight` at a round boundary
+would drop the issuer-velocity protection mid-run.
+
 Counting call sites (`len(_eligible_cards(...))` for "how many cards remain" and
 "is there work left") must pass `exclude_used=False`, or the number shrinks as the
 round progresses and the pipeline decides the pool is empty and stops early.

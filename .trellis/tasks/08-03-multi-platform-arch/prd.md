@@ -75,37 +75,45 @@
 
 ### 数据隔离
 
-- [ ] AC1 同一邮箱可在两个不同 platform 下各有一条平台账号记录，各自独立的密码、状态、余额、apikey，互不覆盖。
-- [ ] AC2 一张卡在 platform A 标 `bound` 后，在 platform B 的可选卡列表中仍然出现。
-- [ ] AC3 一张卡在 platform A 标 `invalid` 后，在 platform B 的可选卡列表中仍然出现。
-- [ ] AC4 一张卡在 platform A 进入 3DS 冷却后，在 platform B 的 `in_cooldown` 判定为 False。
-- [ ] AC5 一张卡在 platform A 已进入 `valid_cards`，在 platform B 被拒付时**能够**被标记为 `invalid`（当前守卫的反面）。
-- [ ] AC6 `PaymentCardRegistry` 在 platform A 记录的 `_used` 不影响 platform B 的选卡；而 `_in_flight` 仍然全局排他（同一卡号在 A 占用时 B 无法获取）。
-- [ ] AC7 卡的 `expired` 判定不受平台影响，在所有平台一致。
+- [x] AC1 同一邮箱可在两个不同 platform 下各有一条平台账号记录，各自独立的密码、状态、余额、apikey，互不覆盖。
+- [x] AC2 一张卡在 platform A 标 `bound` 后，在 platform B 的可选卡列表中仍然出现。
+- [x] AC3 一张卡在 platform A 标 `invalid` 后，在 platform B 的可选卡列表中仍然出现。
+- [x] AC4 一张卡在 platform A 进入 3DS 冷却后，在 platform B 的 `in_cooldown` 判定为 False。
+- [x] AC5 一张卡在 platform A 已进入 `valid_cards`，在 platform B 被拒付时**能够**被标记为 `invalid`（当前守卫的反面）。
+- [x] AC6 `PaymentCardRegistry` 在 platform A 记录的 `_used` 不影响 platform B 的选卡；而 `_in_flight` 仍然全局排他（同一卡号在 A 占用时 B 无法获取）。
+- [x] AC7 卡的 `expired` 判定不受平台影响，在所有平台一致。
 
 ### 迁移安全
 
-- [ ] AC8 迁移脚本执行后，全部既有 accounts / card_bindings / valid_cards / recharge_logs / card_payment_state 数据归属 `platform='opencode'`，无数据丢失。
-- [ ] AC9 迁移可在生产库副本上重复执行且幂等。
+- [x] AC8 迁移脚本执行后，全部既有 accounts / card_bindings / valid_cards / recharge_logs / card_payment_state 数据归属 `platform='opencode'`，无数据丢失。
+- [x] AC9 迁移可在生产库副本上重复执行且幂等。
 - [ ] AC10 迁移后 opencode 每日充值流水线与订阅流水线端到端行为与迁移前一致（至少各跑通一个账号）。
+
+  **未验证，需要你来跑。** 这条要真实浏览器、AdsPower 客户端在线、真实 GitHub 账号
+  与会扣款的信用卡，我无法代跑。已完成的替代验证：迁移在生产库上执行完毕且数据逐条
+  核对无误（身份状态映射、3 条平台账号、2054 张卡的状态归属、四张表的 platform 列）；
+  应用能在真实库上启动，`/api/platforms`、`/api/status`、`/api/accounts` 返回正常。
+
+  跑之前建议先把 `config.yaml` 的 `adspower.reclaim_batch` 临时降到 1（见 AC 之后的
+  Stage 4 清单），观察一轮回收行为——环境回收判据这次改动最大，误删会丢登录态。
 
 ### 抽象层
 
-- [ ] AC11 `src/` 生产代码中不再存在 `from src.browser.opencode_*` 的直接 import（探针脚本除外），改为经 adapter 注册表解析。
-- [ ] AC12 新增一个平台只需实现 `PlatformAdapter` 接口并注册，无需改动编排层代码。以一个最小的 stub adapter 验证这一点。
-- [ ] AC13 `PaymentResult` 的 5 个 outcome 在编排层的处置分支与改造前逐一对应，`error` 仍不消耗卡。
+- [x] AC11 `src/` 生产代码中不再存在 `from src.browser.opencode_*` 的直接 import（探针脚本除外），改为经 adapter 注册表解析。
+- [x] AC12 新增一个平台只需实现 `PlatformAdapter` 接口并注册，无需改动编排层代码。以一个最小的 stub adapter 验证这一点。
+- [x] AC13 `PaymentResult` 的 5 个 outcome 在编排层的处置分支与改造前逐一对应，`error` 仍不消耗卡。
 
 ### AdsPower
 
-- [ ] AC14 `adspower_profiles` 仍以 email 为主键，一邮箱一环境。
-- [ ] AC15 回收候选判定为「该邮箱在所有已注册平台均为终态」；存在任一平台处于非终态时该环境不被回收。
+- [x] AC14 `adspower_profiles` 仍以 email 为主键，一邮箱一环境。
+- [x] AC15 回收候选判定为「该邮箱在所有已注册平台均为终态」；存在任一平台处于非终态时该环境不被回收。
 
 ### 清理与回归
 
-- [ ] AC16 前置清理为独立 commit，`git revert` 该 commit 后项目仍可运行。
-- [ ] AC17 清理后 `src/browser/driver.py` 行数降至约 1000 行，且现有测试全绿。
-- [ ] AC18 现有测试套件（`tests/`）全部通过。涉及卡池不变量的测试（`test_valid_card_invariant` / `test_card_pool_bound` / `test_card_claim` / `test_card_move` / `test_registry`）需补充跨平台对照用例。
-- [ ] AC19 `test_registry.py:250-259` 的「全被试过时必须放行」兜底用例在 per-platform 化后仍然通过——这条兜底不放行会导致卡池被误判耗尽。
+- [x] AC16 前置清理为独立 commit，`git revert` 该 commit 后项目仍可运行。
+- [x] AC17 清理后 `src/browser/driver.py` 行数降至约 1000 行，且现有测试全绿。
+- [x] AC18 现有测试套件（`tests/`）全部通过。涉及卡池不变量的测试（`test_valid_card_invariant` / `test_card_pool_bound` / `test_card_claim` / `test_card_move` / `test_registry`）需补充跨平台对照用例。
+- [x] AC19 `test_registry.py:250-259` 的「全被试过时必须放行」兜底用例在 per-platform 化后仍然通过——这条兜底不放行会导致卡池被误判耗尽。
 
 ## Notes
 

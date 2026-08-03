@@ -8,14 +8,15 @@
 
 This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
 
-> **改造说明（openrouter-auto-task reframe）**：本项目由 Cloudflare 自动化项目改造而来。
-> 项目名为 `openrouter-auto-task`，**目标自动化站点为 https://opencode.ai**。
-> 站点无关的基建指南（Database / Concurrency / Browser Profile 的 profile 卫生部分）
-> 依然有效。以下指南描述的是 **Cloudflare 专属流程**，改造后相关站点编排已在
-> `src/services/registration.py` 存根化、`src/browser/driver.py` 内标记为
-> `LEGACY Cloudflare-specific`，**待按 opencode.ai 站点重写**，届时同步更新这些文档：
-> Captcha（Turnstile 部分）、Email Verification（Cloudflare 登录码/2FA）、
-> Stripe Payment Element、Browser Profile 中 `dash.cloudflare.com` 相关的 SPA 白屏说明。
+> **改造说明**：本项目由 Cloudflare 自动化项目改造而来，现已支持多平台——
+> 目标站点由适配器决定（首个实现是 https://opencode.ai）。读任何指南前先看
+> [Multi-Platform](./multi-platform-guidelines.md)，它定义了「什么按平台隔离、
+> 什么保持全局」，是其余指南的前提。
+>
+> `src/browser/driver.py` 里 5100 行 Cloudflare 遗留实现已删除（2026-08-03），
+> 该文件现在只放站点无关的浏览器基建。仍描述 Cloudflare 专属细节、待按实际站点
+> 复核的文档：Captcha（Turnstile 部分）、Email Verification（Cloudflare 登录码/2FA）、
+> Browser Profile 中 `dash.cloudflare.com` 相关的 SPA 白屏说明。
 
 ---
 
@@ -23,8 +24,9 @@ This directory contains guidelines for backend development. Fill in each file wi
 
 | Guide | Description | Status |
 |-------|-------------|--------|
+| [Multi-Platform](./multi-platform-guidelines.md) | Adapter layering, what is isolated per platform vs global, adding a platform | Active |
 | [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
-| [Database Guidelines](./database-guidelines.md) | SQLite, models, pagination queries | Active |
+| [Database Guidelines](./database-guidelines.md) | SQLite, identity/platform split, migrations, row-name pitfalls | Active |
 | [Concurrency Guidelines](./concurrency-guidelines.md) | Worker pool, the three exclusions, thread-binding constraints | Active |
 | [Browser Profile](./browser-profile-guidelines.md) | Profile hygiene, the white-screen failure, what is safe to delete | Active |
 | [AdsPower](./adspower-guidelines.md) | Fingerprint-browser mode: 12-profile quota, reclaim, proxy binding, CDP takeover | Active |

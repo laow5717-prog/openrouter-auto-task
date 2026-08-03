@@ -178,7 +178,8 @@ mechanism — implement/verify them together:
   the always-present invisible-hCaptcha checkbox iframe gets re-detected forever). When no
   3DS, call `solve_hcaptcha` up to **3** times; after 3 failures return `needs_captcha`
   (account-level risk control — switch card / retry later, do not sit and wait).
-  See `opencode_subscribe.detect_subscribe_result` and `opencode_billing.detect_payment_result`
+  See `platforms/opencode/subscribe.detect_subscribe_result` and
+  `platforms/opencode/billing.detect_payment_result`
   — they are deliberately the same structure.
 - **Balance/余额 is the authoritative success signal** for recharge (`_balance_grew` first
   each loop); `detect_subscribe_result` uses "left checkout & fell back to opencode" instead.
