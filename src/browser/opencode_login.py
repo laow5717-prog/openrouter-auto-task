@@ -148,13 +148,16 @@ def _account_flagged(session):
     return "account is flagged" in body or ("flagged" in body and "authorize" in body)
 
 
-def login_and_open_own_go(session, monitor=None, timeout=240):
-    """登录 opencode 并进入该账号自己的 /go 页。
+def login_and_open_own_go(session, monitor=None, timeout=240, open_go=True):
+    """登录 opencode（并按需进入该账号自己的 /go 页）。
+
+    open_go=False 时拿到 wid 即返回，不再导航 /go —— 充值走 zen 的 billing 页，
+    /go 对它毫无用处，白跑一趟约 34 秒。
 
     返回 dict:
-      ok:      bool     是否成功进入 /go
+      ok:      bool     open_go=True 时表示成功进入 /go；open_go=False 时表示已取到 wid
       wid:     str|None 该账号自己的 workspace id
-      go_url:  str|None
+      go_url:  str|None open_go=False 时为 None
       flagged: bool     GitHub 账号被 flag，无法授权第三方应用（新号常见）
       detail:  str
     """
@@ -243,6 +246,14 @@ def login_and_open_own_go(session, monitor=None, timeout=240):
 
     result["wid"] = wid
     _step(monitor, session, f"已登录，自己的 workspace = {wid}")
+
+    # 订阅流程需要 /go 页（Subscribe to Go 按钮在那儿）；充值走 zen，只要 wid 就能直接去
+    # /workspace/<wid>/billing。实机计量：多这一跳每个账号白等约 34 秒，且 /go 是重页面，
+    # 走代理时更慢。故由调用方决定要不要进。
+    if not open_go:
+        result["ok"] = True
+        result["detail"] = f"已登录，workspace = {wid}（按调用方要求跳过 /go）"
+        return result
 
     # 5) 进入自己的 /go 页
     go_url = f"https://opencode.ai/workspace/{wid}/go"

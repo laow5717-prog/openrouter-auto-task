@@ -1,5 +1,77 @@
 # Captcha Guidelines
 
+## Detecting an hCaptcha challenge: frame URL, never body text
+
+Stripe's checkout page **always** embeds hCaptcha's checkbox iframe, whether or not
+any verification is required. Its body text is the fixed string `I am human`.
+hCaptcha splits itself across two iframes, distinguished by the URL fragment:
+
+| Fragment | Meaning |
+|----------|---------|
+| `#frame=checkbox` / `#frame=checkbox-invisible` | Always present on Stripe checkout. Says "I am human". Means nothing. |
+| `#frame=challenge` | The image-challenge frame. **Pre-created as an empty shell**, so its mere presence means nothing either. |
+
+`_captcha_challenge_present` requires `#frame=challenge` **and** rendered challenge
+content (`.prompt-text` or `.task-grid`). Both halves are load-bearing. Measured
+frame set on a live Stripe checkout with no captcha shown to the user:
+
+```
+debugMode=false&parentOrigin=https%3A%2F%2Fcheckout.stripe.c
+(无 fragment)
+frame=challenge&id=0967yoxdwrdr&host=b.stripecdn.com&sentry=   ← empty shell
+frame=checkbox-invisible
+frame=challenge&id=1glndzfcb9oa&host=b.stripecdn.com&sentry=   ← empty shell
+frame=checkbox-invisible
+```
+
+Two challenge frames existed and nothing was being asked of the user. Matching on
+the fragment alone would be just as wrong as matching on body text.
+
+> **2026-08-03 incident.** The detector used to match body text across any
+> `hcaptcha.com` frame, and `i am human` was in the keyword list. It therefore
+> fired on every Stripe checkout, with no challenge on screen. The cost was not a
+> stray log line: each card burned 3 paid solver calls (~90s), and after the third
+> the loop returned `needs_captcha`, which `registration.py` treats as
+> account-level risk control — "switching cards is useless, stop now". Every
+> account's recharge was aborted before its real payment outcome (success,
+> decline, 3DS) could be observed. The giveaway in the injection diagnostics was
+> `gr: 0`: Stripe had never once called `hcaptcha.getResponse()`.
+
+Because the tightened rule makes "no challenge found" the normal case, a genuine
+challenge that stops matching would fail *silently*. `_captcha_frames_debug` logs
+the hCaptcha frame fragments on the timeout path so that regression is visible.
+
+Regression coverage: `tests/test_captcha_detection.py`.
+
+---
+
+## `/go` is for subscribe, not for recharge
+
+`login_and_open_own_go(open_go=False)` returns as soon as the workspace id is
+known. Recharge goes to `/workspace/<wid>/billing` and has no use for `/go`;
+navigating there cost ~34s per account (measured) on a heavy page over a proxy.
+Subscribe still needs it — the "Subscribe to Go" button lives there — so the
+default stays `True`.
+
+---
+
+## GitHub device verification is now automatic
+
+Signing in from a browser profile GitHub has not seen before lands on
+`github.com/sessions/verified-device` asking for an 8-digit emailed code. Under
+AdsPower **every account gets a fresh fingerprint environment**, so this triggers
+almost every time — waiting for a human (the old behaviour, 600s) would stall the
+pipeline on each account.
+
+`_auto_verify_device` reuses the registration path's machinery:
+`wait_for_github_launch_code_ruoanzhu` for the code and `submit_email_code` to fill
+it — the same "Your GitHub launch code" email and the same segmented input. It
+needs the account's ruoanzhu link, threaded through as
+`recharge_account(verify_link=...)` from `accounts.email_verify_link`. Without a
+link it returns False and the human-wait fallback still applies.
+
+---
+
 > How solved tokens get delivered to the page, and why the obvious way silently
 > fails. Read before touching `src/services/captcha.py` or the Turnstile handling
 > in `src/browser/driver.py`.

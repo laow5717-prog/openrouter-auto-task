@@ -11,6 +11,7 @@ js.stripe.com iframe），可直接用 page 定位填充。
 """
 import re
 import time
+from datetime import datetime
 
 from src.services import captcha as captcha_solver
 
@@ -53,15 +54,20 @@ _DECLINE_HINTS = [
     "error processing your request", "processing your request",
 ]
 
-# hCaptcha 人机验证「图像挑战」：仅当 Stripe 真的弹出需人工点选图片的挑战时才归
-# needs_captcha（账号级风控、需人工、换卡无用）。判据刻意只认图像挑战的特征文案——
-# 不能用裸 "verify" / "try again"：hCaptcha 壳/加载失败态常带这些词（实机 newassets.
-# hcaptcha.com frame 文案就是 "Please try again ⚠️ Verify"），会把上面那种「卡无法验证」
-# 的普通失败误判成需人工验证码从而错误停手。
+# hCaptcha 图像挑战真正出现时，挑战帧内会渲染的提示文案（题面 / 题格）。
+# 只作二次确认用，主判据是帧 URL 的 #frame=challenge——见 _captcha_challenge_present。
+#
+# ⚠️ 绝不能把 "i am human" 放进来：那是常驻 checkbox 帧的固定标签（见下）。
 _CAPTCHA_TEXT_HINTS = [
     "select each image", "click each image", "select all images",
-    "verify you are human", "are you a human", "i am human",
+    "verify you are human", "are you a human",
 ]
+
+# hCaptcha 把自己拆成两种 iframe，URL 片段区分（与 services/hcaptcha_click_solver.py 一致）：
+#   #frame=checkbox   —— 常驻帧，Stripe 结账页**永远**存在，哪怕根本不需要验证。
+#                        它的 body 文本就是固定的 "I am human"。
+#   #frame=challenge  —— 真正的图像挑战帧，只在需要人点选时才出现。
+_CAPTCHA_CHALLENGE_FRAME_MARK = "#frame=challenge"
 
 
 def _step(monitor, session, msg):
@@ -75,6 +81,52 @@ def _step(monitor, session, msg):
 def _extract_wid(url):
     m = WORKSPACE_RE.search(url or '')
     return m.group(1) if m else None
+
+
+def _auto_verify_device(session, monitor, verify_link, timeout=180, since=None):
+    """GitHub 新设备邮箱验证（/sessions/verified-device）自动过码。
+
+    登录一个此前没在这台机器/这个指纹环境登录过的账号时，GitHub 会拦在这一页要 8 位
+    邮箱验证码。换 AdsPower 后每个账号都是全新环境，所以**这一步几乎必然触发**，
+    不能再依赖人工。
+
+    verify_link 是该账号的若安收信链接（accounts.email_verify_link）。没有就没法收码，
+    返回 False 由调用方回退到等人工。
+
+    收码与回填复用注册流程那套（wait_for_github_launch_code_ruoanzhu + submit_email_code）——
+    同一种 8 位码、同样的分格输入框。
+
+    since：**必须由调用方在提交登录表单之前取**，用来把注册时那封旧 GitHub 码邮件挡在外面。
+    这些 hotmail 是长期真实邮箱，注册收过的码一直躺在收件箱里（实测 cunninghamh22 的
+    收件箱里就同时有旧的 "[GitHub] Please verify your device"）；不过滤就会拿旧码去填新
+    表单，现象是「明明收到了验证码却验证不通过」，而且每轮稳定复现。
+    """
+    if not verify_link:
+        return False
+    from src.services.hotmail_inbox import wait_for_github_launch_code_ruoanzhu
+    from src.browser import github_signup as gh
+
+    _step(monitor, session, "GitHub 要求新设备邮箱验证，自动收码中…")
+    code = wait_for_github_launch_code_ruoanzhu(verify_link, timeout=timeout, since=since)
+    if not code:
+        _step(monitor, session, f"{timeout}s 内未收到 GitHub 验证码邮件")
+        return False
+
+    _step(monitor, session, f"收到验证码 {code}，回填中…")
+    if not gh.submit_email_code(session, code):
+        _step(monitor, session, "验证码回填失败（输入框未命中）")
+        return False
+
+    # 回填后等 GitHub 离开验证页。提交是异步的，立刻判 URL 会读到还没跳转的旧地址。
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        time.sleep(2)
+        url = (session.current_url or "").lower()
+        if "verified-device" not in url and "two-factor" not in url:
+            _step(monitor, session, "GitHub 新设备验证已自动完成")
+            return True
+    _step(monitor, session, "已回填验证码但 60s 内仍停在验证页")
+    return False
 
 
 def _wait_github_verified(session, monitor, timeout=600):
@@ -102,11 +154,15 @@ def _wait_github_verified(session, monitor, timeout=600):
     return False
 
 
-def ensure_opencode_session(session, monitor, login_password, email):
+def ensure_opencode_session(session, monitor, login_password, email, verify_link=None):
     """确保浏览器处于 opencode 登录态，返回 (workspace_id, detail)。
 
-    未登录时尝试用 GitHub 账号密码自动登录（best-effort）。遇 GitHub 新设备验证
-    等人工环节则返回 (None, 原因)，由上层提示先手动登录一次建立 profile 登录态。
+    未登录时尝试用 GitHub 账号密码自动登录（best-effort）。
+
+    verify_link：该账号的若安收信链接。GitHub 新设备验证会用它自动收码回填；
+    不传（或收码失败）才回退到等人工 10 分钟。换 AdsPower 后每个账号都是全新指纹环境，
+    新设备验证几乎必然触发，所以这个参数实际上是必需的——缺了它整条流水线会退化成
+    「每个账号都停下来等人」。
     """
     session.get("https://opencode.ai/auth")
     time.sleep(3)
@@ -123,14 +179,19 @@ def ensure_opencode_session(session, monitor, login_password, email):
     if "/login" in (session.current_url or "").lower():
         if not login_password:
             return None, "该账号未保存登录密码，且 profile 未登录，请先手动登录一次"
+        # 收码的时间下界必须在**提交登录表单之前**取：GitHub 是在提交那一刻发信的，
+        # 取晚了会把刚到的新邮件也判成旧邮件而永远收不到码。
+        since = datetime.now()
         login = gh.login_after_signup(session, email, login_password)
         if login.get("suspended"):
             return None, "GitHub 账号被反滥用挂起（/suspended）"
         if login.get("needs_device_verification"):
-            # 用户要求：需邮箱/设备验证时不关浏览器，等待人工在浏览器里完成
-            _step(monitor, session, "GitHub 需邮箱/设备验证，请在浏览器手动输入验证码，等待中…")
-            if not _wait_github_verified(session, monitor, timeout=600):
-                return None, "GitHub 邮箱/设备验证 10 分钟内未完成"
+            # 先自动收码回填；有收信链接时这条几乎总能走通，无需人工。
+            if not _auto_verify_device(session, monitor, verify_link, since=since):
+                # 回退：不关浏览器，等人工在浏览器里输码（无收信链接的老账号才会走到这）
+                _step(monitor, session, "自动过码未成功，请在浏览器手动输入验证码，等待中…")
+                if not _wait_github_verified(session, monitor, timeout=600):
+                    return None, "GitHub 邮箱/设备验证未完成（自动收码失败且 10 分钟内无人工处理）"
         elif not login.get("ok"):
             return None, f"GitHub 登录未确认：{login.get('detail')}"
 
@@ -139,10 +200,11 @@ def ensure_opencode_session(session, monitor, login_password, email):
     # wid——凡 profile 里 opencode 会话 cookie 已过期（GitHub 能重登）的账号必然失败。
     from src.browser import opencode_login as ol
     _step(monitor, session, "GitHub 登录后建立 opencode 会话（OAuth 链）")
-    res = ol.login_and_open_own_go(session, monitor)
+    # open_go=False：充值走 zen 的 /workspace/<wid>/billing，/go 页是订阅流程才要的入口，
+    # 这里进它纯属白跑（实机每账号约 34 秒）。
+    res = ol.login_and_open_own_go(session, monitor, open_go=False)
     wid = res.get("wid")
     if wid:
-        # billing 只需要 wid；/go 落地异常（res.ok=False）不影响后续导航 billing 页
         return wid, "GitHub 登录成功并建立 opencode 会话"
     if res.get("flagged"):
         return None, "GitHub 账号被 flagged，无法授权 opencode OAuth"
@@ -559,24 +621,50 @@ def click_pay(session, monitor):
 
 
 def _captcha_challenge_present(session):
-    """检测是否出现「需人工完成」的 hCaptcha 挑战。返回 frame 或 None。
+    """检测是否出现「需人工完成」的 hCaptcha 图像挑战。返回 frame 或 None。
 
-    仅当 hcaptcha frame 存在且其可见文本含挑战文案（Verify / Please try again 等）时才算，
-    以区分需交互的挑战与 Stripe 后台常驻、无需交互的 invisible hCaptcha。
+    判据是**挑战帧真的渲染出了题目**：URL 带 #frame=challenge，且帧内有题面
+    （.prompt-text）或题格（.task-grid）。两个条件缺一不可——挑战帧会被提前创建成空壳，
+    只看 URL 会在题目出现前就误判。
+
+    2026-08-03 事故：旧实现是「任意 hcaptcha.com 帧的 body 文本命中关键词」，而关键词里
+    有 "i am human" —— 那正是常驻 checkbox 帧的固定标签，于是**页面上根本没有验证码时也
+    必然命中**。后果不是多打一行日志：每张卡白烧 3 次付费解题（约 90 秒），3 次后返回
+    needs_captcha，而 registration.py 对 needs_captcha 的处理是「账号级风控，换卡无用，
+    立即停手」——整个账号的充值当场终止，真实的付款结果（成功/拒付）被彻底掩盖。
+    实机佐证：注入诊断里 getResponse 调用数 gr=0，说明 Stripe 从未索取过验证码答案。
     """
     try:
         for fr in session.page.frames:
-            if "hcaptcha.com" not in (fr.url or "").lower():
+            if _CAPTCHA_CHALLENGE_FRAME_MARK not in (fr.url or ""):
                 continue
             try:
-                txt = (fr.inner_text("body", timeout=800) or "").lower()
+                if fr.query_selector(".prompt-text") or fr.query_selector(".task-grid"):
+                    return fr
             except Exception:
                 continue
-            if any(h in txt for h in _CAPTCHA_TEXT_HINTS):
-                return fr
     except Exception:
         pass
     return None
+
+
+def _captcha_frames_debug(session):
+    """列出当前所有 hCaptcha 帧的 URL 片段，供「为什么没判到挑战」时排查。
+
+    存在的理由：判据收紧后，若哪天真挑战因结构变化不再命中，现象是「静默不解题」，
+    从日志里看不出任何异常。这个函数让那种情况留下痕迹。
+    """
+    marks = []
+    try:
+        for fr in session.page.frames:
+            u = fr.url or ""
+            if "hcaptcha" not in u.lower():
+                continue
+            frag = u.split("#", 1)[1][:60] if "#" in u else "(无 fragment)"
+            marks.append(frag)
+    except Exception:
+        pass
+    return marks
 
 
 def _threeds_challenge_present(session):
@@ -855,6 +943,14 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
             return {"outcome": "failed", "detail": f"3DS 认证失败: {fmsg[:150]}"}
         return {"outcome": "failed",
                 "detail": f"3DS 交互挑战 {timeout}s 内未自动完成（弹窗未消失），认证失败"}
+    # 判据收紧后「没解题」是常态（页面本就没有验证码）。但万一真挑战因 hCaptcha 结构变化
+    # 不再被识别，现象同样是静默不解题——把当时的 hCaptcha 帧结构记一笔，让这种失效可查。
+    frames = _captcha_frames_debug(session)
+    if frames:
+        # 实测（2026-08-03）：Stripe 结账页会**预建**空的 frame=challenge 壳，同时挂
+        # frame=checkbox-invisible。所以看到 challenge 帧不代表出现了图像挑战——
+        # 判据是帧内有没有渲染出题面，见 _captcha_challenge_present。
+        print(f"  [诊断] 超时收尾时的 hCaptcha 帧: {frames}", flush=True)
     return {"outcome": "unknown", "detail": f"{timeout}s 内余额未增加，未确认成功"}
 
 
