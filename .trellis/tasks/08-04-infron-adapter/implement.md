@@ -24,26 +24,30 @@
 design 里说了，`Pay` 之后的页面没探过，它决定 `stripe_checkout.py` 能复用多少。
 在这一步之前写填卡代码等于赌。
 
-- [ ] **1.1** 用 `briced35@hotmail.com` 的 AdsPower 环境，走到
-  `/dashboard/credits` → `Top Up` → 选 $50 → 选 `Card` → 点 `Pay $X`，
-  **停在填卡表单出现的那一刻，不提交**。dump：
-  - URL 有没有跳到 `checkout.stripe.com`
-  - 所有 frame 的 URL
-  - 卡号/有效期/CVC 输入框的选择器与所在 frame
-  - 有没有账单地址字段、国家/州下拉
-  - hCaptcha 的形态（invisible 还是有交互）
+- [x] **1.1** 实探完成，结论见 `research/infron-payment-form.md`。**决定性事实：
+  嵌入式 Stripe Payment Element，页面不跳转**（URL 始终 `/dashboard/credits`），
+  不是 opencode 那种 hosted Checkout。
 
-- [ ] **1.2** 对照 `src/payments/stripe_checkout.py` 的现有函数，逐个判定可复用性：
-  `_stripe_frame` / `_wait_stripe_frame` / `select_card_method` /
-  `fill_card_and_address` / `fill_phone_if_present` / `uncheck_save_info` /
-  `click_pay` / `_captcha_challenge_present` / `_threeds_*`。
-  产出一张「可直接用 / 要改参数 / 要重写」的表，写进 `research/`。
+- [x] **1.2** 逐函数复用判定表已写进同一份文档。大意：**验证码与 3DS 那半
+  （最难、踩坑最多）能复用，表单定位那半要按 Payment Element 重写。**
 
-- [ ] **1.3** 若判定为「要重写」，先想清楚新代码放哪：
-  能通用化的补进 `stripe_checkout.py`（加参数而不是加分支），
-  确属 infron 特有的才放 `infron/credits.py`。
+- [x] **1.3** 定位相关的新代码放 `infron/credits.py`；`_stripe_frame` 的 frame 匹配
+  建议**加参数**支持 `elements-inner-payment-*`，而不是在里面加站点分支。
 
-**Review Gate G1**：1.2 那张表出来之前不开始 Stage 3。
+### 1.1 没能拿到的部分（Stage 3 第一件事补上）
+
+**卡号/有效期/CVC 的精确选择器没拿到。** 原因：探针没装 captcha hook，
+hCaptcha 显示 `Please try again ⚠️` 并且**把 Payment Element 卡在了加载之前**
+（frame 根本不出现）。
+
+Stage 3 写填卡代码前，**先带着 captcha hook 再探一次**把选择器补进
+`research/infron-payment-form.md`。在此之前不要照抄 opencode 的选择器——
+两边表单结构不同。
+
+这条也是个通用教训：**任何绕过编排层的 infron 调试脚本都会卡在 hCaptcha**，
+而现象（Element 不出现）看起来像页面加载慢，极易误判成别的问题。
+
+**Review Gate G1**：✅ 已通过。
 
 ---
 
@@ -99,8 +103,16 @@ a = P.get('infron'); print(isinstance(a, PlatformAdapter), sorted(a.capabilities
 - [ ] **3.3** `credits.click_pay(session, monitor)`：按 `^Pay ` 前缀匹配，
   **不认金额**（AC11）。
 
-- [ ] **3.4** 按 Stage 1 的结论接填卡：能复用就调 `stripe_checkout.py`，
-  不能就在 `credits.py` 里写。
+- [ ] **3.4a** **带 captcha hook 重探一次**，把卡号/有效期/CVC 的选择器补进
+  `research/infron-payment-form.md`。这是 Stage 1 因 hCaptcha 阻断没拿到的部分。
+
+- [ ] **3.4b** 接填卡：先点 Element 里的 `Card` tab（**默认选中的是 Alipay，不是
+  Card**），再填字段。`select_card_method` 不能复用（accordion vs tab）。
+  `_stripe_frame` 要能匹配 `elements-inner-payment-*` frame。
+
+- [ ] **3.4c** 注意两步弹窗的 `Pay $X` 按钮**同名**。用弹窗文案区分当前步骤：
+  第一步是 `Confirm details on the next step`，第二步是
+  `Enter your card or another Stripe payment method`。
 
 - [ ] **3.5** `credits.detect_payment_result(session, balance_before, ...)`：
   骨架照 opencode 那套写——轮询余额增长为成功判据，识别拒付文案 / 3DS / hCaptcha，

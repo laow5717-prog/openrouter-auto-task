@@ -6,3 +6,4 @@
 {"file": ".trellis/spec/backend/adspower-guidelines.md", "reason": "infron 必须走 AdsPower；环境按 email 共用、回收判据"}
 {"file": ".trellis/spec/backend/email-verification-guidelines.md", "reason": "收码的时间闸门原则，magic link 同样适用"}
 {"file": ".trellis/spec/backend/error-handling.md", "reason": "outcome 的不消耗卡硬约束、失败归因白名单"}
+{"file": ".trellis/tasks/08-04-infron-adapter/research/infron-payment-form.md", "reason": "填卡形态实探：Payment Element 而非 hosted Checkout、两步弹窗、Card tab 默认未选中、stripe_checkout 逐函数复用判定"}
