@@ -1,5 +1,18 @@
 const BASE = ''
 
+// 当前平台。账号状态、卡的占用与冷却全部按它隔离，服务端对卡池类接口要求必填，
+// 所以这里统一注入，而不是让每个调用点自己记得传——漏传一处就会读到错平台的数据。
+// 由 stores/app.js 在平台切换时调用 setPlatform 同步。
+let currentPlatform = 'opencode'
+
+export function setPlatform(p) {
+  if (p) currentPlatform = p
+}
+
+export function getPlatform() {
+  return currentPlatform
+}
+
 async function request(url, options = {}) {
   const res = await fetch(BASE + url, options)
   if (!res.ok) {
@@ -10,7 +23,7 @@ async function request(url, options = {}) {
 }
 
 async function get(url, params = {}) {
-  const qs = new URLSearchParams(params).toString()
+  const qs = new URLSearchParams({ platform: currentPlatform, ...params }).toString()
   const fullUrl = qs ? `${url}?${qs}` : url
   const res = await request(fullUrl)
   return res.json()
@@ -20,7 +33,7 @@ async function post(url, body = {}) {
   const res = await request(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ platform: currentPlatform, ...body }),
   })
   return res.json()
 }

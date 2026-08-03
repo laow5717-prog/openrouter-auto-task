@@ -1,5 +1,15 @@
 """
 信用卡绑定数据模型
+
+每行带 platform：绑卡任务是平台各自的，A 平台的 worker 不能领走 B 平台任务的卡，
+「已成功绑过」「已被拒付」这两个派生集合也各算各的。
+
+一处例外是 get_stripe_field_error_card_numbers——那类失败说的是卡数据本身有问题
+（卡号/有效期/地址填不进去），换哪个平台都一样，故**保持全局**。
+
+另一处例外是 reap_stale / reset_all_processing：它们回收的是「worker 失联/进程重启」
+留下的占位，语义就是全量，不按平台过滤。本次只跑单平台，全量重置是安全的；将来
+真要跨平台并发，得先把这两处改成按平台，否则一条流水线重启会清掉另一条的占位。
 """
 
 import json
@@ -9,15 +19,16 @@ class CardBindingModel:
     def __init__(self, db):
         self.db = db
 
-    def create_batch(self, task_id, cards):
+    def create_batch(self, platform, task_id, cards):
         """批量创建绑定记录，返回 record id 列表"""
         ids = []
         for card in cards:
             display = card['number'][-4:] if len(card.get('number', '')) >= 4 else card.get('number', '????')
             card_json = json.dumps(card)
             cursor = self.db.execute(
-                "INSERT INTO card_bindings (task_id, card_display, card_data_json) VALUES (?, ?, ?)",
-                (task_id, display, card_json),
+                "INSERT INTO card_bindings (platform, task_id, card_display, card_data_json) "
+                "VALUES (?, ?, ?, ?)",
+                (platform, task_id, display, card_json),
             )
             ids.append(cursor.lastrowid)
         return ids
@@ -64,7 +75,11 @@ class CardBindingModel:
 
         与 get_pending 的区别：get_pending 只读不占位，并发下多个 worker 会拿到
         同一批卡；claim_batch 在同一条语句内完成"选中+占位"，是并发场景下的唯一
-        正确入口。"""
+        正确入口。
+
+        不按 platform 过滤是有意的：一个 task 天然只属于一个平台（建任务时就定死了），
+        task_id 已经把范围收到单平台内。再加一层 platform 条件不增加任何隔离，却会在
+        create_batch 万一把 platform 写空时让领卡静默返回空——那种故障比多余的防御难查得多。"""
         if limit <= 0:
             return []
         self.db.execute(
@@ -125,7 +140,11 @@ class CardBindingModel:
         return [dict(r) for r in rows]
 
     def get_stripe_field_error_card_numbers(self):
-        """获取所有因 Stripe 字段错误而失败的卡号（跨所有任务），这类卡数据本身有问题，重启也无法成功"""
+        """获取所有因 Stripe 字段错误而失败的卡号（跨所有任务、**跨所有平台**）。
+
+        刻意不按平台过滤：这类失败说的是卡数据本身有问题（卡号/有效期/账单地址填不
+        进去），换个平台一样填不进去。按平台隔离反而会让同一张脏卡在每个平台各踩一遍坑。
+        """
         rows = self.db.fetchall(
             "SELECT card_data_json FROM card_bindings WHERE status='failed' AND error LIKE '[Stripe字段错误]%' AND card_data_json IS NOT NULL"
         )
@@ -139,10 +158,12 @@ class CardBindingModel:
                 pass
         return numbers
 
-    def get_successfully_bound_card_numbers(self):
-        """获取所有已成功绑定的卡号（跨所有任务）"""
+    def get_successfully_bound_card_numbers(self, platform):
+        """获取该平台所有已成功绑定的卡号（跨该平台的所有任务）"""
         rows = self.db.fetchall(
-            "SELECT card_data_json FROM card_bindings WHERE status='success' AND card_data_json IS NOT NULL"
+            "SELECT card_data_json FROM card_bindings "
+            "WHERE platform=? AND status='success' AND card_data_json IS NOT NULL",
+            (platform,),
         )
         numbers = set()
         for r in rows:
@@ -154,7 +175,7 @@ class CardBindingModel:
                 pass
         return numbers
 
-    def mark_declined_by_number(self, card_number, reason=''):
+    def mark_declined_by_number(self, platform, card_number, reason=''):
         """把指定卡号的**成功绑定**记录标记为失效（Top-up 因卡本身被拒）。
 
         复用 status+error 前缀模式（与 [Stripe字段错误] 同类）：置 status='failed'、
@@ -163,7 +184,9 @@ class CardBindingModel:
         if not card_number:
             return 0
         rows = self.db.fetchall(
-            "SELECT id, card_data_json FROM card_bindings WHERE status='success' AND card_data_json IS NOT NULL"
+            "SELECT id, card_data_json FROM card_bindings "
+            "WHERE platform=? AND status='success' AND card_data_json IS NOT NULL",
+            (platform,),
         )
         ids = []
         for r in rows:
@@ -180,10 +203,16 @@ class CardBindingModel:
             )
         return len(ids)
 
-    def get_declined_card_numbers(self):
-        """获取所有因 Top-up 拒付被标记失效的卡号（跨所有任务），补绑阶段据此跳过"""
+    def get_declined_card_numbers(self, platform):
+        """获取该平台因 Top-up 拒付被标记失效的卡号，补绑阶段据此跳过。
+
+        按平台算：拒付是发卡行对**这个商户**的判断，换个平台可能就过了。
+        """
         rows = self.db.fetchall(
-            "SELECT card_data_json FROM card_bindings WHERE status='failed' AND error LIKE '[充值拒付]%' AND card_data_json IS NOT NULL"
+            "SELECT card_data_json FROM card_bindings "
+            "WHERE platform=? AND status='failed' AND error LIKE '[充值拒付]%' "
+            "AND card_data_json IS NOT NULL",
+            (platform,),
         )
         numbers = set()
         for r in rows:

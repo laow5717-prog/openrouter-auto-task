@@ -117,27 +117,31 @@ def test_empty_email_is_never_claimable():
     assert reg.claim(None) is False
 
 
+OC = 'opencode'
+OTHER = 'infron'
+
+
 # ==================== PaymentCardRegistry ====================
 
 
 def test_card_cannot_be_used_by_two_accounts():
     reg = _state().payment_registry
-    assert reg.try_acquire('4111111111111111', 'a@example.com') is True
-    assert reg.try_acquire('4111111111111111', 'b@example.com') is False
+    assert reg.try_acquire(OC, '4111111111111111', 'a@example.com') is True
+    assert reg.try_acquire(OC, '4111111111111111', 'b@example.com') is False
 
 
 def test_card_reacquire_by_same_account_is_idempotent():
     """同一账号内一张卡可支付多笔，重复占用必须成功。"""
     reg = _state().payment_registry
-    assert reg.try_acquire('4111', 'a@example.com') is True
-    assert reg.try_acquire('4111', 'a@example.com') is True
+    assert reg.try_acquire(OC, '4111', 'a@example.com') is True
+    assert reg.try_acquire(OC, '4111', 'a@example.com') is True
 
 
 def test_card_release_frees_it_for_others():
     reg = _state().payment_registry
-    reg.try_acquire('4111', 'a@example.com')
+    reg.try_acquire(OC, '4111', 'a@example.com')
     reg.release('4111')
-    assert reg.try_acquire('4111', 'b@example.com') is True
+    assert reg.try_acquire(OC, '4111', 'b@example.com') is True
 
 
 def test_concurrent_card_acquire_has_single_winner():
@@ -148,7 +152,7 @@ def test_concurrent_card_acquire_has_single_winner():
 
     def attempt(i):
         barrier.wait()
-        ok = reg.try_acquire('4111', f'acct{i}@example.com')
+        ok = reg.try_acquire(OC, '4111', f'acct{i}@example.com')
         with lock:
             results.append(ok)
 
@@ -164,8 +168,8 @@ def test_concurrent_card_acquire_has_single_winner():
 
 def test_empty_card_number_is_never_acquirable():
     reg = _state().payment_registry
-    assert reg.try_acquire('', 'a@example.com') is False
-    assert reg.try_acquire(None, 'a@example.com') is False
+    assert reg.try_acquire(OC, '', 'a@example.com') is False
+    assert reg.try_acquire(OC, None, 'a@example.com') is False
 
 
 # ==================== 回归：争用不等于耗尽 ====================
@@ -180,13 +184,13 @@ def test_release_lets_a_waiting_worker_proceed():
     reg = _state().payment_registry
 
     # W1 取卡付款
-    assert reg.try_acquire('4111', 'a@example.com') is True
+    assert reg.try_acquire(OC, '4111', 'a@example.com') is True
     # W2 此刻拿不到
-    assert reg.try_acquire('4111', 'b@example.com') is False
+    assert reg.try_acquire(OC, '4111', 'b@example.com') is False
     # W1 这笔付完就放
     reg.release('4111')
     # W2 立刻可用——不必等 W1 整个账号跑完
-    assert reg.try_acquire('4111', 'b@example.com') is True
+    assert reg.try_acquire(OC, '4111', 'b@example.com') is True
 
 
 def test_in_flight_set_empties_after_each_attempt():
@@ -194,7 +198,7 @@ def test_in_flight_set_empties_after_each_attempt():
     reg = _state().payment_registry
     for i in range(5):
         num = f'411{i}'
-        reg.try_acquire(num, 'a@example.com')
+        reg.try_acquire(OC, num, 'a@example.com')
         reg.release(num)
     assert reg.in_flight_numbers() == set()
 
@@ -202,28 +206,28 @@ def test_in_flight_set_empties_after_each_attempt():
 def test_used_numbers_survives_release():
     """本轮归属在 release 后仍保留——它是选卡层去重的依据，不能随 in-flight 一起消失。"""
     reg = _state().payment_registry
-    reg.try_acquire('4444', 'a@example.com')
+    reg.try_acquire(OC, '4444', 'a@example.com')
     reg.release('4444')
-    assert '4444' in reg.used_numbers()
+    assert '4444' in reg.used_numbers(OC)
     assert '4444' not in reg.in_flight_numbers()
 
 
 def test_release_all_clears_round_ownership():
     """整轮结束后归属清空，下一轮这张卡可以给别的账号用。"""
     reg = _state().payment_registry
-    reg.try_acquire('4333', 'a@example.com')
+    reg.try_acquire(OC, '4333', 'a@example.com')
     reg.release('4333')
     reg.release_all()
-    assert reg.used_numbers() == set()
+    assert reg.used_numbers(OC) == set()
 
 
 def test_used_records_first_account_only():
     """归属记首个使用者；同一账号重复取不改归属。"""
     reg = _state().payment_registry
-    reg.try_acquire('4555', 'a@example.com')
+    reg.try_acquire(OC, '4555', 'a@example.com')
     reg.release('4555')
-    reg.try_acquire('4555', 'a@example.com')
-    assert reg._used['4555'] == 'a@example.com'
+    reg.try_acquire(OC, '4555', 'a@example.com')
+    assert reg._used[(OC, '4555')] == 'a@example.com'
 
 
 # ==================== 选卡层：同一轮不重复用卡 ====================
@@ -241,9 +245,9 @@ def test_eligible_cards_excludes_cards_used_by_other_accounts():
     并标 invalid，只是后者的快照更早），白烧一次拒付还叠加风控 velocity。
     """
     state = _state()
-    state.payment_registry.try_acquire('4111', 'a@example.com')
+    state.payment_registry.try_acquire(OC, '4111', 'a@example.com')
     state.payment_registry.release('4111')
-    left = state._exclude_used_this_run(_cards('4111', '4222', '4333'))
+    left = state._exclude_used_this_run(OC, _cards('4111', '4222', '4333'))
     assert [c['number'] for c in left] == ['4222', '4333']
 
 
@@ -252,15 +256,76 @@ def test_eligible_cards_falls_back_when_all_used():
     编排层据此永久放弃该账号——这个坑早先踩过。"""
     state = _state()
     for n in ('4111', '4222'):
-        state.payment_registry.try_acquire(n, 'a@example.com')
+        state.payment_registry.try_acquire(OC, n, 'a@example.com')
         state.payment_registry.release(n)
-    left = state._exclude_used_this_run(_cards('4111', '4222'))
+    left = state._exclude_used_this_run(OC, _cards('4111', '4222'))
     assert [c['number'] for c in left] == ['4111', '4222']
 
 
 def test_exclude_used_normalises_spaces_in_card_numbers():
     """卡池里的卡号可能带空格，登记表存的是原样串，比对必须去空格后再比。"""
     state = _state()
-    state.payment_registry.try_acquire('4111222233334444', 'a@example.com')
-    left = state._exclude_used_this_run(_cards('4111 2222 3333 4444', '4222'))
+    state.payment_registry.try_acquire(OC, '4111222233334444', 'a@example.com')
+    left = state._exclude_used_this_run(OC, _cards('4111 2222 3333 4444', '4222'))
     assert [c['number'] for c in left] == ['4222']
+
+
+# ==================== 跨平台：两级排他的语义刻意相反（AC6） ====================
+
+
+def test_used_is_isolated_per_platform():
+    """本轮归属按平台隔离：在 opencode 试过的卡，不影响另一个平台的选卡。
+
+    _used 纯粹是选卡策略——避免同一轮里两个账号做重复功。「在 opencode 试过」
+    对另一个平台没有参考意义，那边它还是张没人碰过的新卡。
+    """
+    state = _state()
+    state.payment_registry.try_acquire(OC, '4111', 'a@example.com')
+    state.payment_registry.release('4111')
+
+    assert state.payment_registry.used_numbers(OC) == {'4111'}
+    assert state.payment_registry.used_numbers(OTHER) == set()
+
+    left = state._exclude_used_this_run(OTHER, _cards('4111', '4222'))
+    assert [c['number'] for c in left] == ['4111', '4222'], "别的平台不该被 opencode 的归属挡住"
+
+
+def test_in_flight_stays_global_across_platforms():
+    """in-flight **不**按平台隔离：同一张卡不能同时在两个平台提交支付。
+
+    这不是并发正确性问题，是业务风险——发卡行看的是卡，不是我们在跑哪个平台。
+    同一张卡在两处同时扣款会叠加 velocity 风控，比单平台重复刷更容易被拒甚至锁卡。
+    """
+    reg = _state().payment_registry
+    assert reg.try_acquire(OC, '4111', 'a@example.com') is True
+    assert reg.try_acquire(OTHER, '4111', 'b@example.com') is False, \
+        "同一张卡在另一个平台也必须被 in-flight 拦住"
+
+    reg.release('4111')
+    assert reg.try_acquire(OTHER, '4111', 'b@example.com') is True
+
+
+def test_release_all_by_platform_keeps_other_platform_and_in_flight():
+    """轮边界只清本平台的归属：另一个平台的归属与全局 in-flight 都不受影响。"""
+    reg = _state().payment_registry
+    reg.try_acquire(OC, '4111', 'a@example.com')
+    reg.try_acquire(OTHER, '4222', 'b@example.com')
+
+    reg.release_all(OC)
+
+    assert reg.used_numbers(OC) == set()
+    assert reg.used_numbers(OTHER) == {'4222'}
+    assert reg.in_flight_numbers() == {'4111', '4222'}, "轮边界不该打断全局 in-flight"
+
+
+def test_release_all_without_platform_clears_everything():
+    """任务收尾（不带平台）则全清，含 in-flight。"""
+    reg = _state().payment_registry
+    reg.try_acquire(OC, '4111', 'a@example.com')
+    reg.try_acquire(OTHER, '4222', 'b@example.com')
+
+    reg.release_all()
+
+    assert reg.used_numbers(OC) == set()
+    assert reg.used_numbers(OTHER) == set()
+    assert reg.in_flight_numbers() == set()

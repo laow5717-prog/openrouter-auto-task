@@ -498,7 +498,7 @@ class AppState:
         """卡号比对键：去空格。卡池里的卡号可能带内部空格，登记表里存的是原样字符串。"""
         return str(number or '').replace(' ', '')
 
-    def _exclude_used_this_run(self, cards):
+    def _exclude_used_this_run(self, platform, cards):
         """剔除本轮已被**其它账号**试过的卡；全被试过时原样返回。
 
         为什么要剔除：_eligible_cards 是每个账号进入时的一次性快照，并行 worker 从同一
@@ -512,7 +512,7 @@ class AppState:
         tests/test_registry.py::test_release_lets_a_waiting_worker_proceed），
         宁可偶尔重复一张，也不能让账号被误弃。
         """
-        used = self.payment_registry.used_numbers()
+        used = self.payment_registry.used_numbers(platform)
         if not used:
             return cards
         used_keys = {self._card_key(n) for n in used}
@@ -522,8 +522,12 @@ class AppState:
         self.add_log("[选卡] 本轮可选卡已全部被其它账号试过，放开重复限制以免账号被误弃")
         return cards
 
-    def _eligible_cards(self, group_id, exclude_used=True):
-        """返回该分组当前「可选」的卡，有序：新卡优先，再复用好卡。
+    def _eligible_cards(self, group_id, exclude_used=True, platform=None):
+        """返回该分组在指定平台当前「可选」的卡，有序：新卡优先，再复用好卡。
+
+        platform 省略时用 self.platform（当前流水线/界面选中的平台）。整条判定链——
+        可用状态、冷却、新卡还是好卡、本轮是否被试过——全部按这个平台算，所以同一张卡
+        在别的平台的遭遇不会影响这里的结果。
 
         可选 = get_usable_cards_as_list（已排除 expired/invalid/bound）且不处于临时冷却
         （3DS / 「曾成功卡本次被拒」的速率冷却）中。排序：
@@ -534,14 +538,15 @@ class AppState:
         exclude_used=True 时再剔除本轮已被其它账号试过的卡（见 _exclude_used_this_run）。
         统计用途（启动前算「分组有多少可选卡」）应传 False，否则数字会随本轮进度缩水。"""
         models = self.models
-        usable, _ = models['card_pool'].get_usable_cards_as_list(group_id)
+        platform = platform or self.platform
+        usable, _ = models['card_pool'].get_usable_cards_as_list(platform, group_id)
         cooldown_map = {}
         try:
-            cooldown_map = models['card_state'].get_state_map()
+            cooldown_map = models['card_state'].get_state_map(platform)
         except Exception:
             cooldown_map = {}
         try:
-            success_nums = models['recharge_log'].all_success_card_numbers()
+            success_nums = models['recharge_log'].all_success_card_numbers(platform)
         except Exception:
             success_nums = set()
         fresh, good = [], []
@@ -553,7 +558,7 @@ class AppState:
             # 去空格，保证「新卡/好卡」分类与记账口径一致（卡号含内部空格时也不误判）。
             (good if num.replace(' ', '') in success_nums else fresh).append(c)
         cards = fresh + good
-        return self._exclude_used_this_run(cards) if exclude_used else cards
+        return self._exclude_used_this_run(platform, cards) if exclude_used else cards
 
     def _recharge_one_account(self, email, login_password, payment_group_id=None,
                               worker=None, captcha_api_key=None,
@@ -702,9 +707,14 @@ class AppState:
             # （避免重复充值/空开浏览器），但这不影响它在别的平台被选中。
             # 排除 done——本次运行已终结的账号。
             def _payable_now():
+                # 两次查询的**先后有讲究**：平台状态是排除依据，必须后读、取最新一份。
+                # 反过来先读平台状态再读账号列表的话，worker 在两次查询之间刚写完
+                # 'recharged'，这里就会拿着过期的平台状态把它当成可充值账号再发一次
+                # ——同一账号被充两次。判据读得越晚，这个窗口越窄。
+                accounts = account_model.get_all(order_desc=False)
                 platform_status = platform_account_model.map_by_email(platform)
                 return [
-                    a for a in account_model.get_all(order_desc=False)
+                    a for a in accounts
                     if (login_password or a.get('login_password'))
                     and not is_identity_terminal(a.get('identity_status'))
                     and not is_platform_terminal(
@@ -827,7 +837,9 @@ class AppState:
                 round_state['cards_at_start'] = cards_now
                 with state_lock:
                     failed_this_round.clear()
-                self.payment_registry.release_all()   # 「本轮已被试过的卡」标记随轮清零
+                # 「本轮已被试过的卡」标记随轮清零。只清本平台的归属，in-flight 不动
+                # ——那是全局的发卡行 velocity 防护，不该被轮边界打断。
+                self.payment_registry.release_all(platform)
                 zero_note = ("，上轮零进展（容忍一轮，可能是瞬时抖动）"
                              if round_state['zero_rounds'] else "")
                 self._hooked_print(
@@ -1126,14 +1138,15 @@ class AppState:
                 last4 = str(num)[-4:]
                 self.set_action(worker, f"{email} 订阅试卡 ****{last4}")
                 self.add_log(f"{email} 订阅试卡 ****{last4}（第 {i}/{len(cards)} 张）")
-                log_id = models['recharge_log'].create(email, num, amount=5)
+                log_id = models['recharge_log'].create(platform, email, num, amount=5)
                 res = subscribe_via_stripe(session, card, wid, monitor=monitor,
                                            should_stop=lambda: self.stop_requested, dry=False)
                 oc = res.get('outcome')
                 if oc == 'success':
-                    models['card_pool'].mark_status_by_number(num, 'paid')
+                    models['card_pool'].mark_status_by_number(platform, num, 'paid')
                     try:
-                        models['valid_card'].record(card, source_type='payment', source_email=email)
+                        models['valid_card'].record(platform, card, source_type='payment',
+                                                    source_email=email)
                     except Exception:
                         pass
                     models['platform_account'].update_status(platform, email, 'subscribed')
@@ -1144,12 +1157,13 @@ class AppState:
                 elif oc == 'failed':
                     # 曾成功过的有效卡（in valid_cards）本次被拒：不判无效，改打 24h 速率冷却，
                     # 本轮跳过、到期恢复可用；从未成功过的卡才判无效。与 registration.py 一致。
-                    if models['valid_card'].is_valid(num):
+                    # 判据按平台算：卡在别的平台成功过不算数，那边的商户与风控都不同。
+                    if models['valid_card'].is_valid(platform, num):
                         models['card_state'].set_cooldown(
-                            num, hours=24, reason='曾成功卡本次支付失败，速率冷却')
+                            platform, num, hours=24, reason='曾成功卡本次支付失败，速率冷却')
                         note = '曾成功有效卡，24h 冷却'
                     else:
-                        models['card_pool'].mark_invalid_by_number(num)
+                        models['card_pool'].mark_invalid_by_number(platform, num)
                         note = '标 invalid'
                     models['recharge_log'].mark_failed(log_id, error=res.get('err', ''),
                                                        api_response={"result": res})
@@ -1217,8 +1231,10 @@ class AppState:
             # 身份层排除封禁/挂起/被拒/被 flag（flagged=GitHub 禁授权，无解，所有平台通吃）；
             # 平台层排除本平台已订阅/已充值/已归档——同一邮箱在别的平台的进度不影响这里。
             def _needing():
+                # 同 _payable_now：作为排除依据的平台状态后读，缩小重复派发的窗口。
+                accounts = account_model.get_all(order_desc=False)
                 platform_status = platform_account_model.map_by_email(platform)
-                return [a for a in account_model.get_all(order_desc=False)
+                return [a for a in accounts
                         if not is_identity_terminal(a.get('identity_status'))
                         and not is_platform_terminal(
                             (platform_status.get(a['email']) or {}).get('status'))]

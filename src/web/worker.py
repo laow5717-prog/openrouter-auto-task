@@ -114,15 +114,23 @@ class PaymentCardRegistry:
     本注册表补的正是"判定合格"到"写入结果"之间的时间差窗口，与 DB 派生规则叠加
     使用（双闸门）。内存态，进程崩溃即丢，此时 DB 规则仍是第二道闸。
 
-    两级排他：
-      _in_flight —— "此刻正在刷"，用完即放，防两个 worker 同时刷同一张卡；
-      _used      —— "本轮已被某账号试过"，整轮才清，防一张卡在同一轮里被第二个账号重刷。
+    两级排他，**两级的平台语义刻意不同**：
+
+      _in_flight —— "此刻正在刷"，用完即放。key 是裸卡号，**全局，不按平台隔离**。
+                    这不是并发正确性问题，是业务风险：同一张卡在两个平台同时向发卡行
+                    提交扣款会叠加 velocity 风控，比单平台重复刷更容易触发拒付甚至锁卡。
+                    发卡行看的是卡，不是我们在跑哪个平台。
+
+      _used      —— "本轮已被某账号试过"，整轮才清。key 是 (platform, card_number)，
+                    **按平台隔离**。它纯粹是选卡策略——避免同一轮里两个账号刷同一张卡
+                    做无用功；而"在 opencode 试过"对另一个平台没有任何参考意义，那边
+                    它还是张没人碰过的新卡。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._in_flight = {}               # card_number -> email（正在刷）
-        # card_number -> 首个试过它的 email。release 后仍保留，整轮结束才清空。
+        self._in_flight = {}               # card_number -> email（正在刷；全局）
+        # (platform, card_number) -> 首个试过它的 email。release 后仍保留，整轮结束才清空。
         #
         # 为什么需要它：_eligible_cards 是每个账号**进入时的一次性快照**，两个 worker
         # 从同一个有序列表的头部出发，只差几十秒。只有 in_flight 排他时，A 刷完某张卡
@@ -134,8 +142,11 @@ class PaymentCardRegistry:
         # 准入判断——理由见 try_acquire 的注释。
         self._used = {}
 
-    def try_acquire(self, card_number, email):
+    def try_acquire(self, platform, card_number, email):
         """占用一张支付卡。已被其它账号**正在使用**则返回 False。
+
+        in-flight 判定不看 platform（同一张卡同时在两个平台提交支付同样要拦），
+        platform 只用来登记 _used 的本轮归属。
 
         同一账号重复占用同一张卡视为成功（幂等），因为串行路径内允许一张卡
         为同一账号支付多笔。
@@ -152,7 +163,7 @@ class PaymentCardRegistry:
             if holder is not None and holder != email:
                 return False
             self._in_flight[card_number] = email
-            self._used.setdefault(card_number, email)
+            self._used.setdefault((platform, card_number), email)
             return True
 
     def release(self, card_number):
@@ -164,15 +175,21 @@ class PaymentCardRegistry:
         with self._lock:
             return set(self._in_flight)
 
-    def used_numbers(self):
-        """本轮已被某个账号试过的卡号集合。"""
+    def used_numbers(self, platform):
+        """该平台本轮已被某个账号试过的卡号集合。"""
         with self._lock:
-            return set(self._used)
+            return {num for (plat, num) in self._used if plat == platform}
 
-    def release_all(self):
+    def release_all(self, platform=None):
+        """清空占用。platform 为 None 时连同 in-flight 一并全清（任务收尾）；
+        传了平台则只清该平台的本轮归属，in-flight 不动（轮边界）。"""
         with self._lock:
-            self._in_flight.clear()
-            self._used.clear()
+            if platform is None:
+                self._in_flight.clear()
+                self._used.clear()
+                return
+            for key in [k for k in self._used if k[0] == platform]:
+                del self._used[key]
 
 
 class ProxyRegistry:

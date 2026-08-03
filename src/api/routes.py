@@ -706,6 +706,7 @@ def _attach_recharge_counts(card, counts):
 @api.route('/api/card-pool/<int:group_id>')
 def get_card_pool(group_id):
     models = get_models()
+    platform = _req_platform()
     page = int(request.args.get('page', 1))
     page_size = int(request.args.get('page_size', 20))
     bucket = request.args.get('bucket', '')  # ''=全部 / valid / unverified / invalid
@@ -713,21 +714,22 @@ def get_card_pool(group_id):
     # 先按当前日期刷新过期状态，列表里直接能看到哪些卡已过期
     models['card_pool'].refresh_expired_status(group_id)
     cards, total = models['card_pool'].get_by_group(
-        group_id, page=page, page_size=page_size, bucket=bucket)
+        platform, group_id, page=page, page_size=page_size, bucket=bucket)
 
-    # 标记有效卡 + 选卡规则状态（供列表状态列展示 3DS临时/24h次数冷却）
-    recharge_counts = models['recharge_log'].count_success_by_last4()
+    # 标记有效卡 + 选卡规则状态（供列表状态列展示 3DS临时/24h次数冷却）。
+    # 全部按当前平台算——同一张卡在别的平台的冷却与绑定跟这个列表无关。
+    recharge_counts = models['recharge_log'].count_success_by_last4(platform)
     for card in cards:
         num = card['card_number']
-        card['is_valid'] = models['valid_card'].is_valid(num)
-        card['tds_cooldown'] = models['card_state'].in_tds_cooldown(num)
-        card['rate_cooldown'] = models['recharge_log'].success_count_since(num, 24) >= 2
-        card['bound_email'] = models['valid_card'].get_bound_email(num)
+        card['is_valid'] = models['valid_card'].is_valid(platform, num)
+        card['tds_cooldown'] = models['card_state'].in_tds_cooldown(platform, num)
+        card['rate_cooldown'] = models['recharge_log'].success_count_since(platform, num, 24) >= 2
+        card['bound_email'] = models['valid_card'].get_bound_email(platform, num)
         _attach_recharge_counts(card, recharge_counts)
 
-    buckets = models['card_pool'].count_buckets(group_id)
+    buckets = models['card_pool'].count_buckets(platform, group_id)
     return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size,
-                    "bucket": bucket, "buckets": buckets})
+                    "bucket": bucket, "buckets": buckets, "platform": platform})
 
 
 @api.route('/api/card-pool/merge', methods=['POST'])
@@ -755,7 +757,8 @@ def merge_card_pools():
             return jsonify({"error": f"源分组 {gid} 不存在"}), 404
 
     new_id = models['card_group'].create(name, group_type=group_type)
-    result = models['card_pool'].move_non_invalid_to_group(source_ids, new_id, bucket=bucket)
+    result = models['card_pool'].move_non_invalid_to_group(
+        _req_platform(), source_ids, new_id, bucket=bucket)
     return jsonify({"status": "ok", "group_id": new_id,
                     "moved": result['moved'], "deduped": result['deduped']})
 
@@ -788,7 +791,8 @@ def move_cards_to_group(group_id):
     if not models['card_group'].get_by_id(target_id):
         return jsonify({"error": "目标分组不存在"}), 404
 
-    result = models['card_pool'].move_bucket_to_group(group_id, target_id, bucket, limit)
+    result = models['card_pool'].move_bucket_to_group(
+        _req_platform(), group_id, target_id, bucket, limit)
     return jsonify({"status": "ok", "moved": result['moved'], "skipped": result['skipped']})
 
 
@@ -798,7 +802,7 @@ def delete_invalid_cards(group_id):
     models = get_models()
     if not models['card_group'].get_by_id(group_id):
         return jsonify({"error": "分组不存在"}), 404
-    deleted = models['card_pool'].delete_invalid_by_group(group_id)
+    deleted = models['card_pool'].delete_invalid_by_group(_req_platform(), group_id)
     return jsonify({"status": "ok", "deleted": deleted})
 
 
@@ -861,18 +865,20 @@ _POOL_STATUS_ZH = {'': '在库(未验证)', 'paid': '有效(已支付)', 'invali
                    'expired': '已过期', 'bound': '已绑定'}
 
 
-def _valid_card_status(models, card):
-    """给一张有效卡补充选卡状态：绑定账号、3DS临时冷却、24h次数冷却、汇总状态文案、池内分组/状态。"""
+def _valid_card_status(models, card, platform):
+    """给一张有效卡补充选卡状态：绑定账号、3DS临时冷却、24h次数冷却、汇总状态文案、池内分组/状态。
+
+    全部按 platform 算：冷却、池内状态在各平台各不相同。"""
     num = card.get('card_number', '')
-    tds = models['card_state'].in_tds_cooldown(num)
-    rate = models['recharge_log'].success_count_since(num, 24) >= 2
+    tds = models['card_state'].in_tds_cooldown(platform, num)
+    rate = models['recharge_log'].success_count_since(platform, num, 24) >= 2
     card['bound_email'] = card.get('source_email', '') if card.get('source_type') == 'payment' else ''
     card['tds_cooldown'] = bool(tds)
     card['rate_cooldown'] = bool(rate)
-    card['tds_until'] = models['card_state'].get_tds_until(num)
+    card['tds_until'] = models['card_state'].get_tds_until(platform, num)
     card['status_text'] = '3DS临时冷却' if tds else ('24h达2次冷却' if rate else '可用')
     # 池内位置：该有效卡当前在卡池哪个分组、什么状态（解释"为何不计入某分组的有效桶"）
-    locs = models['card_pool'].get_locations_by_number(num)
+    locs = models['card_pool'].get_locations_by_number(platform, num)
     if locs:
         card['pool_group'] = '，'.join((l.get('group_name') or str(l.get('group_id'))) for l in locs)
         card['pool_status'] = '，'.join(_POOL_STATUS_ZH.get(l.get('status') or '', l.get('status') or '') for l in locs)
@@ -885,20 +891,22 @@ def _valid_card_status(models, card):
 @api.route('/api/valid-cards')
 def get_valid_cards():
     models = get_models()
+    platform = _req_platform()
     page = int(request.args.get('page', 1))
     page_size = int(request.args.get('page_size', 20))
     source_type = request.args.get('source_type', '')
     keyword = request.args.get('keyword', '')
     cards, total = models['valid_card'].get_all(
-        page=page, page_size=page_size,
+        platform, page=page, page_size=page_size,
         source_type=source_type, keyword=keyword,
     )
-    recharge_counts = models['recharge_log'].count_success_by_last4()
+    recharge_counts = models['recharge_log'].count_success_by_last4(platform)
     for c in cards:
-        _valid_card_status(models, c)
+        _valid_card_status(models, c, platform)
         _attach_recharge_counts(c, recharge_counts)
-    summary = models['valid_card'].get_summary()
-    return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size, "summary": summary})
+    summary = models['valid_card'].get_summary(platform)
+    return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size,
+                    "summary": summary, "platform": platform})
 
 
 @api.route('/api/valid-cards/export')
@@ -910,7 +918,7 @@ def export_valid_cards():
     models = get_models()
     platform = _req_platform()
     source_type = request.args.get('source_type', '')
-    cards = models['valid_card'].get_all_for_export(source_type)
+    cards = models['valid_card'].get_all_for_export(platform, source_type)
 
     # 关联账号信息：身份层取密码，平台层取该平台的状态
     acct_map = {a['email']: a for a in models['account'].get_all(order_desc=False)}
@@ -925,9 +933,9 @@ def export_valid_cards():
     ws = wb.active
     ws.title = '有效卡'
     ws.append(headers)
-    recharge_counts = models['recharge_log'].count_success_by_last4()
+    recharge_counts = models['recharge_log'].count_success_by_last4(platform)
     for c in cards:
-        _valid_card_status(models, c)
+        _valid_card_status(models, c, platform)
         _attach_recharge_counts(c, recharge_counts)
         email = c.get('source_email', '') or ''
         acct = acct_map.get(email, {})

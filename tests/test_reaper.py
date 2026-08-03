@@ -16,7 +16,7 @@ def _reaper(db, timeout=20):
 
 
 def test_reap_once_reclaims_timed_out_cards(db, card_model, task_id):
-    card_model.create_batch(task_id, make_cards(3))
+    card_model.create_batch('opencode', task_id, make_cards(3))
     claimed = card_model.claim_batch(task_id, 'W1', limit=3)
     db.execute(
         "UPDATE card_bindings SET claimed_at=datetime('now','localtime','-45 minutes') WHERE id=?",
@@ -30,7 +30,7 @@ def test_reap_once_reclaims_timed_out_cards(db, card_model, task_id):
 
 
 def test_reap_once_is_quiet_when_nothing_expired(db, card_model, task_id):
-    card_model.create_batch(task_id, make_cards(2))
+    card_model.create_batch('opencode', task_id, make_cards(2))
     card_model.claim_batch(task_id, 'W1', limit=2)
 
     st, reaper = _reaper(db)
@@ -52,7 +52,7 @@ def test_reap_once_swallows_errors(db):
 
 def test_reclaimed_card_can_be_consumed_by_another_worker(db, card_model, task_id):
     """AC4 的核心：回收后的卡必须能被后续 worker 正常领取。"""
-    card_model.create_batch(task_id, make_cards(2))
+    card_model.create_batch('opencode', task_id, make_cards(2))
     card_model.claim_batch(task_id, 'W1', limit=2)
     db.execute("UPDATE card_bindings SET claimed_at=datetime('now','localtime','-60 minutes')")
 
@@ -73,7 +73,7 @@ def test_startup_resets_leftover_processing():
     from src.models.task import TaskModel
     cm = CardBindingModel(db)
     tid = TaskModel(db).create('test', config={})
-    cm.create_batch(tid, make_cards(5))
+    cm.create_batch('opencode', tid, make_cards(5))
     cm.claim_batch(tid, 'W1', limit=5)
     assert cm.get_summary(tid)['processing'] == 5
     db.close()

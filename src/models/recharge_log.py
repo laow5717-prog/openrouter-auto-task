@@ -1,5 +1,14 @@
 """
 充值记录数据模型
+
+每条记录带 platform：它是「这张卡在这个平台上付款成功过没有」的唯一真值来源，
+而那个判断直接决定拒付时是**判废**还是**只冷却**（见 registration.recharge_account）。
+漏掉 platform 过滤的后果很具体：一张在 opencode 成功过的卡，到了新平台被拒也只会
+进冷却、永远标不成 invalid，于是每轮都被重新选中、反复拒付，把额度和风控配额一起耗光。
+
+统计类查询（all_success_card_numbers / last_success_at / success_count_since /
+count_success_by_last4 / get_success_card_numbers）因此一律要求 platform。
+create/mark_* 这类按 id 操作的写入不需要——记录建的时候平台就定死了。
 """
 
 import json
@@ -9,11 +18,11 @@ class RechargeLogModel:
     def __init__(self, db):
         self.db = db
 
-    def create(self, email, card_display='', amount=10):
+    def create(self, platform, email, card_display='', amount=10):
         """创建充值记录，返回记录 ID"""
         cursor = self.db.execute(
-            "INSERT INTO recharge_logs (email, card_display, amount) VALUES (?, ?, ?)",
-            (email, card_display, amount),
+            "INSERT INTO recharge_logs (platform, email, card_display, amount) VALUES (?, ?, ?, ?)",
+            (platform, email, card_display, amount),
         )
         return cursor.lastrowid
 
@@ -43,10 +52,10 @@ class RechargeLogModel:
             (log_id,),
         )
 
-    def has_today_record(self, email, card_last4=''):
-        """检查今日是否已有充值记录（不管成功失败）"""
-        conditions = ["email=?", "DATE(created_at)=DATE('now','localtime')"]
-        params = [email]
+    def has_today_record(self, platform, email, card_last4=''):
+        """检查该平台今日是否已有充值记录（不管成功失败）"""
+        conditions = ["platform=?", "email=?", "DATE(created_at)=DATE('now','localtime')"]
+        params = [platform, email]
         if card_last4:
             conditions.append("card_display LIKE ?")
             params.append(f"%{card_last4}")
@@ -63,41 +72,47 @@ class RechargeLogModel:
         )
         return [dict(r) for r in rows]
 
-    def get_success_card_numbers(self, email):
-        """返回该账号所有『成功支付』记录里出现过的不同卡号集合。
+    def get_success_card_numbers(self, platform, email):
+        """返回该账号在此平台所有『成功支付』记录里出现过的不同卡号集合。
         用于统计一个账号已处于支付成功状态的卡数量（上限 20）。"""
         rows = self.db.fetchall(
             "SELECT DISTINCT card_display FROM recharge_logs "
-            "WHERE email=? AND status='success' AND card_display IS NOT NULL AND card_display != ''",
-            (email,),
+            "WHERE platform=? AND email=? AND status='success' "
+            "AND card_display IS NOT NULL AND card_display != ''",
+            (platform, email),
         )
         return set(r['card_display'] for r in rows)
 
-    def all_success_card_numbers(self):
-        """全局「曾成功付款过」的完整卡号集合（用于选卡时区分新卡/好卡）。
+    def all_success_card_numbers(self, platform):
+        """该平台上「曾成功付款过」的完整卡号集合（用于选卡时区分新卡/好卡）。
 
         card_display 写入为完整卡号（见 recharge_account._log_card_attempt），去空格后取用；
         历史脱敏串（'•••• 1234'）无法还原完整号，天然落在集合外，不影响「新卡优先」判断。
+
+        按平台统计是有意的：跨平台复用的卡在新平台上仍然算「新卡」，应当优先试——
+        它在那里确实还没被用过。
         """
         rows = self.db.fetchall(
             "SELECT DISTINCT replace(card_display,' ','') AS num FROM recharge_logs "
-            "WHERE status='success' AND card_display IS NOT NULL AND card_display != ''"
+            "WHERE platform=? AND status='success' "
+            "AND card_display IS NOT NULL AND card_display != ''",
+            (platform,),
         )
         return {r['num'] for r in rows if r['num']}
 
-    def success_count_since(self, card_number, hours=24):
-        """该卡号在最近 hours 小时内的成功支付次数（R2 次数/冷却判定）。"""
+    def success_count_since(self, platform, card_number, hours=24):
+        """该卡号在此平台最近 hours 小时内的成功支付次数（R2 次数/冷却判定）。"""
         if not card_number:
             return 0
         row = self.db.fetchone(
             "SELECT COUNT(*) as cnt FROM recharge_logs "
-            "WHERE card_display=? AND status='success' "
+            "WHERE platform=? AND card_display=? AND status='success' "
             "AND created_at >= datetime('now','localtime',?)",
-            (card_number, f'-{int(hours)} hours'),
+            (platform, card_number, f'-{int(hours)} hours'),
         )
         return row['cnt'] if row else 0
 
-    def count_success_by_last4(self):
+    def count_success_by_last4(self, platform):
         """一次聚合出「每张卡的成功充值次数 / 当日成功充值次数」，返回 {last4: {'total': n, 'today': n}}。
 
         card_display 的写入格式不统一（可能是完整卡号，也可能是脱敏的 '•••• 1234'，见 app.py
@@ -109,8 +124,10 @@ class RechargeLogModel:
             "COUNT(*) AS total, "
             "SUM(CASE WHEN DATE(created_at)=DATE('now','localtime') THEN 1 ELSE 0 END) AS today "
             "FROM recharge_logs "
-            "WHERE status='success' AND card_display IS NOT NULL AND card_display != '' "
-            "GROUP BY last4"
+            "WHERE platform=? AND status='success' "
+            "AND card_display IS NOT NULL AND card_display != '' "
+            "GROUP BY last4",
+            (platform,),
         )
         return {
             r['last4']: {'total': r['total'] or 0, 'today': r['today'] or 0}
@@ -134,14 +151,19 @@ class RechargeLogModel:
         )
         return [dict(r) for r in rows]
 
-    def last_success_at(self, card_number):
-        """该卡号最近一次成功支付时间（localtime 字符串），无则 None。"""
+    def last_success_at(self, platform, card_number):
+        """该卡号在此平台最近一次成功支付时间（localtime 字符串），无则 None。
+
+        这是「拒付时判废还是判冷却」的判据（registration.recharge_account）：本平台
+        从未成功过 → 判 invalid；成功过 → 只进 24h 冷却。必须按平台算，否则跨平台
+        复用的坏卡在新平台上永远判不了废。
+        """
         if not card_number:
             return None
         row = self.db.fetchone(
             "SELECT MAX(created_at) as ts FROM recharge_logs "
-            "WHERE card_display=? AND status='success'",
-            (card_number,),
+            "WHERE platform=? AND card_display=? AND status='success'",
+            (platform, card_number),
         )
         return row['ts'] if row and row['ts'] else None
 

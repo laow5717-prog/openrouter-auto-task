@@ -80,7 +80,7 @@ def _run_loop(state, task_id, recorder, monkeypatch, workers):
 def test_every_card_consumed_exactly_once_in_parallel(state, task_id, monkeypatch, no_wait):
     """并发注册时，同一张卡不能被两个账号绑走。"""
     cards = make_cards(12)
-    state.models['card_binding'].create_batch(task_id, cards)
+    state.models['card_binding'].create_batch('opencode', task_id, cards)
 
     rec = _Recorder(bind_per_account=2)
     _run_loop(state, task_id, rec, monkeypatch, workers=3)
@@ -96,7 +96,7 @@ def test_every_card_consumed_exactly_once_in_parallel(state, task_id, monkeypatc
 
 def test_parallel_actually_overlaps(state, task_id, monkeypatch, no_wait):
     """确认多个 worker 真的同时在跑，而不是退化成串行。"""
-    state.models['card_binding'].create_batch(task_id, make_cards(20))
+    state.models['card_binding'].create_batch('opencode', task_id, make_cards(20))
 
     rec = _Recorder(bind_per_account=2)
     original = rec.register_and_bind_cards
@@ -126,7 +126,7 @@ def test_serial_and_parallel_consume_the_same_cards(db, task_id, monkeypatch, no
             'task': TaskModel(db),
         })
         tid = TaskModel(db).create('test', config={})
-        st.models['card_binding'].create_batch(tid, make_cards(10, prefix='42'))
+        st.models['card_binding'].create_batch('opencode', tid, make_cards(10, prefix='42'))
         rec = _Recorder(bind_per_account=2)
         monkeypatch.setattr(app_module.registration, 'register_and_bind_cards',
                             rec.register_and_bind_cards)
@@ -143,7 +143,7 @@ def test_serial_and_parallel_consume_the_same_cards(db, task_id, monkeypatch, no
 
 def test_unbound_cards_return_to_pool(state, task_id, monkeypatch, no_wait):
     """绑不掉的卡必须退回 pending，不能滞留在 processing。"""
-    state.models['card_binding'].create_batch(task_id, make_cards(6))
+    state.models['card_binding'].create_batch('opencode', task_id, make_cards(6))
 
     rec = _Recorder(bind_per_account=1)     # 每号只绑 1 张，另一张应退回
     _run_loop(state, task_id, rec, monkeypatch, workers=2)
@@ -155,7 +155,7 @@ def test_unbound_cards_return_to_pool(state, task_id, monkeypatch, no_wait):
 
 def test_exception_releases_claimed_cards(state, task_id, monkeypatch, no_wait):
     """注册抛异常时，已领取的卡必须退回卡池而不是丢失。"""
-    state.models['card_binding'].create_batch(task_id, make_cards(4))
+    state.models['card_binding'].create_batch('opencode', task_id, make_cards(4))
     calls = {'n': 0}
 
     def boom(*a, **kw):
@@ -175,7 +175,7 @@ def test_exception_releases_claimed_cards(state, task_id, monkeypatch, no_wait):
 
 
 def test_stop_request_halts_the_loop(state, task_id, monkeypatch, no_wait):
-    state.models['card_binding'].create_batch(task_id, make_cards(20))
+    state.models['card_binding'].create_batch('opencode', task_id, make_cards(20))
 
     def stop_after_first(*a, **kw):
         state.stop_requested = True
@@ -191,7 +191,7 @@ def test_stop_request_halts_the_loop(state, task_id, monkeypatch, no_wait):
 
 def test_fail_streak_stops_the_loop(state, task_id, monkeypatch, no_wait):
     """连续失败达阈值后必须收敛，且卡全部退回。"""
-    state.models['card_binding'].create_batch(task_id, make_cards(40))
+    state.models['card_binding'].create_batch('opencode', task_id, make_cards(40))
 
     def always_fail(*a, **kw):
         return None, None, 0                 # email=None → 注册失败

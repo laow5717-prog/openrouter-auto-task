@@ -31,8 +31,11 @@ def groups(client):
     return src, dst
 
 
-def _bucket(models, gid):
-    return models['card_pool'].count_buckets(gid)
+OC = 'opencode'
+
+
+def _bucket(models, gid, platform=OC):
+    return models['card_pool'].count_buckets(platform, gid)
 
 
 def test_moves_requested_count(client, groups):
@@ -60,7 +63,7 @@ def test_invalid_cards_never_move(client, groups):
     src, dst = groups
     nums = [r['card_number'] for r in models['card_pool'].get_all_by_group(src)][:3]
     for n in nums:
-        models['card_pool'].mark_status_by_number(n, 'invalid')
+        models['card_pool'].mark_status_by_number(OC, n, 'invalid')
 
     c.post(f'/api/card-pool/{src}/move',
            json={'target_group_id': dst, 'bucket': 'unverified', 'limit': 9999})
@@ -73,7 +76,7 @@ def test_valid_cards_excluded_from_unverified_bucket(client, groups):
     c, models = client
     src, dst = groups
     card = models['card_pool'].get_all_by_group(src)[0]
-    models['valid_card'].record(card, source_type='payment', source_group_id=src)
+    models['valid_card'].record(OC, card, source_type='payment', source_group_id=src)
 
     c.post(f'/api/card-pool/{src}/move',
            json={'target_group_id': dst, 'bucket': 'unverified', 'limit': 9999})
@@ -144,7 +147,7 @@ def test_merge_valid_only_moves_valid_cards(client, groups):
     # 把前 6 张登记为有效卡（进入 valid_cards）
     nums = [r['card_number'] for r in models['card_pool'].get_all_by_group(src)][:6]
     for n in nums:
-        models['valid_card'].record({'number': n}, source_type='payment')
+        models['valid_card'].record(OC, {'number': n}, source_type='payment')
 
     body = c.post('/api/card-pool/merge',
                   json={'source_group_ids': [src], 'name': '仅有效组',

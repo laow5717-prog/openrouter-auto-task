@@ -115,7 +115,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
         if not recharge_log_model:
             return
         try:
-            log_id = recharge_log_model.create(email, card.get("number", ""), amount=20)
+            log_id = recharge_log_model.create(platform, email, card.get("number", ""), amount=20)
             if ok:
                 recharge_log_model.mark_success(log_id, api_response={"result": result})
             else:
@@ -134,7 +134,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     if card_state_model:
         try:
             cards = [c for c in payment_cards
-                     if not card_state_model.in_cooldown(c.get("number", ""))]
+                     if not card_state_model.in_cooldown(platform, c.get("number", ""))]
         except Exception:
             cards = payment_cards
         if not cards:
@@ -218,7 +218,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
             num = card.get("number", "")
             # 卡排他（并发安全网）：被其它 worker 占用则跳过，不计入尝试次数
-            if payment_registry is not None and not payment_registry.try_acquire(num, email):
+            if payment_registry is not None and not payment_registry.try_acquire(platform, num, email):
                 continue
             try:
                 attempts += 1
@@ -235,12 +235,13 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                     # 复用；仅当这张曾成功的卡再次被拒时才进入 24h 速率冷却（见下方 else 分支）。
                     if card_pool_model:
                         try:
-                            card_pool_model.mark_status_by_number(num, "paid")
+                            card_pool_model.mark_status_by_number(platform, num, "paid")
                         except Exception:
                             pass
                     if valid_card_model:
                         try:
-                            valid_card_model.record(card, source_type="payment", source_email=email)
+                            valid_card_model.record(platform, card, source_type="payment",
+                                                    source_email=email)
                         except Exception:
                             pass
                     if platform_account_model:
@@ -281,22 +282,25 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                     # failed（明确拒付 / 3DS 交互挑战 / 3DS 认证失败）：按用户规则——
                     #   曾成功过的卡 → 24h 速率冷却，不判无效（可复用）；
                     #   从未成功过的卡 → 判无效（坏卡，永久剔除）。
+                    # 「曾成功过」按**本平台**算：在别的平台成功过不能豁免这里的判废，
+                    # 否则跨平台复用的坏卡在新平台永远只进冷却、每轮被重选，白耗额度。
                     prior_success = False
                     if recharge_log_model:
                         try:
-                            prior_success = recharge_log_model.last_success_at(num) is not None
+                            prior_success = recharge_log_model.last_success_at(platform, num) is not None
                         except Exception:
                             prior_success = False
                     if prior_success:
                         if card_state_model:
                             try:
                                 card_state_model.set_cooldown(
-                                    num, hours=24, reason="曾成功卡本次支付失败，速率冷却")
+                                    platform, num, hours=24,
+                                    reason="曾成功卡本次支付失败，速率冷却")
                             except Exception:
                                 pass
                     elif card_pool_model:
                         try:
-                            card_pool_model.mark_invalid_by_number(num)
+                            card_pool_model.mark_invalid_by_number(platform, num)
                         except Exception:
                             pass
                     _log_card_attempt(card, False, reason, result)

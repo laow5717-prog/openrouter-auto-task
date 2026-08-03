@@ -266,6 +266,114 @@ WHERE COALESCE(status,'') IN ('archived','recharged','subscribed')
    OR COALESCE(apikey,'') != '';
 """
 
+# 卡池平台化第一步：把 card_pool.status 里「每平台一份」的语义搬出去。
+#
+# 一列 TEXT 装不下多平台状态。拆分口径是「这个状态跟平台有没有关系」：
+#   expired —— 有效期已过，与平台无关，**留在 card_pool.status**；
+#   bound / invalid / paid —— 都是「这张卡在某个平台上发生过什么」，搬进本表。
+# 于是一张卡对某平台的有效状态 = card_pool.status 为 expired 则 expired，
+# 否则取 card_platform_state 里 (card_number, platform) 那一行（没有则空）。
+#
+# 以 card_number 而非 card_pool.id 为键，与既有的 *_by_number 方法一致，也让卡在
+# 分组间移动时状态自动跟随。
+#
+# card_pool.status 列保留不删：迁移后它只承载 expired/''，但代码回退到旧版本时
+# refresh_expired_status 仍能按日期重算出 expired，项目照常能跑。
+_SCHEMA_V15 = """
+CREATE TABLE IF NOT EXISTS card_platform_state (
+    card_number TEXT NOT NULL,
+    platform    TEXT NOT NULL,
+    status      TEXT DEFAULT '',
+    updated_at  TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (card_number, platform)
+);
+
+INSERT OR IGNORE INTO card_platform_state (card_number, platform, status)
+SELECT card_number, 'opencode',
+       CASE WHEN SUM(CASE WHEN status='invalid' THEN 1 ELSE 0 END) > 0 THEN 'invalid'
+            WHEN SUM(CASE WHEN status='bound'   THEN 1 ELSE 0 END) > 0 THEN 'bound'
+            ELSE 'paid' END
+FROM card_pool
+WHERE COALESCE(status,'') IN ('bound','invalid','paid')
+GROUP BY card_number;
+
+UPDATE card_pool SET status='' WHERE COALESCE(status,'') IN ('bound','invalid','paid');
+"""
+
+# 卡池平台化第二步：其余四张状态表加 platform 维度。
+#
+# valid_cards 与 card_payment_state 的约束里要塞进 platform，而 SQLite 改不了主键和
+# UNIQUE，只能重建（create → copy → drop → rename）。既有行全部归 'opencode'。
+#
+# recharge_logs / card_bindings 加列即可。列默认给 ''、再把既有行 UPDATE 成 'opencode'，
+# 而不是直接 DEFAULT 'opencode'——后者会让「调用方忘了传 platform」的新行悄悄变成
+# opencode 的数据，那种错误查起来极其痛苦；留空则一眼可见。
+_SCHEMA_V16 = """
+CREATE TABLE IF NOT EXISTS valid_cards_v16 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_number TEXT NOT NULL,
+    expiry_month TEXT NOT NULL,
+    expiry_year TEXT NOT NULL,
+    cvc TEXT NOT NULL,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    country TEXT DEFAULT '',
+    address TEXT DEFAULT '',
+    address2 TEXT DEFAULT '',
+    city TEXT DEFAULT '',
+    state TEXT DEFAULT '',
+    zip TEXT DEFAULT '',
+    company TEXT DEFAULT '',
+    source_type TEXT NOT NULL,
+    source_email TEXT DEFAULT '',
+    source_group_id INTEGER,
+    platform TEXT NOT NULL DEFAULT 'opencode',
+    validated_at TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE(card_number, source_type, platform)
+);
+
+INSERT INTO valid_cards_v16
+    (id, card_number, expiry_month, expiry_year, cvc, first_name, last_name,
+     country, address, address2, city, state, zip, company,
+     source_type, source_email, source_group_id, platform, validated_at)
+SELECT id, card_number, expiry_month, expiry_year, cvc, first_name, last_name,
+       country, address, address2, city, state, zip, company,
+       source_type, source_email, source_group_id, 'opencode', validated_at
+FROM valid_cards;
+
+DROP TABLE valid_cards;
+
+ALTER TABLE valid_cards_v16 RENAME TO valid_cards;
+
+CREATE TABLE IF NOT EXISTS card_payment_state_v16 (
+    card_number TEXT NOT NULL,
+    platform    TEXT NOT NULL DEFAULT 'opencode',
+    tds_until   TEXT,
+    tds_reason  TEXT DEFAULT '',
+    updated_at  TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (card_number, platform)
+);
+
+INSERT INTO card_payment_state_v16 (card_number, platform, tds_until, tds_reason, updated_at)
+SELECT card_number, 'opencode', tds_until, tds_reason, updated_at FROM card_payment_state;
+
+DROP TABLE card_payment_state;
+
+ALTER TABLE card_payment_state_v16 RENAME TO card_payment_state;
+
+ALTER TABLE recharge_logs ADD COLUMN platform TEXT DEFAULT '';
+
+UPDATE recharge_logs SET platform='opencode' WHERE COALESCE(platform,'')='';
+
+ALTER TABLE card_bindings ADD COLUMN platform TEXT DEFAULT '';
+
+UPDATE card_bindings SET platform='opencode' WHERE COALESCE(platform,'')='';
+
+CREATE INDEX IF NOT EXISTS idx_rl_platform_card ON recharge_logs(platform, card_display);
+
+CREATE INDEX IF NOT EXISTS idx_cb_platform_status ON card_bindings(platform, status);
+"""
+
 _ADD_COLUMN_RE = re.compile(r'^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)', re.I)
 
 _MIGRATIONS = {
@@ -283,6 +391,8 @@ _MIGRATIONS = {
     12: _SCHEMA_V12,
     13: _SCHEMA_V13,
     14: _SCHEMA_V14,
+    15: _SCHEMA_V15,
+    16: _SCHEMA_V16,
 }
 
 

@@ -110,11 +110,15 @@ class _FlakyOnceTracker(_Tracker):
                 first = self.recharged_calls.count(email) == 1
             threading.Event().wait(self.delay)
             if first:
-                # 烧掉一张可用卡：可选卡集合变化 → 轮转判定视为「有进展」
+                # 烧掉一张可用卡：可选卡集合变化 → 轮转判定视为「有进展」。
+                # invalid 现在是**平台状态**，写 card_platform_state 而不是 card_pool。
                 self.db.execute(
-                    "UPDATE card_pool SET status='invalid' WHERE id IN ("
-                    "SELECT id FROM card_pool "
-                    "WHERE COALESCE(status,'') NOT IN ('invalid','expired') LIMIT 1)")
+                    "INSERT OR REPLACE INTO card_platform_state (card_number, platform, status) "
+                    "SELECT cp.card_number, 'opencode', 'invalid' FROM card_pool cp "
+                    "LEFT JOIN card_platform_state cps "
+                    "  ON cps.card_number = cp.card_number AND cps.platform = 'opencode' "
+                    "WHERE COALESCE(cp.status,'') != 'expired' "
+                    "  AND COALESCE(cps.status,'') NOT IN ('invalid','bound') LIMIT 1")
                 return "failed", "declined"
             self._mark_recharged(email)
             return "success", ""
@@ -187,7 +191,7 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls
             "GROUP BY s"):
         status_counts[row['s']] = row['c']
 
-    usable_left, _ = models['card_pool'].get_usable_cards_as_list(gid)
+    usable_left, _ = models['card_pool'].get_usable_cards_as_list('opencode', gid)
 
     result = {
         'status_counts': status_counts,
