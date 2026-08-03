@@ -51,7 +51,7 @@ def main():
     ap.add_argument("--group", type=int, default=1)
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
-    usable, _ = CardPoolModel(Database()).get_usable_cards_as_list(args.group)
+    usable, _ = CardPoolModel(Database()).get_usable_cards_as_list('opencode', args.group)
     if not usable: print("无可用卡"); sys.exit(1)
     card = usable[0]
     session = create_driver(headless=False, profile_id=args.email)

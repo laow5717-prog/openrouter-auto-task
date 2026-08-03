@@ -59,7 +59,7 @@ def main():
     if not args.key:
         print("缺 MULTIBOT_API_KEY"); sys.exit(1)
 
-    usable, _ = CardPoolModel(Database()).get_usable_cards_as_list(args.group)
+    usable, _ = CardPoolModel(Database()).get_usable_cards_as_list('opencode', args.group)
     if not usable:
         print("无可用卡"); sys.exit(1)
     card = usable[0]

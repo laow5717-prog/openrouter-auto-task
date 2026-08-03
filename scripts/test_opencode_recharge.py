@@ -32,7 +32,7 @@ TEST_CARD = {
 
 def _pick_pool_card(group_id, index):
     pool = CardPoolModel(Database())
-    usable, _ = pool.get_usable_cards_as_list(group_id)
+    usable, _ = pool.get_usable_cards_as_list('opencode', group_id)
     if not usable:
         return None
     return usable[min(index, len(usable) - 1)]

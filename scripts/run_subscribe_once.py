@@ -82,7 +82,7 @@ def main():
     account = AccountModel(db)
     platform_account = PlatformAccountModel(db)
 
-    usable, _ = card_pool.get_usable_cards_as_list(args.group)
+    usable, _ = card_pool.get_usable_cards_as_list(args.platform, args.group)
     if not usable:
         print(f"❌ 分组 {args.group} 无可用卡")
         sys.exit(1)
@@ -110,15 +110,15 @@ def main():
             num = card.get("number", "")
             last4 = str(num)[-4:]
             print(f"\n{'#'*56}\n# 第 {i} 张卡 ****{last4} 真实订阅付款\n{'#'*56}")
-            log_id = recharge_log.create(args.email, num, amount=5)
+            log_id = recharge_log.create(args.platform, args.email, num, amount=5)
             res = subscribe_via_stripe(session, card, wid, dry=False)
             print("订阅结果:", json.dumps(res, ensure_ascii=False))
             outcome = res.get("outcome")
             final = {"ok": res.get("ok"), "outcome": outcome, "last4": last4}
 
             if outcome == "success":
-                card_pool.mark_status_by_number(num, "paid")
-                valid_card.record(card, source_type="payment", source_email=args.email)
+                card_pool.mark_status_by_number(args.platform, num, "paid")
+                valid_card.record(args.platform, card, source_type="payment", source_email=args.email)
                 platform_account.update_status(args.platform, args.email, "subscribed")
                 recharge_log.mark_success(log_id, api_response={"result": res})
                 print(f"  ✅ 订阅成功（卡 ****{last4} 标 paid，账号标 subscribed）")
@@ -130,7 +130,7 @@ def main():
                 break
             elif outcome == "failed":
                 # 明确拒付：从未成功过的卡判无效
-                card_pool.mark_invalid_by_number(num)
+                card_pool.mark_invalid_by_number(args.platform, num)
                 recharge_log.mark_failed(log_id, error=res.get("err", ""), api_response={"result": res})
                 print(f"  ❌ 卡 ****{last4} 拒付，标 invalid，换下一张")
             else:  # error / unknown
