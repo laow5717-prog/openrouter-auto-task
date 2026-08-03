@@ -9,6 +9,18 @@ import re
 import time
 
 from src.browser.monitor import step as _step
+from src.payments.stripe_checkout import (
+    ELEMENT_MARK,
+    _captcha_challenge_present,
+    _close_challenge_lightbox,
+    _close_threeds_modal,
+    _threeds_challenge_lightbox,
+    _threeds_challenge_present,
+    _threeds_failure_modal,
+    _DECLINE_HINTS,
+    fill_payment_element_card,
+    select_card_tab,
+)
 
 CREDITS_URL = 'https://infron.ai/dashboard/credits'
 
@@ -198,3 +210,138 @@ def wait_for_payment_step(session, monitor=None, timeout=60):
     _step(monitor, session,
           f'{timeout}s 内未进入填卡步骤（多半是 hCaptcha 未解，Payment Element 加载不出来）')
     return False
+
+
+# ---------------------------------------------------------------------------
+# 结果判定
+# ---------------------------------------------------------------------------
+
+def detect_payment_result(session, balance_before, monitor=None, timeout=180, poll=6):
+    """判定这笔充值成没成。返回 (outcome, detail, balance_after)。
+
+    **成功判据是余额增长，不是页面文案。** 页面可能显示"处理中"就再无更新，也可能
+    在真的扣款成功后仍停在弹窗上；余额是唯一不会骗人的信号。这条是从 opencode 那边
+    照搬的，那套判定是一次次事故换来的。
+
+    outcome 的语义与 opencode 逐字一致（见 platforms.base）：
+      success        余额增加
+      failed         明确拒付 / 3DS 认证失败
+      needs_captcha  hCaptcha 挑战出现且没被解掉 —— 账号级拦截，**不消耗卡**
+      unknown        已提交但超时无定论 —— **不消耗卡**
+    """
+    baseline = balance_before if balance_before is not None else 0.0
+    deadline = time.time() + timeout
+    saw_captcha = False
+
+    while time.time() < deadline:
+        time.sleep(poll)
+
+        # 1) 余额涨了就是成功——最可靠的信号，优先判
+        after = read_balance_from_current_page(session)
+        if after is None:
+            # 弹窗盖着 credits 页时读不到，去页面文本里再找一次
+            after = read_balance_from_current_page(session)
+        if after is not None and after > baseline + 1e-6:
+            _step(monitor, session, f'余额已增加：{baseline} → {after}')
+            return 'success', f'余额 {baseline} → {after}', after
+
+        text = (_page_text(session) or '').lower()
+
+        # 2) 明确拒付
+        hit = next((h for h in _DECLINE_HINTS if h in text), None)
+        if hit:
+            _step(monitor, session, f'检测到拒付：{hit}')
+            return 'failed', f'拒付：{hit}', None
+
+        # 3) 3DS：失败弹窗算拒付；交互挑战则关掉后继续等
+        try:
+            fr = _threeds_failure_modal(session)
+            if fr is not None:
+                _close_threeds_modal(fr, session, monitor)
+                return 'failed', '3DS 认证失败', None
+            fr = _threeds_challenge_lightbox(session)
+            if fr is not None:
+                _close_challenge_lightbox(fr, session, monitor)
+        except Exception:
+            pass
+
+        # 4) hCaptcha 挑战：记下但不立刻收手——求解器可能正在解
+        try:
+            if _threeds_challenge_present(session) is None and _captcha_challenge_present(session):
+                saw_captcha = True
+        except Exception:
+            pass
+
+    if saw_captcha:
+        _step(monitor, session, '超时且期间出现过 hCaptcha 挑战')
+        return 'needs_captcha', f'{timeout}s 内未确认结果，期间出现 hCaptcha 挑战', None
+    return 'unknown', f'{timeout}s 内余额未增加，未确认成功', None
+
+
+def top_up(session, card, amount, monitor=None, should_stop=None):
+    """完整充值流程。返回 dict，字段对齐 PaymentResult.from_dict。
+
+    每一步失败都归到 **error**（不消耗卡）而不是 failed——这些都是「还没走到付款」的
+    页面故障，把它们算成拒付会白白废掉好卡，而判废不可逆。只有真的提交了付款、
+    拿到明确拒付信号才是 failed。
+
+    **本函数不让异常逃出去**（InterruptedError 除外，那是用户主动停止）。契约要求
+    返回 PaymentResult；异常逃出去意味着编排层的 outcome 分派根本不会执行，那张卡的
+    状态就悬着了。浏览器操作抛异常是常态（导航超时、frame 被卸载、元素消失），
+    统一收敛成 error。
+    """
+    try:
+        return _top_up_inner(session, card, amount, monitor, should_stop)
+    except InterruptedError:
+        raise
+    except Exception as e:
+        return {'ok': False, 'outcome': 'error',
+                'err': f'充值过程异常：{type(e).__name__}: {str(e)[:150]}',
+                'last4': str(card.get('number', ''))[-4:], 'steps': []}
+
+
+def _top_up_inner(session, card, amount, monitor=None, should_stop=None):
+    steps = []
+    last4 = str(card.get('number', ''))[-4:]
+
+    def _fail(detail):
+        return {'ok': False, 'outcome': 'error', 'err': detail,
+                'last4': last4, 'steps': steps}
+
+    balance_before = read_balance(session, monitor)
+    steps.append(f'balance_before={balance_before}')
+    if should_stop and should_stop():
+        raise InterruptedError('用户请求停止')
+
+    if not open_topup_modal(session, monitor):
+        return _fail('充值弹窗未打开')
+    steps.append('modal_opened')
+
+    if not select_amount(session, amount, monitor):
+        return _fail('选充值金额失败')
+    select_card_payment(session, monitor)
+    steps.append(f'amount={amount}')
+
+    if not click_pay(session, monitor):
+        return _fail('第一步 Pay 点击失败')
+
+    if not wait_for_payment_step(session, monitor):
+        return _fail('未进入填卡步骤（多半是 hCaptcha 未解，Payment Element 加载不出来）')
+    steps.append('payment_step')
+
+    select_card_tab(session, monitor, mark=ELEMENT_MARK)
+    ok, detail = fill_payment_element_card(session, card, monitor, mark=ELEMENT_MARK)
+    steps.append(f'fill_card ok={ok}')
+    if not ok:
+        return _fail(f'填卡失败：{detail}')
+
+    if should_stop and should_stop():
+        raise InterruptedError('用户请求停止')
+    if not click_pay(session, monitor):
+        return _fail('第二步 Pay 点击失败')
+    steps.append('submitted')
+
+    outcome, detail, balance_after = detect_payment_result(session, balance_before, monitor)
+    steps.append(f'outcome={outcome}')
+    return {'ok': outcome == 'success', 'outcome': outcome, 'err': detail,
+            'last4': last4, 'balance_after': balance_after, 'steps': steps}

@@ -75,37 +75,49 @@ _CAPTCHA_TEXT_HINTS = [
 _CAPTCHA_CHALLENGE_FRAME_MARK = "#frame=challenge"
 
 
-def _stripe_frame(session, retries=6):
-    """返回 Stripe Checkout 所在 frame。
+# Stripe 的两种集成形态，frame URL 特征不同：
+#   hosted Checkout —— 整页或 iframe 的 checkout.stripe.com（opencode 用这种）
+#   Payment Element —— 页面内嵌 js.stripe.com/v3/elements-inner-payment-*（infron 用这种）
+# 两者的字段命名也不同，见 fill_card_and_address / fill_payment_element_card。
+CHECKOUT_MARK = "checkout.stripe.com"
+ELEMENT_MARK = "elements-inner-payment"
+
+
+def _stripe_frame(session, retries=6, mark=CHECKOUT_MARK):
+    """返回 Stripe 表单所在 frame。
 
     首充：Enable Billing 整页跳转 checkout.stripe.com → 主文档即 Stripe → main_frame。
     复充：Add Balance 在 opencode 页面内嵌入 checkout.stripe.com iframe → 该子 frame。
 
     复充的嵌入 iframe 在渲染/重排时可能瞬时从 page.frames 中消失，若此时直接回退
     main_frame（opencode 页），后续 locator 会落到错误的文档、静默命中不到（曾导致
-    Pay 按钮 count=0 的偶发假失败）。故先短暂重试等待 checkout 帧出现，重试耗尽才回退。
+    Pay 按钮 count=0 的偶发假失败）。故先短暂重试等待目标帧出现，重试耗尽才回退。
+
+    mark 是 frame URL 的匹配标记，默认 hosted Checkout。用 Payment Element 的平台
+    （infron）传 ELEMENT_MARK。做成参数而不是在函数里按站点分支——分支会随平台数量
+    线性膨胀，而这里真正变化的只是一个字符串。
     """
     page = session.page
     for _ in range(max(1, retries)):
-        if "checkout.stripe.com" in (page.url or ""):
+        if mark in (page.url or ""):
             return page.main_frame
         for fr in page.frames:
-            if "checkout.stripe.com" in (fr.url or ""):
+            if mark in (fr.url or ""):
                 return fr
         time.sleep(0.5)
     return page.main_frame
 
 
-def _wait_stripe_frame(session, timeout=60):
-    """等待 Stripe Checkout frame 出现（整页 or iframe）。返回 frame 或 None。"""
+def _wait_stripe_frame(session, timeout=60, mark=CHECKOUT_MARK):
+    """等待 Stripe 表单 frame 出现（整页 or iframe）。返回 frame 或 None。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         page = session.page
-        if "checkout.stripe.com" in (page.url or ""):
+        if mark in (page.url or ""):
             time.sleep(2)
             return page.main_frame
         for fr in page.frames:
-            if "checkout.stripe.com" in (fr.url or ""):
+            if mark in (fr.url or ""):
                 time.sleep(2)
                 return fr
         session.capture_frame()
@@ -291,6 +303,133 @@ def fill_card_and_address(session, card, monitor):
     _step(monitor, session, "账单地址填写完成")
     ok = not any(k in " ".join(errs) for k in ["cardNumber", "cardExpiry", "cardCvc"])
     return ok, ("; ".join(errs) if errs else "")
+
+
+# Payment Element 的字段 ID 与 hosted Checkout 不同。两套都列出来逐个试，命中即用。
+#
+# 为什么是多候选而不是写死一套：infron 的填卡表单没能实探到（hCaptcha 未解时
+# Payment Element 根本不渲染，见任务 08-04 的 Stage 1）。Stripe 官方对 Payment
+# Element 用 Field-*Input 命名、对 Checkout 用裸名，两套都覆盖比赌一套稳；真跑时
+# 哪套命中会记进 steps，据此再收敛。
+_CARD_FIELD_CANDIDATES = {
+    "number": ("#Field-numberInput", "#cardNumber", "input[name='cardnumber']"),
+    "expiry": ("#Field-expiryInput", "#cardExpiry", "input[name='exp-date']"),
+    "cvc": ("#Field-cvcInput", "#cardCvc", "input[name='cvc']"),
+    "name": ("#Field-nameInput", "#billingName"),
+}
+_ADDR_FIELD_CANDIDATES = {
+    "country": ("#Field-countryInput", "#billingCountry"),
+    "line1": ("#Field-addressLine1Input", "#billingAddressLine1"),
+    "line2": ("#Field-addressLine2Input", "#billingAddressLine2"),
+    "city": ("#Field-localityInput", "#billingLocality"),
+    "zip": ("#Field-postalCodeInput", "#billingPostalCode"),
+    "state": ("#Field-administrativeAreaInput", "#billingAdministrativeArea"),
+}
+
+
+def _type_first(page, selectors, value, delay=90, timeout=4000):
+    """按顺序试多个选择器，第一个能填进去的算成功。返回命中的选择器或 None。"""
+    if value in (None, ""):
+        return None
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if not loc.count():
+                continue
+            loc.click(timeout=timeout)
+            loc.type(str(value), delay=delay)
+            return sel
+        except Exception:
+            continue
+    return None
+
+
+def _select_first(page, selectors, value):
+    if not value:
+        return None
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if not loc.count():
+                continue
+            loc.select_option(value, timeout=4000)
+            return sel
+        except Exception:
+            continue
+    return None
+
+
+def select_card_tab(session, monitor, mark=ELEMENT_MARK):
+    """在 Payment Element 里切到 Card 支付方式。
+
+    **必须显式点**：实测 infron 的 Element 默认选中的是 **Alipay** 而不是 Card，
+    不点就根本不会出现卡号字段。这与 hosted Checkout 的 accordion 结构不同，
+    所以不能复用 select_card_method。
+    """
+    fr = _stripe_frame(session, mark=mark)
+    for sel in ("[role=tab]:has-text('Card')", "button:has-text('Card')", "text=Card"):
+        try:
+            loc = fr.locator(sel).first
+            if not loc.count():
+                continue
+            loc.click(timeout=4000)
+            _step(monitor, session, "已切到 Card 支付方式")
+            time.sleep(2)
+            return True
+        except Exception:
+            continue
+    _step(monitor, session, "未找到 Card 支付方式 tab")
+    return False
+
+
+def fill_payment_element_card(session, card, monitor, mark=ELEMENT_MARK):
+    """在 Stripe Payment Element 里填卡与账单地址。返回 (ok, detail)。
+
+    与 fill_card_and_address（hosted Checkout 版）并列而不是合并：两者的字段命名、
+    地址展开方式、frame 定位都不同，硬合成一个函数会变成一堆 if。
+
+    ok 的判据只看**卡三要素**（号/有效期/CVC）是否填上——地址字段缺失通常不阻止提交，
+    而卡填不进去必然失败。
+    """
+    fr = _stripe_frame(session, mark=mark)
+    exp_yy = str(card.get("expiry_year", ""))[-2:]
+    exp = f"{str(card.get('expiry_month','')).zfill(2)}{exp_yy}"
+    name = f"{card.get('first_name','')} {card.get('last_name','')}".strip()
+
+    hits, misses = [], []
+    for key, value in (("number", card.get("number")),
+                       ("expiry", exp),
+                       ("cvc", card.get("cvc")),
+                       ("name", name)):
+        sel = _type_first(fr, _CARD_FIELD_CANDIDATES[key], value)
+        (hits if sel else misses).append(f"{key}={sel or 'miss'}")
+    _step(monitor, session, f"填卡字段：{', '.join(hits + misses)}")
+
+    # 国家要先选，地址子字段可能随之变化
+    _select_first(fr, _ADDR_FIELD_CANDIDATES["country"], card.get("country") or "US")
+    time.sleep(1)
+    # US 默认给的是地址自动完成搜索框，要展开成手动输入
+    for sel in ("text=Enter address manually", "button:has-text('Enter address manually')"):
+        try:
+            loc = fr.locator(sel).first
+            if loc.count():
+                loc.click(timeout=3000)
+                time.sleep(1)
+                break
+        except Exception:
+            continue
+    for key, value in (("line1", card.get("address")),
+                       ("city", card.get("city")),
+                       ("zip", card.get("zip")),
+                       ("line2", card.get("address2"))):
+        _type_first(fr, _ADDR_FIELD_CANDIDATES[key], value, delay=60)
+    _select_first(fr, _ADDR_FIELD_CANDIDATES["state"], card.get("state"))
+    _step(monitor, session, "账单地址填写完成")
+
+    filled = {h.split("=")[0] for h in hits}
+    ok = {"number", "expiry", "cvc"} <= filled
+    detail = "" if ok else f"卡字段未填全：{', '.join(misses)}"
+    return ok, detail
 
 
 def uncheck_save_info(session, monitor):

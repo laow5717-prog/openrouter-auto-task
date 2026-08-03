@@ -106,16 +106,15 @@ class InfronAdapter:
     # ---------- 充值 ----------
 
     def top_up(self, session, tenant_id, card, amount=None, monitor=None, should_stop=None):
-        """尚未实现（Stage 3）。返回 error 而不是抛异常。
+        """走 Top Up 弹窗充值。tenant_id 在 infron 恒为 None，用不到。
 
-        选 `error` 是有意的：按 outcome 契约，error 表示「付款**前**的故障，不是这张卡
-        的问题」，编排层因此**不会消耗这张卡**——不判废、不冷却、不记账。若改成抛异常
-        或返回 failed，一次误配置就会把好卡打成废卡，而那是不可逆的。
+        流程里每一步「还没走到付款」的失败都归 error（不消耗卡）而不是 failed——
+        把页面故障算成拒付会白白废掉好卡，而判废不可逆。详见 credits.top_up。
         """
-        from src.platforms.base import OUTCOME_ERROR, PaymentResult
-        return PaymentResult(
-            ok=False,
-            outcome=OUTCOME_ERROR,
-            err='infron 充值尚未实现（见任务 08-04-infron-adapter 的 Stage 3）',
-            last4=str(card.get('number', ''))[-4:] if card else '',
+        from src.platforms.base import PaymentResult
+        result = _credits.top_up(
+            session, card,
+            self.default_topup_amount if amount is None else amount,
+            monitor=monitor, should_stop=should_stop,
         )
+        return PaymentResult.from_dict(result)

@@ -37,16 +37,46 @@ def test_infron_is_more_conservative_than_opencode():
     assert platforms.get('infron').max_card_attempts < platforms.get('opencode').max_card_attempts
 
 
-def test_topup_stub_returns_error_not_failed():
-    """充值未实现时返回 error —— 那是「不消耗卡」的 outcome。
+class _DeadSession:
+    """所有页面操作都失败的会话——模拟页面/基础设施故障。"""
 
-    若返回 failed，一次误配置就会把好卡判废，而判废不可逆。
+    class _Page:
+        url = 'about:blank'
+        frames = []
+
+        def evaluate(self, _js):
+            raise RuntimeError('页面挂了')
+
+        def __getattr__(self, _name):
+            raise RuntimeError('页面挂了')
+
+    page = _Page()
+
+    def get(self, _url):
+        raise RuntimeError('导航失败')
+
+    def capture_frame(self):
+        pass
+
+
+def test_page_failure_yields_error_not_failed():
+    """走不到付款的故障必须归 error —— 那是「不消耗卡」的 outcome。
+
+    若归成 failed，一次页面抽风就会把好卡判废，而判废不可逆。这是整条充值链路上
+    最容易写错、后果又最严重的一处。
     """
     a = platforms.get('infron')
-    r = a.top_up(None, None, {'number': '4111111111111111'})
-    assert r.outcome == 'error'
+    r = a.top_up(_DeadSession(), None, {'number': '4111111111111111'}, amount=50)
+    assert r.outcome == 'error', f'页面故障应归 error，实际 {r.outcome}'
     assert r.keeps_card is True
     assert r.ok is False
+    assert r.last4 == '1111'
+
+
+def test_topup_uses_adapter_default_amount():
+    """不传金额时用适配器自己的默认档位，不是写死的值。"""
+    a = platforms.get('infron')
+    assert a.default_topup_amount == 50, 'infron 最低档位是 $50'
 
 
 # ---------- magic link 的时间闸门 ----------
@@ -204,3 +234,28 @@ def test_unknown_modal_text_falls_back_to_step_one():
 
 def test_preset_amounts_match_the_site():
     assert ic._PRESET_AMOUNTS == (50, 100, 300)
+
+
+def test_user_stop_propagates_through_the_catch_all():
+    """用户主动停止必须能穿透 top_up 的兜底 except，不能被收敛成 error。
+
+    吞掉它的后果是「点了停止但任务继续跑下一张卡」——用户以为停了，钱还在扣。
+    """
+    from src.platforms.infron import credits as c
+
+    class _Sess:
+        def get(self, _url):
+            pass
+
+        def capture_frame(self):
+            pass
+
+        class _Page:
+            def evaluate(self, _js):
+                return 'Available Balance $ 0.00000000'
+
+        page = _Page()
+
+    with pytest.raises(InterruptedError):
+        c.top_up(_Sess(), {'number': '4111111111111111'}, 50,
+                 should_stop=lambda: True)
