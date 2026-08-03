@@ -177,29 +177,6 @@ def generate_random_password(length=None):
     return password
 
 
-def extract_verification_link(content: str):
-    if not content:
-        return None
-
-    # TODO(opencode): 目标站点为 https://opencode.ai。验证链接匹配为占位规则，
-    # 接入时按 opencode.ai 实际验证邮件的域名与链接格式（verify/confirm 路径）调整。
-    # 原 Cloudflare 规则见 git 历史。
-    patterns = [
-        r'(https?://[^\s"<>]*opencode[^\s"<>]*verify[^\s"<>]*)',
-        r'(https?://[^\s"<>]*opencode[^\s"<>]*confirm[^\s"<>]*)',
-        r'href="(https?://[^\s"<>]*opencode[^\s"<>]*)"',
-    ]
-
-    for pattern in patterns:
-        matches = re.findall(pattern, content, re.IGNORECASE)
-        if matches:
-            link = matches[0]
-            print(f"  Found verification link: {link[:80]}...")
-            return link
-
-    return None
-
-
 def extract_verification_code(content: str):
     if not content:
         return None

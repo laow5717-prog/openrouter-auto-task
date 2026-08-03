@@ -73,11 +73,6 @@
                 {{ acc.card_count }} 张卡
               </span>
               <span v-else class="card-count-badge empty">无</span>
-              <!-- 账单页真实绑卡数超过库内关联数：差额是卡池外的卡，无明细可点 -->
-              <span v-if="extraBoundCount(acc) > 0" class="card-extra-badge"
-                    :title="acc.cards_checked_at ? `账单页核对到 ${acc.bound_card_count} 张，核对于 ${acc.cards_checked_at}` : `账单页核对到 ${acc.bound_card_count} 张`">
-                +{{ extraBoundCount(acc) }} 外部
-              </span>
             </td>
             <td>
               <span v-if="acc.credits_balance !== null && acc.credits_balance !== undefined"
@@ -281,17 +276,8 @@ const statusMap = {
   subscribed: '已订阅',
   recharged: '已充值',
 }
-// 账单页真实绑卡数 - 库内已关联卡数 = 卡池外的卡，仅计数不展示明细
-function extraBoundCount(acc) {
-  const real = acc.bound_card_count
-  if (real === null || real === undefined) return 0
-  return Math.max(0, Number(real) - Number(acc.card_count || 0))
-}
 function accStatusLabel(s) {
-  if (statusMap[s]) return statusMap[s]
-  const m = s.match(/^bound_(\d+)_cards$/)
-  if (m) return `已绑${m[1]}张卡`
-  return s
+  return statusMap[s] || s
 }
 function accStatusClass(s) {
   if (s === 'banned' || s === 'flagged' || s === 'suspended') return 'fail'
@@ -513,18 +499,6 @@ onUnmounted(stopBrowserPoll)
 }
 .card-count-badge:hover { background: #bfdbfe; }
 .card-count-badge.empty { background: #f3f4f6; color: #9ca3af; cursor: default; }
-.card-extra-badge {
-  display: inline-flex;
-  align-items: center;
-  margin-left: 4px;
-  padding: 4px 8px;
-  border-radius: 20px;
-  font-size: 12px;
-  font-weight: 500;
-  background: #fef3c7;
-  color: #92400e;
-  cursor: default;
-}
 
 .balance-badge {
   display: inline-block;

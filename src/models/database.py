@@ -128,7 +128,8 @@ CREATE TABLE IF NOT EXISTS card_payment_state (
 );
 """
 
-# 账单支付：「账单已无法在 Stripe 支付」的 24h 冷却状态（详见 InvoicePaymentStateModel）
+# 账单支付：「账单已无法在 Stripe 支付」的 24h 冷却状态。该表从未接线（模型有方法、
+# 无调用方），已由 V13 删除；此处保留建表语句只为让版本链完整，勿删。
 _SCHEMA_V7 = """
 CREATE TABLE IF NOT EXISTS invoice_payment_state (
     invoice_id      TEXT PRIMARY KEY,
@@ -199,6 +200,13 @@ CREATE TABLE IF NOT EXISTS adspower_profiles (
 );
 """
 
+# 删除 invoice_payment_state：V7 建了这张表，但「标记账单无法支付」这条线一直没接完
+# ——模型方法齐全却零调用方，表也始终是空的。多平台改造要给各状态表加 platform 维度，
+# 留着它只会多一处需要跟着改的死数据。
+_SCHEMA_V13 = """
+DROP TABLE IF EXISTS invoice_payment_state;
+"""
+
 _MIGRATIONS = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
@@ -212,6 +220,7 @@ _MIGRATIONS = {
     10: _SCHEMA_V10,
     11: _SCHEMA_V11,
     12: _SCHEMA_V12,
+    13: _SCHEMA_V13,
 }
 
 

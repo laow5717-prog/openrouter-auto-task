@@ -22,7 +22,6 @@ from src.models.card_group import CardGroupModel
 from src.models.card_pool import CardPoolModel
 from src.models.valid_card import ValidCardModel
 from src.models.card_payment_state import CardPaymentStateModel
-from src.models.invoice_payment_state import InvoicePaymentStateModel
 from src.models.proxy import ProxyModel
 from src.models.adspower_profile import AdsPowerProfileModel
 from src.services.adspower import AdsPowerError
@@ -1344,7 +1343,6 @@ def create_app(db_path=None):
         'card_pool': CardPoolModel(db),
         'valid_card': ValidCardModel(db),
         'card_state': CardPaymentStateModel(db),
-        'invoice_state': InvoicePaymentStateModel(db),
         'proxy': ProxyModel(db),
         'adspower_profile': AdsPowerProfileModel(db),
     }

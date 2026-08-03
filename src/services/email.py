@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 
 from src.config import cfg
-from src.utils import http_session, extract_verification_link, extract_verification_code
+from src.utils import http_session, extract_verification_code
 
 MAIL_TM_API = "https://api.mail.tm"
 
@@ -145,26 +145,27 @@ def _parse_created_at(value):
     return dt
 
 
-def wait_for_login_code(token: str, since_ts, timeout: int = None):
-    """等待并提取 opencode 登录二次验证码（two-factor）。
+def wait_for_login_code(token: str, since_ts, timeout: int = None, sender_hints=None):
+    """等待并提取登录二次验证码（two-factor）。平台无关。
 
-    与 wait_for_verification_email 的区别，二者不可互换：
-      1. 只认验证码，不认验证链接；
-      2. 按 createdAt 过滤，只接受 since_ts 之后到达的邮件。
-
-    第 2 点是关键：账号收件箱通常已积压多封历史 "Your opencode login token"
-    邮件，不做时间过滤会立刻返回一个早已过期的码。
+    只认验证码不认链接，且按 createdAt 过滤、只接受 since_ts 之后到达的邮件。
+    时间过滤是关键：账号收件箱通常已积压多封历史登录码邮件，不过滤会立刻返回一个
+    早已过期的码。
 
     参数:
         token: mail.tm 访问 token
         since_ts: aware datetime，只接受严格晚于它的邮件。
                   调用方须在「点击登录按钮之前」取值，否则可能错过邮件。
         timeout: 秒，默认取 cfg.email.wait_timeout
+        sender_hints: 关键词列表，发件人地址或主题命中任一即视为目标邮件。
+                      各平台适配器传自己的域名（如 ['opencode']）。
+                      留空表示不按来源过滤，只靠时间窗口 + 能否提出码来判定。
     返回:
         str | None: 验证码；超时未收到新邮件返回 None
     """
     if timeout is None:
         timeout = cfg.email.wait_timeout
+    hints = [h.lower() for h in (sender_hints or []) if h]
 
     print(f"等待登录验证码 (最长 {timeout} 秒，只认 {since_ts} 之后的邮件)...")
     start_time = time.time()
@@ -179,12 +180,10 @@ def wait_for_login_code(token: str, since_ts, timeout: int = None):
 
             sender = str(msg.get('from', {}).get('address', '')).lower()
             subject = _to_str(msg.get('subject', ''))
-            # TODO(opencode): 目标站点为 https://opencode.ai。过滤词 'opencode' 为占位，
-            # 接入时按 opencode.ai 实际验证邮件的发件人域名/主题核对调整。
-            if 'opencode' not in sender and 'opencode' not in subject.lower():
+            if hints and not any(h in sender or h in subject.lower() for h in hints):
                 continue
 
-            # 登录码通常直接在主题里（Your opencode login token: 1234567）
+            # 登录码通常直接在主题里（如 Your opencode login token: 1234567）
             code = extract_verification_code(subject)
             if not code:
                 detail = get_email_detail(token, msg.get('id', '')) or {}
@@ -326,60 +325,3 @@ def _to_str(value):
     if isinstance(value, dict):
         return str(value)
     return str(value)
-
-
-def wait_for_verification_email(token: str, timeout: int = None):
-    if timeout is None:
-        timeout = cfg.email.wait_timeout
-
-    print(f"等待验证邮件 (最长 {timeout} 秒)...")
-    start_time = time.time()
-
-    while time.time() - start_time < timeout:
-        messages = fetch_emails(token)
-
-        if messages and len(messages) > 0:
-            for msg in messages:
-                sender = str(msg.get('from', {}).get('address', '')).lower()
-                subject = _to_str(msg.get('subject', ''))
-
-                if 'opencode' in sender or 'opencode' in subject.lower():
-                    print(f"\n收到 opencode 验证邮件！")
-                    print(f"   主题: {subject}")
-
-                    message_id = msg.get('id', '')
-                    if message_id:
-                        detail = get_email_detail(token, message_id)
-                        if detail:
-                            html_content = _to_str(detail.get('html'))
-                            text_content = _to_str(detail.get('text'))
-                            intro = _to_str(detail.get('intro'))
-
-                            for content in [html_content, text_content, intro, subject]:
-                                if content:
-                                    link = extract_verification_link(content)
-                                    if link:
-                                        return link
-
-                            for content in [html_content, text_content, intro, subject]:
-                                if content:
-                                    code = extract_verification_code(content)
-                                    if code:
-                                        return code
-
-                            print(f"   无法从邮件中提取验证信息")
-                            if text_content:
-                                print(f"   文本预览: {text_content[:300]}")
-
-                    intro = _to_str(msg.get('intro', ''))
-                    if intro:
-                        link = extract_verification_link(intro)
-                        if link:
-                            return link
-
-        elapsed = int(time.time() - start_time)
-        print(f"  等待中... ({elapsed}秒)", end='\r')
-        time.sleep(cfg.email.poll_interval)
-
-    print("\n等待验证邮件超时")
-    return None

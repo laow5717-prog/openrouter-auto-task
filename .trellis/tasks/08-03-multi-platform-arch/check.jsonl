@@ -1,0 +1,8 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量检查基准"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "校验 schema 迁移是否符合既有约定、是否幂等、旧列是否按计划保留"}
+{"file": ".trellis/spec/backend/concurrency-guidelines.md", "reason": "校验 PaymentCardRegistry 的 _in_flight 保持全局、_used 按平台隔离是否落实"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验 PaymentResult 六个 outcome 的处置分支与改造前逐一对应"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "platform 参数需贯穿 API→编排→模型→SQL 全链路，跨层一致性是本次主要风险"}
+{"file": ".trellis/tasks/08-03-multi-platform-arch/research/card-occupancy-inventory.md", "reason": "逐条核对卡占用 6 个载体与 12 条排除条件是否都已平台化，尤其 valid_cards 守卫"}
+{"file": ".trellis/tasks/08-03-multi-platform-arch/research/accounts-table-inventory.md", "reason": "逐条核对 accounts 读写点是否都已迁移到正确的层"}

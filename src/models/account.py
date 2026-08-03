@@ -49,30 +49,6 @@ class AccountModel:
         )
         return cur.rowcount
 
-    def update_bound_cards(self, email, count, sync_status=True):
-        """记录账单页核对到的真实已绑卡数。
-
-        count 是页面读数（get_bound_card_count），不是数据库里 card_bindings 的成功条数——
-        账号可能绑过卡池之外的卡，那些卡在库里查不到也不做关联，只体现在这个计数上。
-        sync_status=True 时顺带把 status 写成 'bound_N_cards' 保持与旧筛选逻辑兼容；
-        count 为 0 时不改 status，避免把 registered/failed 等状态覆盖成 'bound_0_cards'。
-        """
-        if count is None:
-            return
-        count = int(count)
-        if sync_status and count > 0:
-            self.db.execute(
-                "UPDATE accounts SET bound_card_count=?, cards_checked_at=datetime('now','localtime'), "
-                "status=?, updated_at=datetime('now','localtime') WHERE email=?",
-                (count, f"bound_{count}_cards", email),
-            )
-        else:
-            self.db.execute(
-                "UPDATE accounts SET bound_card_count=?, cards_checked_at=datetime('now','localtime'), "
-                "updated_at=datetime('now','localtime') WHERE email=?",
-                (count, email),
-            )
-
     def update_balance(self, email, balance):
         """记录该账号最近一次读到的 AI Credits 余额（美元）"""
         if balance is None:
@@ -110,16 +86,6 @@ class AccountModel:
             (link, email),
         )
         return cur.rowcount
-
-    def get_email_password(self, email):
-        """取该账号的邮箱密码（用于登录二次验证时换 mail.tm token）。
-
-        返回 str | None；账号不存在或未存密码均返回 None。
-        """
-        row = self.db.fetchone(
-            "SELECT email_password FROM accounts WHERE email=?", (email,)
-        )
-        return (dict(row).get('email_password') or None) if row else None
 
     def get_all(self, order_desc=True):
         order = "DESC" if order_desc else "ASC"

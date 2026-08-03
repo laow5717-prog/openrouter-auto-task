@@ -1,0 +1,12 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "本次核心是 schema 迁移（V13-V16）与模型层改造，必须遵守既有的迁移与 SQLite 约定"}
+{"file": ".trellis/spec/backend/concurrency-guidelines.md", "reason": "PaymentCardRegistry / claim_batch / WorkerPool 的并发不变量在改造中必须保住"}
+{"file": ".trellis/spec/backend/adspower-guidelines.md", "reason": "AdsPower 环境配额 12 与回收判据改写是 Stage 2C.4 的直接约束"}
+{"file": ".trellis/spec/backend/stripe-payment-element.md", "reason": "Stage 2A 抽 StripeCheckoutProvider 时不得改变既有 Stripe 交互行为"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新增 src/platforms、src/payments、src/identity 三个目录需符合既有结构约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "PaymentResult 六个 outcome 的处置语义必须逐字保持，错误处理约定是判据"}
+{"file": ".trellis/spec/api/index.md", "reason": "Stage 3 要给流水线与卡池接口加 platform 参数"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "抽象层设计的核心判断是「哪些已在事实上被共享」，避免发明新结构"}
+{"file": ".trellis/tasks/08-03-multi-platform-arch/research/accounts-table-inventory.md", "reason": "accounts 表全部读写点清单，Stage 1A 拆表的完整改动面"}
+{"file": ".trellis/tasks/08-03-multi-platform-arch/research/card-occupancy-inventory.md", "reason": "卡占用 6 个载体与选卡 12 条排除条件，Stage 1B 的完整改动面"}
+{"file": ".trellis/tasks/08-03-multi-platform-arch/research/platform-adapter-surface.md", "reason": "候选接口方法清单、6 处 opencode 耦合点、AdsPower 不按平台拆的论据"}
