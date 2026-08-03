@@ -562,8 +562,13 @@ class WorkerPool:
         会落到聚合流而不是它自己的分栏。
 
         用 token 复位而非直接 set(None)：串行分支跑在协调线程上，若不复位，
-        绑定会泄漏到后续阶段，让阶段之间的日志被错记到 W1 名下。"""
+        绑定会泄漏到后续阶段，让阶段之间的日志被错记到 W1 名下。
+
+        除 worker 外还要绑**日志归属的 ctx**：多平台并发时两个平台各有一套同名的
+        W1..W4，只绑 worker 的话 dispatch_print 解析不出这条日志属于哪个平台。
+        同样因为 contextvars 不跨线程继承，必须在线程体里绑。"""
         token = _current_worker.set(worker)
+        ctx_token = self.app_state.bind_logs() if hasattr(self.app_state, 'bind_logs') else None
         worker.busy = True
         try:
             return fn(worker, *args)
@@ -572,6 +577,8 @@ class WorkerPool:
             worker.current_action = "空闲"
             worker.stop_screenshot_loop()
             worker.clear_active_driver()
+            if ctx_token is not None:
+                self.app_state.unbind_logs(ctx_token)
             _current_worker.reset(token)
 
     def map(self, items, fn):

@@ -8,6 +8,7 @@ import time
 import random
 import json
 import threading
+import contextvars
 from datetime import datetime
 
 from flask import Flask, send_from_directory, Response
@@ -40,6 +41,68 @@ from src.web.worker import (
 # 实测本机直连 stripe 正常（302），故让 stripe 走直连、其余（github/opencode）走代理。
 # Stripe 结账风控看卡/账单/设备指纹，不强依赖 IP 与 opencode 会话同源，可接受本机 IP。
 _PROXY_BYPASS = "*.stripe.com, stripe.com, *.stripecdn.com, b.stripecdn.com, js.stripe.com, m.stripe.com, m.stripe.network, *.stripe.network"
+
+
+# ---------- 日志归属 ----------
+#
+# 被劫持的 print 指向下面的模块级 dispatch_print，由它从 contextvar 解析
+# 「这条日志属于哪个平台」。
+#
+# 为什么不能像从前那样把某个实例的绑定方法装进各模块：_patch_prints 是往模块的
+# globals 里塞一个 print 名字，两个平台各装一次的话，后装的直接覆盖先装的 ——
+# 于是**所有平台的 print 都进同一个实例的日志流**。src.payments.stripe_checkout
+# 尤其致命：opencode 与 infron 的 module_names() 都含它。
+_RUN_CTX = contextvars.ContextVar('run_context', default=None)
+
+# _patch_prints 只该执行一次。装的是下面这个模块级函数，与实例无关，
+# 重复装没有意义，反而容易掩盖「到底装的是谁」的问题。
+_prints_patched = False
+_patch_lock = threading.Lock()
+
+
+def dispatch_print(*args, **kwargs):
+    """所有被劫持的 print 的统一入口。从 contextvar 解析归属后转交给对应的 ctx。
+
+    无归属时（未绑定的线程、导入期的零星 print）如实退化成 builtins.print，
+    **不猜平台**——猜错就是把日志写进另一个平台的流里，比丢掉更难查。
+    """
+    ctx = _RUN_CTX.get()
+    if ctx is None:
+        import builtins
+        builtins.print(*args, **kwargs)
+        return
+    ctx.dispatch_print(*args, **kwargs)
+
+
+def patch_prints():
+    """把各业务模块的 print 换成 dispatch_print。进程内只生效一次。
+
+    模块名由 adapter 自报（module_names），加平台时不用回来改硬编码列表。
+    """
+    global _prints_patched
+    with _patch_lock:
+        if _prints_patched:
+            return
+        _prints_patched = True
+
+    registration.print = dispatch_print
+    try:
+        from src.browser import driver as browser_module
+        browser_module.print = dispatch_print
+    except Exception:
+        pass
+
+    import src.platforms as platforms
+    mods = ['src.services.github_signup_service',
+            'src.services.email', 'src.services.captcha']
+    for _slug in platforms.all_slugs():
+        mods.extend(platforms.get(_slug).module_names())
+    import importlib
+    for _mod in mods:
+        try:
+            importlib.import_module(_mod).print = dispatch_print
+        except Exception:
+            pass
 
 
 def _to_pw_proxy(row):
@@ -375,10 +438,10 @@ class AppState:
     # ---------- 日志路由 ----------
 
     def dispatch_print(self, *args, **kwargs):
-        """被劫持的 print 入口：按调用线程所属 worker 路由日志。
+        """把一条日志写进**本 ctx** 的分栏与聚合流。
 
-        worker 线程内（已 bind_current_worker）→ 进该 worker 的分栏日志，
-        同时以 [Wn] 前缀进聚合流；worker 外（串行路径/请求线程）→ 只进聚合流。
+        这是「已经知道归属」之后的写入端。归属的解析在模块级的 `dispatch_print`
+        里做——被劫持的 print 指向那个函数，不是这个绑定方法。
         """
         sep = kwargs.get('sep', ' ')
         msg = sep.join(map(str, args))
@@ -394,6 +457,31 @@ class AppState:
 
     # 旧名保留：内部调用点众多，且语义等价（未绑定 worker 时行为与从前一致）
     _hooked_print = dispatch_print
+
+    def bind_logs(self):
+        """把本 ctx 绑成当前线程/协程的日志归属，返回可 reset 的 token。
+
+        用法（每个会跑业务代码的新线程入口都要来一次）：
+
+            token = ctx.bind_logs()
+            try:
+                ...
+            finally:
+                ctx.unbind_logs(token)
+
+        ⚠️ contextvars **不跨线程继承**。漏绑一处的表现是那条链路的日志跑到另一个
+        平台的日志流里去，不报错、不崩溃——所以每个绑定点都得有对应测试。
+        """
+        return _RUN_CTX.set(self)
+
+    @staticmethod
+    def unbind_logs(token):
+        try:
+            _RUN_CTX.reset(token)
+        except (ValueError, LookupError):
+            # token 来自别的 context（跨线程误用）时 reset 会抛。吞掉即可：
+            # 线程结束后它的 context 本就随之消失。
+            pass
 
     def run_batch_task(self, count, card_info_list, login_password, max_bindable_cards, captcha_api_key):
         self.is_running = True
@@ -1456,36 +1544,17 @@ class AppState:
             self._hooked_print(f"{'#' * 50}")
 
     def _patch_prints(self):
-        """劫持相关模块的 print 函数以捕获日志"""
-        hooked = self._hooked_print
-        registration.print = hooked
-        try:
-            from src.browser import driver as browser_module
-            browser_module.print = hooked
-        except Exception:
-            pass
-        # 平台适配器与身份供给各模块的 print 也劫持，便于 Web 日志捕获。
-        # 模块名由 adapter 自报——加平台时不用回来改这份硬编码列表。
-        import src.platforms as platforms
-        mods = ['src.services.github_signup_service']
-        for _slug in platforms.all_slugs():
-            mods.extend(platforms.get(_slug).module_names())
-        for _mod in mods:
-            try:
-                import importlib
-                importlib.import_module(_mod).print = hooked
-            except Exception:
-                pass
-        try:
-            from src.services import email as email_module
-            email_module.print = hooked
-        except Exception:
-            pass
-        try:
-            from src.services import captcha as captcha_module
-            captcha_module.print = hooked
-        except Exception:
-            pass
+        """装 print 钩子，并把本 ctx 绑成**当前线程**的日志归属。
+
+        名字与调用点都沿用改造前的，但语义变了两处：
+        1. 钩子是进程级的、只装一次（装的是模块级 dispatch_print，与实例无关）；
+        2. 「这条日志属于谁」不再由钩子里绑死的 self 决定，而是运行时从 contextvar 解析。
+
+        返回 token 供调用方 reset。既有调用点都不接返回值——它们跑在各自的流水线
+        线程里，线程结束后 context 随之消失，不 reset 也不会泄漏到别处。
+        """
+        patch_prints()
+        return self.bind_logs()
 
 
 def gen_frames(worker):

@@ -444,11 +444,14 @@ def recharge_account():
     state.is_running = True
     state.stop_requested = False
     state.current_action = f"正在为 {email} 在 {platform} 充值..."
-    state._patch_prints()
 
     import threading
 
     def _do_recharge():
+        # 绑定必须在**本线程内**做：contextvars 不跨线程继承，在请求线程里绑
+        # 对这个新线程毫无作用，日志会因为解析不出归属而退化成裸 print。
+        # （_patch_prints 同时完成「装钩子」与「绑本线程」，钩子部分是幂等的。）
+        state._patch_prints()
         try:
             state._recharge_one_account(email, login_password, payment_group_id,
                                         captcha_api_key=captcha_api_key,
