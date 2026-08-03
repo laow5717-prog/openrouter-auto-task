@@ -159,3 +159,48 @@ def test_returns_none_when_balance_block_absent():
 @pytest.mark.parametrize('text', ['', 'Available Balance', 'Balance $ 5.00'])
 def test_returns_none_on_unparsable_text(text):
     assert _bal(text) is None
+
+
+# ---------- Top Up 弹窗的步骤判定 ----------
+
+_STEP1 = ('Top Up Credits\nAdd credits to your account. '
+          'Confirm details on the next step.\n$50 $100 $300\nPay $52.85\nClose')
+_STEP2 = ('Top Up Credits\nEnter your card or another Stripe payment method '
+          'to complete the top-up.\nBack Pay $52.85 Close')
+
+
+class _ModalSession:
+    """只实现 current_step 需要的那点接口。"""
+
+    def __init__(self, modal_text):
+        self._t = modal_text
+
+    class _Page:
+        def __init__(self, t):
+            self._t = t
+
+        def evaluate(self, _js):
+            return {'text': self._t} if self._t else None
+
+    @property
+    def page(self):
+        return self._Page(self._t)
+
+
+def test_step_detection_distinguishes_the_two_pay_buttons():
+    """两步弹窗的 Pay 按钮同名，只能靠副标题区分——认错步骤会在第一步就去找卡号框。"""
+    assert ic.current_step(_ModalSession(_STEP1)) == 1
+    assert ic.current_step(_ModalSession(_STEP2)) == 2
+
+
+def test_step_is_none_when_modal_absent():
+    assert ic.current_step(_ModalSession(None)) is None
+
+
+def test_unknown_modal_text_falls_back_to_step_one():
+    """站点改文案时保守按第一步处理，而不是崩掉。"""
+    assert ic.current_step(_ModalSession('Top Up Credits\n某种新文案')) == 1
+
+
+def test_preset_amounts_match_the_site():
+    assert ic._PRESET_AMOUNTS == (50, 100, 300)
