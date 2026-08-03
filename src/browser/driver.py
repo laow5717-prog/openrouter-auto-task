@@ -866,11 +866,23 @@ def create_driver_vanilla(profile_id, proxy=None):
 
 
 def close_driver(driver):
-    """安全关闭浏览器并清理临时 profile（幂等；quit 内部已含 profile 清理）"""
+    """安全关闭浏览器并清理临时 profile（幂等；quit 内部已含 profile 清理）。
+
+    关闭后触发 driver._on_closed（若有）。这是给「跟着会话生命周期走的资源」用的
+    统一回收点——目前是 AdsPower 的环境配额：占用在建会话时取得，必须在会话关掉时
+    还回去，否则配额只出不进，几个账号之后就再也起不来浏览器。
+    close_driver 是所有关闭路径的唯一收口，挂在这里才不会漏。
+    """
     try:
         driver.quit()
     except Exception:
         pass
+    cb = getattr(driver, '_on_closed', None)
+    if cb is not None:
+        try:
+            cb()
+        except Exception:
+            pass       # 回收失败不能反过来把关闭流程搞挂
 
 
 def type_slowly(element, text, delay=0.05):

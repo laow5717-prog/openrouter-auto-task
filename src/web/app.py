@@ -156,6 +156,14 @@ class SharedResources:
         # 同一把——那个是每平台各自的收尾集合，混用会让两个平台互相阻塞。
         self._adspower_lock = threading.Lock()
 
+        # AdsPower 环境配额的按平台仲裁（7/4，总 11，可借用）。
+        # 必须共享：配额是两个平台共用的物理资源，各持一个仲裁器等于没有仲裁。
+        from src.browser.adspower_quota import AdsPowerQuota
+        self.quota = AdsPowerQuota(
+            total=getattr(cfg.adspower, 'total_quota', None),
+            reserved=getattr(cfg.adspower, 'platform_quota', None),
+        )
+
 
 class AppState:
     """单个平台的运行时状态。
@@ -265,6 +273,10 @@ class AppState:
     def _adspower_lock(self):
         return self.shared._adspower_lock
 
+    @property
+    def quota(self):
+        return self.shared.quota
+
     # ---------- AdsPower 环境池 ----------
 
     @property
@@ -307,7 +319,35 @@ class AppState:
         from src.browser.adspower_driver import create_driver_adspower
 
         def _factory(email):
-            session = create_driver_adspower(email, pool, client)
+            # ⚠️ 配额必须在**进池之前**取。池的 _lock 串行化「挑代理→建环境→撞配额
+            # →回收→重试」整条链；持着池锁再去等配额的话，释放方永远拿不到池锁来
+            # 删环境 —— 直接死锁。顺序只能是「先配额，后池」。
+            #
+            # 拿不到是**等待**而不是报错：配额是两个平台共用的资源，对方跑完就会
+            # 释放，直接判失败会让账号白白进失败集合。
+            if not self.quota.acquire(self.platform,
+                                      timeout=cfg.adspower.quota_wait_seconds,
+                                      should_stop=lambda: self.stop_requested):
+                snap = self.quota.snapshot()
+                raise AdsPowerError(
+                    f"等待 AdsPower 环境配额超时（本平台 {snap['held'].get(self.platform, 0)}/"
+                    f"{snap['reserved'].get(self.platform, '?')}，总 {snap['total_held']}/{snap['total']}）")
+
+            released = threading.Event()
+
+            def _give_back():
+                # 幂等：close_driver 可能被重复调用，多还一次会把别人的额度也放掉。
+                if not released.is_set():
+                    released.set()
+                    self.quota.release(self.platform)
+
+            try:
+                session = create_driver_adspower(email, pool, client)
+            except BaseException:
+                _give_back()          # 没起来就立刻还，否则额度只出不进
+                raise
+
+            session._on_closed = _give_back
             pid = getattr(session, 'adspower_profile_id', None)
             if pid:
                 # 用本平台自己的锁，不是共享的 _adspower_lock —— 那把锁保护的是
@@ -324,6 +364,15 @@ class AppState:
             pending = list(self._adspower_started)
             self._adspower_started.clear()
         client = self._adspower_client
+        # 配额对账：正常路径由 close_driver 的 _on_closed 逐个归还，但异常路径可能
+        # 漏掉（进程被杀、会话对象没走到 close_driver）。任务收尾时本平台不该再持有
+        # 任何额度，把残留的全还回去——只出不进的话，几个账号之后就再也起不来浏览器。
+        leaked = self.quota.held(self.platform)
+        if leaked:
+            for _ in range(leaked):
+                self.quota.release(self.platform)
+            self.add_log(f"[AdsPower] 收尾归还了 {leaked} 个泄漏的环境配额")
+
         if not pending or client is None:
             return
         closed = 0
@@ -1107,14 +1156,23 @@ class AppState:
                     self._hooked_print("充值阶段被中断")
                     raise
                 except AdsPowerError as e:
-                    # 浏览器起不来（配额满 / 客户端没开 / Key 无效）。这不是账号的问题，
-                    # 所以**不动账号状态**——标 failed 会让 imported 账号退出补号池永不重试。
-                    # 也不必逐个账号重试：环境配额是全局的，下一个账号必然撞同一堵墙，
-                    # 整批立刻收敛才能让「配额已满」这条关键信息留在日志顶端而不被淹掉。
+                    # 浏览器起不来（配额等不到 / 客户端没开 / Key 无效）。这不是账号的
+                    # 问题，所以**不动账号状态**——标 failed 会让 imported 账号退出补号池
+                    # 永不重试。
+                    #
+                    # 曾经这里是「置全局 stop_requested 整批收敛」，理由是「配额是全局的，
+                    # 下一个账号必然撞同一堵墙」。多平台并发后这条不成立了：配额由仲裁器
+                    # 管，拿不到会先**等**（quota_wait_seconds），能走到这里说明是等超时或
+                    # 客户端真的不可用。而按平台拆分后置 stop 只会停自己，配额却是共用的
+                    # ——结果是 A 平台饿死在等待、B 平台反复抛错自杀。
+                    #
+                    # 改为：只跳过本账号，并向借用方发一个归还请求。下一个账号还会重试，
+                    # 真的持续不可用时由「整轮零进展」兜底收敛。
                     with state_lock:
                         done.add(email)   # 本轮不再重领，但账号状态保持原样
-                    self.stop_requested = True
-                    self._hooked_print(f"AdsPower 环境不可用，终止本次任务: {e}")
+                    asked = self.quota.request_recall(self.platform)
+                    note = f"；已向借用方请求归还 {asked} 个额度" if asked else ""
+                    self._hooked_print(f"AdsPower 环境暂不可用，跳过 {email}: {e}{note}")
                 except Exception as e:
                     with state_lock:
                         stats['fail'] += 1
@@ -1491,10 +1549,14 @@ class AppState:
                         self._hooked_print("订阅阶段被中断")
                         raise
                     except AdsPowerError as e:
-                        # 与充值管线同理：浏览器起不来是全局故障，不是这个账号的问题。
-                        # 下一个账号必然撞同一堵墙，整批立刻收敛。
-                        self.stop_requested = True
-                        self._hooked_print(f"AdsPower 环境不可用，终止本次任务: {e}")
+                        # 与充值管线同理，理由见那边的长注释：多平台并发后不能再
+                        # 「置全局 stop 整批收敛」——配额由仲裁器管、拿不到会先等，
+                        # 而按平台拆分后置 stop 只停自己、配额却是共用的，
+                        # 结果是一个平台饿死等待、另一个反复抛错自杀。
+                        # 改为只跳过本账号 + 请求归还，由「整轮零进展」兜底收敛。
+                        asked = self.quota.request_recall(self.platform)
+                        note = f"；已向借用方请求归还 {asked} 个额度" if asked else ""
+                        self._hooked_print(f"AdsPower 环境暂不可用，跳过 {email}: {e}{note}")
                     except Exception as e:
                         with round_lock:
                             round_stats['other'] += 1

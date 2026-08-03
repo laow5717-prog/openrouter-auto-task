@@ -134,6 +134,12 @@ class AdsPowerConfig:
     ua_systems: 新建环境的指纹允许哪些操作系统。**只能是桌面系统**——AdsPower 不设此项
              时会在所有系统里随机（含 Android/iOS/Linux），移动端 UA 会让 GitHub 与
              Stripe 返回移动版页面，而本项目所有选择器都按桌面版编写。留空用代码默认值。
+    total_quota: 同时可用的环境总数硬上限。**11 而不是 12**——AdsPower 的配额是 12，
+             但它自带的 "Default Profile" 也占一个名额，实测会卡在 11/12。
+    platform_quota: 各平台的自有额度（如 {opencode: 7, infron: 4}）。对方空闲时可以
+             借用，但总数始终受 total_quota 约束。留空用代码默认值。
+    quota_wait_seconds: 等配额的最长时间。配额是两平台共用的资源，对方跑完就会释放，
+             所以拿不到时应当等待而非报错——直接判失败会让账号白白进失败集合。
     """
     enabled: bool = False
     base_url: str = "http://local.adspower.net:50325"
@@ -141,6 +147,9 @@ class AdsPowerConfig:
     group_id: str = "0"
     reclaim_batch: int = 3
     ua_systems: list = field(default_factory=list)
+    total_quota: int = 11
+    platform_quota: dict = field(default_factory=dict)
+    quota_wait_seconds: int = 300
 
 
 @dataclass
@@ -298,6 +307,9 @@ class ConfigLoader:
                 group_id=str(ads.get('group_id', '0')),
                 reclaim_batch=ads.get('reclaim_batch', 3),
                 ua_systems=list(ads.get('ua_systems') or []),
+                total_quota=int(ads.get('total_quota', 11)),
+                platform_quota=dict(ads.get('platform_quota') or {}),
+                quota_wait_seconds=int(ads.get('quota_wait_seconds', 300)),
             )
 
         if 'captcha' in self.raw_config:

@@ -59,6 +59,18 @@ adspower:
   # 移动端 UA 会让 GitHub / Stripe 返回移动版页面，本项目的选择器全是按桌面版写的。
   # 可选值：Windows 7/8/10/11、Mac OS X 10/11/12/13
   ua_systems: []
+  # ---- 多平台并发的环境配额 ----
+  # total_quota 是**同时**可用的环境总数硬上限。11 而不是 12：AdsPower 的配额是 12，
+  # 但它自带的 "Default Profile" 也占一个名额，实测会卡在 11/12。
+  total_quota: 11
+  # 各平台的自有额度。对方空闲时可借用，但总数始终受 total_quota 约束；
+  # 原主需要时借用方会在**下一个账号边界**归还（协作式，不中断正在跑的付款）。
+  platform_quota:
+    opencode: 7
+    infron: 4
+  # 等配额的最长秒数。配额是两平台共用的资源，对方跑完就会释放，
+  # 所以拿不到时是等待而非报错——直接判失败会让账号白白进失败集合。
+  quota_wait_seconds: 300
 
 # 验证码服务配置 (2Captcha)
 captcha:
