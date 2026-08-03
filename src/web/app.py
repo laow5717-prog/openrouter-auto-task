@@ -323,6 +323,11 @@ class AppState:
         task_id = self.models['task'].create('batch', config={
             'count': count, 'has_cards': bool(card_info_list),
         })
+        # 把 task_id 记到状态上，供 /api/card/history/cleanup 保护本任务的未完成行。
+        # 此前这个字段只在 __init__ 里被置 None、再没人写过，于是清理接口拿到的永远是
+        # None —— 而 cleanup_stale_pending(None) 走的是**无条件删除所有 pending/processing**
+        # 的分支。任务运行中点一下清理，正在跑的这个任务的绑卡记录就被删了。
+        self.current_card_task_id = task_id
 
         self._hooked_print(f"开始批量任务，目标: {count}")
 
@@ -373,6 +378,9 @@ class AppState:
             self.current_action = "任务已完成"
             self.models['task'].update_counts(task_id, self.success_count, self.fail_count)
             self.models['task'].finish(task_id, 'completed' if not self.stop_requested else 'stopped')
+            # 任务已结束，撤销保护——否则下一次清理会去保护一个已完成的任务，
+            # 它的残留 pending 行反而永远清不掉。
+            self.current_card_task_id = None
             self._hooked_print("任务完成")
 
     def _register_bind_loop(self, task_id, login_password, max_bindable_cards, captcha_api_key,

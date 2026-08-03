@@ -1050,7 +1050,11 @@ def start_daily_pipeline():
     # 账号判据必须与 run_daily_pipeline._payable_now 用同一组常量——此前这里只排除
     # ('banned','archived') 而流水线排除四项，于是「启动时说有 N 个可充值账号，
     # 实际跑起来只有 M 个」。
-    eligible = len(state._eligible_cards(group_id))
+    # platform 必须显式传下去：_eligible_cards 在 platform=None 时回落 AppState.platform，
+    # 也就是**上一次运行**的那个平台。单平台下「碰巧对」，于是这个启动门一直在用
+    # 另一个平台的卡数做判断。exclude_used=False 同样是必须的——计数调用点不能扣掉
+    # 「本次运行已用」，否则报给用户的可选卡数会偏小。
+    eligible = len(state._eligible_cards(group_id, exclude_used=False, platform=platform))
     if not eligible:
         return jsonify({"error": "该分组无可选卡（全部无效/过期或冷却中），无事可做"}), 400
 
@@ -1103,7 +1107,8 @@ def start_daily_subscribe_pipeline():
     captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
 
     # 启动门：分组要有可选卡，且要有待订阅账号（判据同 _needing）
-    eligible = len(state._eligible_cards(group_id))
+    # platform / exclude_used 必须显式传，理由同每日充值那个启动门。
+    eligible = len(state._eligible_cards(group_id, exclude_used=False, platform=platform))
     if not eligible:
         return jsonify({"error": "该分组无可选卡（全部无效/过期或冷却中），无事可做"}), 400
 

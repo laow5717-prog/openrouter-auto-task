@@ -189,3 +189,75 @@ def test_recharge_clears_stale_stop_flag(client):
         time.sleep(0.1)
 
     assert seen.get('stop') is False, '残留的停止标志没被清掉，本次充值会立刻中断'
+
+
+def test_start_gate_counts_cards_for_the_requested_platform(client, pool):
+    """启动门的可选卡数必须按**请求的**平台算，不能回落到 AppState.platform。
+
+    实际缺陷：端点取到了 platform 却没往下传，_eligible_cards 在 platform=None 时
+    回落 AppState.platform —— 也就是**上一次运行**的那个平台。单平台下「碰巧对」，
+    于是这个启动门一直在用另一个平台的卡数做判断，并发后必然错。
+
+    构造：把两张卡都在 OTHER 平台判废，OC 平台仍可用。
+    此时以 OTHER 启动应被挡（无可选卡），以 OC 启动不应被这个理由挡。
+    """
+    c, models = client
+    state = c.application.config['APP_STATE']
+    state.platform = OC                       # 让回落值是「有卡」的那个平台
+
+    for num in ('4111111111111111', '4222222222222222'):
+        models['card_pool'].mark_invalid_by_number(OTHER, num)
+
+    r = c.post('/api/daily/start', json={'group_id': pool, 'platform': OTHER})
+    assert r.status_code == 400, '该平台的卡全废了，应被启动门挡住'
+    assert '无可选卡' in r.get_json()['error'], \
+        f"被挡的理由不对，说明算的是另一个平台的卡：{r.get_json()}"
+
+
+def test_cleanup_protects_the_running_task(client):
+    """清理接口必须放过**正在运行**的任务的未完成行，只清已结束任务的。
+
+    实际缺陷：current_card_task_id 只在 __init__ 里被置 None、再没人写过，
+    于是清理接口拿到的永远是 None —— 而 cleanup_stale_pending(None) 走的是
+    **无条件删除所有 pending/processing** 的分支。任务运行中点一下清理，
+    正在跑的这个任务的绑卡记录就被一起删了。
+    """
+    c, models = client
+    cb = models['card_binding']
+
+    running = models['task'].create('batch', config={})
+    finished = models['task'].create('batch', config={})
+    models['task'].finish(finished, 'completed')
+
+    cb.create_batch(OC, running, [_card('4111111111111111')])
+    cb.create_batch(OC, finished, [_card('4222222222222222')])
+
+    state = c.application.config['APP_STATE']
+    state.is_running = True
+    state.current_card_task_id = running
+
+    r = c.post('/api/card/history/cleanup')
+    assert r.status_code == 200
+
+    assert len(cb.get_pending(running)) == 1, '正在运行的任务的未完成行被误删了'
+    assert len(cb.get_pending(finished)) == 0, '已结束任务的残留行应被清掉'
+
+
+def test_batch_run_actually_sets_the_task_id():
+    """`run_batch_task` 必须把 task_id 写到 current_card_task_id，并在结束时清掉。
+
+    上一条测试验的是「清理接口尊重这个字段」，但它自己设了字段值，走不到赋值点。
+    真正的缺陷是**这个字段从来没被赋过值**（全仓库唯一写点是 __init__ 的 None），
+    于是保护形同虚设。
+
+    跑一遍完整批量任务的代价太大（要起浏览器、注册账号），这里退而用源码检查钉住
+    赋值点。crude 但有效：删掉那两行赋值，这条就红。
+    """
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState.run_batch_task)
+    assert 'self.current_card_task_id = task_id' in src, \
+        'run_batch_task 没有把 task_id 记到状态上，清理接口的保护会永远失效'
+    assert 'self.current_card_task_id = None' in src, \
+        '任务结束后没有撤销保护，已完成任务的残留行将永远清不掉'
