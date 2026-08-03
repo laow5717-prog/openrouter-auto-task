@@ -94,49 +94,49 @@ Top Up 弹窗选金额、Stripe 付款、余额读取。同一个卡池、同一
 
 ### 适配器与抽象
 
-- [ ] AC1 `platforms.get('infron')` 返回适配器且满足 `PlatformAdapter` 协议，
+- [x] AC1 `platforms.get('infron')` 返回适配器且满足 `PlatformAdapter` 协议，
   `capabilities == {CAP_TOPUP}`。
-- [ ] AC2 接入 infron **没有改动任何编排层代码**（`registration.recharge_account`、
+- [x] AC2 接入 infron **没有改动任何编排层代码**（`registration.recharge_account`、
   `AppState._recharge_one_account`、`routes.py` 的流水线入口）。用 git diff 证明：
   改动只落在 `src/platforms/infron/`、`src/platforms/__init__.py` 的注册处，
   以及必要的测试。
-- [ ] AC3 `subscribe` 未实现时，编排层按 capabilities 跳过而不是抛异常。
+- [x] AC3 `subscribe` 未实现时，编排层按 capabilities 跳过而不是抛异常。
 
 ### 会话
 
-- [ ] AC4 首次登录（环境无 cookie）能走通 magic link 全程并落地 `/dashboard`，
+- [x] AC4 首次登录（环境无 cookie）能走通 magic link 全程并落地 `/dashboard`，
   `SessionResult.ok=True` 且 `tenant_id` 有值（若 infron 无租户概念则明确返回 None
   并在 design 里说明）。
-- [ ] AC5 已登录环境再次 `ensure_session` **不发新邮件**，直接复用。
-- [ ] AC6 只接受本次发起之后到达的 magic link；收件箱里的旧链接不被误用。
-- [ ] AC7 无 `verify_link` 的账号返回 `ok=False` 且 detail 说明原因。
+- [x] AC5 已登录环境再次 `ensure_session` **不发新邮件**，直接复用。
+- [x] AC6 只接受本次发起之后到达的 magic link；收件箱里的旧链接不被误用。
+- [x] AC7 无 `verify_link` 的账号返回 `ok=False` 且 detail 说明原因。
 
 ### 充值
 
-- [ ] AC8 `top_up` 能走到 Stripe 付款环节并返回符合契约的 `PaymentResult`。
-- [ ] AC9 真实拒付返回 `outcome='failed'`，且卡按「本平台是否成功过」判冷却或判废。
-- [ ] AC10 `needs_captcha` / `error` / `unknown` 三种结果**不消耗卡**（不写平台状态、
+- [x] AC8 `top_up` 能走到 Stripe 付款环节并返回符合契约的 `PaymentResult`。
+- [x] AC9 真实拒付返回 `outcome='failed'`，且卡按「本平台是否成功过」判冷却或判废。
+- [x] AC10 `needs_captcha` / `error` / `unknown` 三种结果**不消耗卡**（不写平台状态、
   不进冷却）。
-- [ ] AC11 `Pay` 按钮的定位不依赖具体金额（改充值额后仍能点中）。
+- [x] AC11 `Pay` 按钮的定位不依赖具体金额（改充值额后仍能点中）。
 
 ### 余额
 
-- [ ] AC12 `read_balance` 在余额为 0 时返回 `0.0` 而不是 None——两者语义不同，
+- [x] AC12 `read_balance` 在余额为 0 时返回 `0.0` 而不是 None——两者语义不同，
   None 应只表示「读不到」。
 - [ ] AC13 充值成功后余额回写到 `platform_accounts(platform='infron').credits_balance`。
 
 ### 跨平台隔离（真实数据验证）
 
 - [ ] AC14 同一邮箱同时有 opencode 与 infron 两行平台账号，状态互不覆盖。
-- [ ] AC15 一张卡在 infron 被判废后，opencode 视角的可选卡集合不变；反之亦然。
-- [ ] AC16 前端切到 infron 后，账号列表的平台状态列、卡池桶计数都按 infron 给。
+- [x] AC15 一张卡在 infron 被判废后，opencode 视角的可选卡集合不变；反之亦然。
+- [x] AC16 前端切到 infron 后，账号列表的平台状态列、卡池桶计数都按 infron 给。
 
 ### 端到端
 
-- [ ] AC17 用一个 `identity_status='failed'` 的账号跑通完整链路：
+- [x] AC17 用一个 `identity_status='failed'` 的账号跑通完整链路：
   AdsPower 起环境 → 过 Turnstile → magic link 登录建号 → 读余额 → Top Up →
   逐卡试付 → 结果与记账全部落到 `platform='infron'`。
-- [ ] AC18 现有测试套件仍全绿（当前基线 262 passed），并新增 infron 适配器的
+- [x] AC18 现有测试套件仍全绿（当前基线 262 passed），并新增 infron 适配器的
   契约测试。
 
 ## Notes
