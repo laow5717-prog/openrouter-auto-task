@@ -132,6 +132,14 @@ class PlatformAdapter(Protocol):
 
     def read_balance_from_current_page(self, session): ...
 
+    def fetch_apikey(self, session, tenant_id, monitor=None):
+        """抓取该租户的 API key 明文；抓不到返回 None。
+
+        编排层在充值成功 / 余额达标归档后调用（此时会话必在登录态），把 key 落到
+        platform_accounts.apikey，免得事后再为每个账号单独开浏览器补抓。
+        """
+        ...
+
     def top_up(self, session, tenant_id, card, amount=None, monitor=None,
                should_stop=None) -> PaymentResult: ...
 

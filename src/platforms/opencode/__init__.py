@@ -97,6 +97,10 @@ class OpencodeAdapter:
         """
         return _billing._read_balance(session)
 
+    def fetch_apikey(self, session, tenant_id, monitor=None):
+        """抓 /keys 页的 API key 明文（sk-…）；抓不到返回 None。"""
+        return _billing.fetch_apikey(session, tenant_id, monitor)
+
     # ---------- 充值 ----------
 
     def top_up(self, session, tenant_id, card, amount=None, monitor=None, should_stop=None):

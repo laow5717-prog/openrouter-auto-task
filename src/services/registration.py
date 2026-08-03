@@ -105,6 +105,26 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
     responses = []
 
+    def _grab_apikey(sess, wid):
+        """登录态下抓平台 API key 落库。best-effort：任何异常都不影响充值主流程。
+
+        充值成功 / 余额达标归档后调用——此时会话必在登录态，顺手抓 key 免得事后再
+        为每个账号单独开一次浏览器补抓。适配器未实现 fetch_apikey 时静默跳过。
+        """
+        if not (platform_account_model and wid):
+            return
+        fetch = getattr(adapter, "fetch_apikey", None)
+        if not callable(fetch):
+            return
+        try:
+            key = fetch(session, wid, monitor_callback)
+            if key:
+                platform_account_model.update_apikey(platform, email, key)
+                if monitor_callback:
+                    monitor_callback(session, f"{email} 已抓取并落库 API key")
+        except Exception:
+            pass
+
     def _log_card_attempt(card, ok, reason, result):
         """逐卡写一条 recharge_logs（成功/失败）。记账集中于此，避免上层重复。"""
         if not recharge_log_model:
@@ -188,6 +208,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                     platform_account_model.update_tenant_id(platform, email, wid)
                 except Exception:
                     pass
+            _grab_apikey(session, wid)
             if monitor_callback:
                 monitor_callback(session, f"{email} 余额 ${cur_bal} ≥ ${skip_balance}，跳过充值并归档")
             return (False, f"余额 ${cur_bal} ≥ ${skip_balance}，跳过并归档",
@@ -251,6 +272,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                             platform_account_model.update_tenant_id(platform, email, wid)
                         except Exception:
                             pass
+                    _grab_apikey(session, wid)
                     _log_card_attempt(card, True, "", result)
                     return (True, "", responses, card_last4, "topup")
 

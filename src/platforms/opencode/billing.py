@@ -190,6 +190,31 @@ def read_current_balance(session, wid, monitor=None):
     return _read_balance(session)
 
 
+_APIKEY_RE_JS = r"""
+() => {
+  const m = document.documentElement.outerHTML.match(/sk-[A-Za-z0-9_\-]{20,}/);
+  return m ? m[0] : null;
+}
+"""
+
+
+def fetch_apikey(session, wid, monitor=None):
+    """导航到 /keys 页抓 API key 明文（sk-…），抓不到返回 None。
+
+    页面展示的是打码 key，但 outerHTML 里含完整明文（与 scripts/fetch_apikeys.py
+    同一判据）。要求会话已登录；充值/归档后顺手调用可免去事后单独开浏览器补抓。
+    """
+    try:
+        session.get(f"https://opencode.ai/workspace/{wid}/keys")
+        time.sleep(3)
+        key = session.page.evaluate(_APIKEY_RE_JS)
+    except Exception:
+        return None
+    if key:
+        _step(monitor, session, "已抓到 API key")
+    return key or None
+
+
 def start_recharge(session, wid, amount, monitor):
     """打开 billing 页并发起充值。返回 (mode, balance_before)。
 
