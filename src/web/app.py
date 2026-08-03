@@ -53,11 +53,59 @@ def _to_pw_proxy(row):
     return d
 
 
-class AppState:
-    """全局应用状态（运行时内存数据）。
+class SharedResources:
+    """跨平台共享的单例资源。
 
-    分层：本类持有全局聚合信息（is_running / 停止标志 / 总计数 / 聚合日志），
-    每个浏览器实例的隔离状态在 WorkerState 里（src/web/worker.py）。
+    多平台并发时**每个平台一个 AppState，但只有一个 SharedResources**。
+    放进这里的依据不是「看起来像全局」，而是每一项都有具体的物理理由：
+
+    - db / models —— Database 自带锁且 check_same_thread=False，本身线程安全；
+      model 方法已全部显式收 platform 参数，天然按平台隔离。
+    - open_browsers —— Chrome profile 目录按 email 命名，同一 email 不能被打开两次。
+    - account_registry —— 同上，账号的排他是 email 级的，跨平台也必须互斥。
+    - payment_registry —— _in_flight 全局是**硬要求**：同一张卡在几秒内被两个商户
+      同时请求授权是典型盗刷特征，会直接触发发卡行风控。
+    - proxy_registry —— 出口 IP 是物理资源，反关联的全部意义就在于不重复。
+    - _adspower_client —— 其 _throttle 限流状态是**实例级**的，两个实例等于两倍
+      请求速率，会撞 AdsPower 的接口频率限制。
+    - _adspower_pool —— 其 _lock 串行化「挑代理→建环境→撞配额→回收→重试」整条链，
+      拆开会活锁（A 刚删出的配额被 B 抢走），池的 docstring 里已写明。
+    """
+
+    def __init__(self, db, models):
+        self.db = db
+        self.models = models
+
+        # 按账号独立跟踪的浏览器查看会话（不阻塞全局任务）
+        self.open_browsers = set()
+
+        # 并发排他：账号（Chrome profile 单实例约束）与支付卡（选卡闸门时间差）。
+        # 三者都必须跨平台共享——理由见类 docstring。
+        self.account_registry = AccountRegistry(self)
+        self.payment_registry = PaymentCardRegistry()
+        self.proxy_registry = ProxyRegistry()
+
+        # AdsPower 指纹浏览器接入（cfg.adspower.enabled 为假时恒为 None，全链路不受影响）。
+        # 惰性构造：启动时不去连 AdsPower，免得客户端没开就起不来服务。
+        self._adspower_pool = None
+        self._adspower_client = None
+        # 只保护「客户端/池的惰性构造」。注意与 AppState._adspower_started 的锁不是
+        # 同一把——那个是每平台各自的收尾集合，混用会让两个平台互相阻塞。
+        self._adspower_lock = threading.Lock()
+
+
+class AppState:
+    """单个平台的运行时状态。
+
+    分层（自外向内三层）：
+      SharedResources —— 跨平台共享的单例资源（DB、models、三个排他注册表、AdsPower 池）
+      AppState        —— **每个平台一个**，持有「这一次运行」的状态
+      WorkerState     —— 每个浏览器实例的隔离状态（src/web/worker.py）
+
+    类名保留 AppState 而不是改成 PlatformRunContext，是为了不动几百处既有引用；
+    但语义已经从「全局唯一」变成「每平台一个」。共享资源通过 property 委托给
+    self.shared，因此方法体里的 self.db / self.models / self.account_registry
+    等写法**一行都不用改**——这是把改动面压到最小的关键。
 
     始终存在一个主 worker 'W1'：串行路径（单账号充值等）与 max_workers=1 时
     都走它，因此下列 set_active_driver / _stop_screenshot_loop / _monitor 等
@@ -68,15 +116,13 @@ class AppState:
 
     DEFAULT_PLATFORM = 'opencode'
 
-    def __init__(self, db, models):
-        self.db = db
-        self.models = models
+    def __init__(self, db, models, platform=None, shared=None):
+        # shared 为 None 时自建一个——保持既有调用方（含测试）不用改。
+        self.shared = shared if shared is not None else SharedResources(db, models)
 
-        # 当前流水线的目标平台。本次改造只支持「一次跑一个平台」——AppState 是
-        # 单例，is_running / 计数器 / 三个内存注册表都是全局的，两个平台同时跑
-        # 会互相清对方的占用。启动流水线时由入口显式设置，跑完不重置（列表页等
-        # 读接口沿用它作为默认平台）。
-        self.platform = self.DEFAULT_PLATFORM
+        # 本实例负责的平台。曾经是「当前流水线跑哪个平台」的全局字段，
+        # 两个平台同时跑会互相覆盖；现在每平台一个实例，它就是这个实例的身份。
+        self.platform = platform or self.DEFAULT_PLATFORM
 
         self.is_running = False
         self.stop_requested = False
@@ -86,11 +132,9 @@ class AppState:
         self.logs = []
         self.lock = threading.Lock()
 
-        # 当前信用卡驱动任务 ID
+        # 当前信用卡驱动任务 ID。由 run_batch_task 写入、收尾时清空，
+        # 供 /api/card/history/cleanup 保护本任务的未完成行。
         self.current_card_task_id = None
-
-        # 按账号独立跟踪的浏览器查看会话（不阻塞全局任务）
-        self.open_browsers = set()
 
         # worker 运行时。W1 是主 worker，恒存在。
         # workers 只增不减（旧 worker 的日志留着供回看）；对外展示以
@@ -103,19 +147,60 @@ class AppState:
         # 是否带 [Wn] 前缀，使串行输出与改造前逐字一致。
         self.parallel_mode = False
 
-        # 并发排他：账号（Chrome profile 单实例约束）与支付卡（选卡闸门时间差）
-        self.account_registry = AccountRegistry(self)
-        self.payment_registry = PaymentCardRegistry()
-        self.proxy_registry = ProxyRegistry()
-
-        # AdsPower 指纹浏览器接入（cfg.adspower.enabled 为假时恒为 None，全链路不受影响）。
-        # 惰性构造：启动时不去连 AdsPower，免得客户端没开就起不来服务。
-        self._adspower_pool = None
-        self._adspower_client = None
-        self._adspower_lock = threading.Lock()
         # 本次运行启动过的环境（profile_id）。任务收尾时逐个 stop，避免用户点停止或
         # 任务异常退出后留下一堆开着的浏览器（每个都吃几百 MB 内存）。
+        # 按平台各自持有：收尾时只该关自己起的，不能连另一个平台的一起关。
         self._adspower_started = set()
+        self._adspower_started_lock = threading.Lock()
+
+    # ---------- 共享资源的委托 ----------
+    # 这些 property 的存在意义：让方法体里的 self.db / self.models /
+    # self.account_registry 等既有写法保持不变。改成 self.shared.db 要动几百处，
+    # 而 app.py 里跑通的 opencode 流程是本项目最贵的资产。
+
+    @property
+    def db(self):
+        return self.shared.db
+
+    @property
+    def models(self):
+        return self.shared.models
+
+    @property
+    def open_browsers(self):
+        return self.shared.open_browsers
+
+    @property
+    def account_registry(self):
+        return self.shared.account_registry
+
+    @property
+    def payment_registry(self):
+        return self.shared.payment_registry
+
+    @property
+    def proxy_registry(self):
+        return self.shared.proxy_registry
+
+    @property
+    def _adspower_pool(self):
+        return self.shared._adspower_pool
+
+    @_adspower_pool.setter
+    def _adspower_pool(self, v):
+        self.shared._adspower_pool = v
+
+    @property
+    def _adspower_client(self):
+        return self.shared._adspower_client
+
+    @_adspower_client.setter
+    def _adspower_client(self, v):
+        self.shared._adspower_client = v
+
+    @property
+    def _adspower_lock(self):
+        return self.shared._adspower_lock
 
     # ---------- AdsPower 环境池 ----------
 
@@ -162,7 +247,9 @@ class AppState:
             session = create_driver_adspower(email, pool, client)
             pid = getattr(session, 'adspower_profile_id', None)
             if pid:
-                with self._adspower_lock:
+                # 用本平台自己的锁，不是共享的 _adspower_lock —— 那把锁保护的是
+                # 客户端/池的惰性构造，拿它护每平台各自的集合会让两个平台互相阻塞。
+                with self._adspower_started_lock:
                     self._adspower_started.add(pid)
             return session
 
@@ -170,10 +257,10 @@ class AppState:
 
     def _stop_started_adspower(self):
         """收尾：关掉本次运行启动过的所有环境（幂等，异常不外溢）。"""
-        with self._adspower_lock:
+        with self._adspower_started_lock:
             pending = list(self._adspower_started)
             self._adspower_started.clear()
-            client = self._adspower_client
+        client = self._adspower_client
         if not pending or client is None:
             return
         closed = 0
@@ -1432,8 +1519,23 @@ def create_app(db_path=None):
         'adspower_profile': AdsPowerProfileModel(db),
     }
 
-    # 创建应用状态
-    state = AppState(db, models)
+    # 创建应用状态：一份共享资源 + 每个已注册平台一个运行上下文。
+    #
+    # 平台列表从适配器注册表取——注册表是平台的唯一真相来源，没有 platforms 表。
+    # 取不到（极端情况）就退化成只建默认平台，服务仍能起来。
+    shared = SharedResources(db, models)
+    try:
+        import src.platforms as _platforms
+        slugs = list(_platforms.all_slugs())
+    except Exception:
+        slugs = []
+    if AppState.DEFAULT_PLATFORM not in slugs:
+        slugs.append(AppState.DEFAULT_PLATFORM)
+
+    contexts = {s: AppState(db, models, platform=s, shared=shared) for s in slugs}
+    # APP_STATE 保留指向默认平台的 ctx：既有代码与测试大量依赖它，
+    # 按平台寻址在 Stage 5 才切换。
+    state = contexts[AppState.DEFAULT_PLATFORM]
 
     # 进程重启意味着所有 worker 都已消失，其领取的卡必须无条件释放，
     # 否则会永远停在 processing 把卡池慢慢吃空。
@@ -1453,6 +1555,10 @@ def create_app(db_path=None):
     app.config['DB'] = db
     app.config['MODELS'] = models
     app.config['APP_STATE'] = state
+    # 按平台寻址用的全部上下文。Stage 5 之前只有 /api/platforms 之类的只读接口会用到，
+    # 真正的按平台分发在 Stage 5 切换。
+    app.config['RUN_CONTEXTS'] = contexts
+    app.config['SHARED'] = shared
     app.config['REAPER'] = reaper
 
     # 注册蓝图
