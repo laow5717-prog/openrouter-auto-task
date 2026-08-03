@@ -1,0 +1,8 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/tasks/08-04-infron-adapter/research/infron-site-survey.md", "reason": "站点实勘：路径、magic link 流程、Top Up 弹窗形态、Turnstile 约束，实现时的一手依据"}
+{"file": ".trellis/spec/backend/multi-platform-guidelines.md", "reason": "加平台的两步流程、什么按平台隔离、PlatformAdapter 接口边界"}
+{"file": ".trellis/spec/backend/stripe-payment-element.md", "reason": "Stripe 表单操作的既有约定，判断可复用性时对照"}
+{"file": ".trellis/spec/backend/captcha-guidelines.md", "reason": "hCaptcha token 注入与求解设施，infron 的 Top Up 同款"}
+{"file": ".trellis/spec/backend/adspower-guidelines.md", "reason": "infron 必须走 AdsPower；环境按 email 共用、回收判据"}
+{"file": ".trellis/spec/backend/email-verification-guidelines.md", "reason": "收码的时间闸门原则，magic link 同样适用"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "outcome 的不消耗卡硬约束、失败归因白名单"}
