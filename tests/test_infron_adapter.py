@@ -457,17 +457,46 @@ def test_threeds_failure_modal_returns_a_tuple_not_a_frame():
     assert fr is None
 
 
-# ---------- Turnstile 交互式挑战 ----------
+# ---------- Turnstile ----------
+#
+# 这组测试的前提全部来自实探（scripts/probe_turnstile.py，2026-08-04），
+# 不是推测。两条与直觉相反的事实：
+#   1. 挂件 iframe 在 **closed shadow DOM** 里，document.querySelectorAll('iframe')
+#      看不到它 —— 所以 page.locator("iframe[src*=...]") 恒返回 0 个元素。
+#      只能走 frame.frame_element()。
+#   2. 挂件帧的 inner_text 恒为空串（内层还有一层 closed shadow root），
+#      所以任何「读文案判断要不要点」的方案都不成立。
+#
+# 第一版修复正是栽在这两点上：写了两条路径，两条都是死的。
+
+
+class _El:
+    def __init__(self, box, visible=True):
+        self._box, self._vis = box, visible
+
+    def is_visible(self):
+        return self._vis
+
+    def bounding_box(self):
+        return self._box
+
 
 class _Frame:
-    def __init__(self, url, text='', boxes=None):
+    """挂件帧。inner_text 一律空串——那是实测行为，不是省事。"""
+
+    def __init__(self, url, box=None, visible=True, has_checkbox=False, detached=False):
         self.url = url
-        self._text = text
-        self._boxes = boxes or {}
+        self._el = None if detached else _El(box, visible)
+        self._has_cb = has_checkbox
         self.clicked = []
 
+    def frame_element(self):
+        if self._el is None:
+            raise RuntimeError('frame detached')
+        return self._el
+
     def inner_text(self, _sel, timeout=None):
-        return self._text
+        return ''
 
     def locator(self, sel):
         frame = self
@@ -478,23 +507,18 @@ class _Frame:
                 return self
 
             def count(self):
-                return frame._boxes.get(sel, 0)
+                return 1 if (frame._has_cb and 'checkbox' in sel) else 0
 
             def click(self, timeout=None):
-                if not frame._boxes.get(sel):
-                    raise RuntimeError('元素不存在')
                 frame.clicked.append(sel)
 
         return _Loc()
 
 
 class _TSSession:
-    """带 Turnstile frame 的假会话。"""
-
-    def __init__(self, frames, box=None):
-        self._frames = frames
-        self._box = box
+    def __init__(self, frames):
         self.mouse_clicks = []
+        self.steps = []
         outer = self
 
         class _Mouse:
@@ -502,79 +526,96 @@ class _TSSession:
                 outer.mouse_clicks.append((x, y))
 
         class _Page:
-            frames = self._frames
-            mouse = _Mouse()
-
-            def locator(self, _sel):
-                class _L:
-                    @property
-                    def first(self_inner):
-                        return self_inner
-
-                    def bounding_box(self_inner, timeout=None):
-                        return outer._box
-                return _L()
+            pass
 
         self.page = _Page()
+        self.page.frames = list(frames)     # 类体读不到 __init__ 的局部变量
+        self.page.mouse = _Mouse()
 
     def capture_frame(self):
         pass
 
 
-TS_URL = 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2'
+TS_URL = 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0'
+CHECKBOX_BOX = {'x': 100, 'y': 200, 'width': 300, 'height': 65}
 
 
-def test_interactive_turnstile_gets_clicked():
-    """「Verify you are human」是交互式挑战，不点就永远不会过。"""
-    fr = _Frame(TS_URL, 'Verify you are human',
-                boxes={"input[type='checkbox']": 1})
-    assert il.click_turnstile_checkbox(_TSSession([fr])) is True
-    assert fr.clicked == ["input[type='checkbox']"]
+def test_interactive_widget_is_clicked_by_coordinates():
+    """交互式挂件：选择器穿不透 closed shadow DOM，只能按坐标点。
 
-
-def test_passive_turnstile_is_left_alone():
-    """被动形态自己转几秒就过，**不该去点**——多点一下可能反而重置挑战。
-
-    这是本组测试里最重要的一条：加了自动点击之后，最容易犯的错就是
-    见到 Turnstile frame 就点。
+    复选框固定在挂件左端约 30px 处。
     """
-    fr = _Frame(TS_URL, 'Verifying...', boxes={"input[type='checkbox']": 1})
-    assert il.click_turnstile_checkbox(_TSSession([fr])) is False
-    assert fr.clicked == [], '被动挑战被误点了'
+    fr = _Frame(TS_URL, box=CHECKBOX_BOX)
+    sess = _TSSession([fr])
+    assert il.click_turnstile_checkbox(sess) is True
+    assert sess.mouse_clicks == [(130, 232.5)]
+
+
+def test_checkbox_selector_wins_when_it_happens_to_work():
+    """能直接定位到复选框时优先用它，比按坐标可靠。"""
+    fr = _Frame(TS_URL, box=CHECKBOX_BOX, has_checkbox=True)
+    sess = _TSSession([fr])
+    assert il.click_turnstile_checkbox(sess) is True
+    assert fr.clicked == ["input[type='checkbox']"]
+    assert sess.mouse_clicks == [], '既然点到了元素就不该再补一次坐标点击'
+
+
+def test_passive_challenge_is_never_clicked():
+    """被动全页质询的挂件不可见/尺寸为 0，绝不能去点——打断它可能反而重置挑战。
+
+    这是本组最重要的一条：实测被动形态约 34 秒自己放行，
+    加了自动点击之后最容易犯的错就是见到 Turnstile 帧就点。
+    """
+    for box, vis in (({'x': 0, 'y': 0, 'width': 0, 'height': 0}, True),
+                     (CHECKBOX_BOX, False),
+                     (None, True)):
+        sess = _TSSession([_Frame(TS_URL, box=box, visible=vis)])
+        assert il.click_turnstile_checkbox(sess) is False
+        assert sess.mouse_clicks == [], f'被动挑战被误点了（box={box}, visible={vis}）'
+
+
+def test_tiny_widget_is_not_clicked():
+    """尺寸明显小于复选框挂件的，不点。"""
+    sess = _TSSession([_Frame(TS_URL, box={'x': 0, 'y': 0, 'width': 60, 'height': 10})])
+    assert il.click_turnstile_checkbox(sess) is False
 
 
 def test_no_turnstile_frame_is_a_noop():
-    fr = _Frame('https://infron.ai/login', 'Verify you are human')
-    assert il.click_turnstile_checkbox(_TSSession([fr])) is False
+    sess = _TSSession([_Frame('https://infron.ai/login', box=CHECKBOX_BOX)])
+    assert il.click_turnstile_checkbox(sess) is False
 
 
-def test_falls_back_to_clicking_by_coordinates():
-    """Turnstile 有时把复选框放进 **closed** shadow DOM，选择器穿不透
-    （Playwright 只能穿 open shadow DOM）。这时只能按 iframe 包围盒的坐标点。
+def test_detached_frame_does_not_raise():
+    """挑战刚好在这一刻过掉时 frame 会被卸载，不能因此抛异常。"""
+    sess = _TSSession([_Frame(TS_URL, detached=True)])
+    assert il.click_turnstile_checkbox(sess) is False
 
-    坐标兜底看着糙，但没有它交互式挑战就完全无解。
+
+def test_widget_is_located_via_frame_element_not_a_css_selector():
+    """必须用 frame.frame_element()。
+
+    挂件 iframe 在 closed shadow DOM 里，document.querySelectorAll('iframe')
+    看不到它 —— 用 page.locator("iframe[src*=...]") 会恒返回 0 个元素，
+    整条坐标兜底就是死代码。第一版就是这么写的。
     """
-    fr = _Frame(TS_URL, 'Verify you are human', boxes={})   # 所有选择器都找不到
-    sess = _TSSession([fr], box={'x': 100, 'y': 200, 'width': 300, 'height': 65})
-
-    assert il.click_turnstile_checkbox(sess) is True
-    assert len(sess.mouse_clicks) == 1
-    x, y = sess.mouse_clicks[0]
-    assert x == 130, '复选框固定在挂件左端约 30px 处'
-    assert y == 232.5, '应点在垂直中线上'
+    src = inspect.getsource(il._widget_box)
+    # 去掉 docstring 再看，否则注释里提到 locator 会误判
+    body = src.split('\"\"\"')[-1]
+    assert 'frame_element()' in body
+    assert 'locator' not in body, 'CSS 选择器穿不透 closed shadow DOM'
 
 
-def test_wait_loop_throttles_clicking():
-    """点击必须限流：Turnstile 点完要几秒才出结果，连点既没用又像机器人。"""
-    import inspect
+def test_passive_grace_comes_before_any_click():
+    """被动形态实测约 34 秒自过，宽限期内什么都不该做。"""
     src = inspect.getsource(il.wait_past_turnstile)
-    assert '_TURNSTILE_CLICK_GAP_SEC' in src, '等待循环里没有点击间隔限制'
-    assert 'click_turnstile_checkbox' in src, '等待循环没有接入自动勾选'
+    i_grace = src.index('_TURNSTILE_PASSIVE_GRACE_SEC')
+    i_click = src.index('click_turnstile_checkbox')
+    assert i_grace < i_click, '还没等够就去点，会打断本来会自己过的被动挑战'
+    assert il._TURNSTILE_PASSIVE_GRACE_SEC >= 34,         f'宽限期 {il._TURNSTILE_PASSIVE_GRACE_SEC}s 短于实测的被动放行耗时（~34s）'
 
 
 def test_click_failure_does_not_break_the_wait():
-    """点不到就继续等被动放行，不能让它把整个登录搞挂。"""
-    import inspect
+    """点不到就继续等，不能让它把整个登录搞挂。"""
     src = inspect.getsource(il.wait_past_turnstile)
     i = src.index('click_turnstile_checkbox')
-    assert 'except Exception' in src[i:i + 300], '点击异常没有被兜住'
+    assert 'except Exception' in src[i - 200:i + 300]

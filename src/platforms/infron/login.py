@@ -31,16 +31,27 @@ _TURNSTILE_TITLE = 'just a moment'
 _TURNSTILE_BODY_HINTS = ('performing security verification',
                          'verifies you are not a bot')
 
-# Turnstile 挂件所在的 iframe。**它的内容读不进主文档的 innerText**——
-# 所以只看 document.body 永远发现不了「需要手动打勾」这个状态，
-# 表现是干等到超时，看起来像「AdsPower 这次没过」。
+# Turnstile 挂件所在的 iframe。
+#
+# ⚠️ 实探（scripts/probe_turnstile.py，2026-08-04）确认的两件事，都与直觉相反：
+#
+# 1. **挂件的 iframe 在 closed shadow DOM 里**。`document.querySelectorAll('iframe')`
+#    完全看不到它，所以 `page.locator("iframe[src*=...]")` 永远返回 0 个元素。
+#    要拿到这个元素只能走 `frame.frame_element()`——Playwright 的 frame 树不受
+#    shadow DOM 影响。
+# 2. **挂件帧的内容也读不出来**：`fr.inner_text('body')` 返回空串，
+#    `document.body.innerHTML` 也是空的（内层还有一层 closed shadow root）。
+#    所以任何「读文案判断要不要点」的方案都不成立。
 _TURNSTILE_FRAME_MARK = 'challenges.cloudflare.com'
 
-# 交互式挑战的文案。Turnstile 有两种形态：被动（自己转几秒就过）与交互
-# （渲染一个复选框等人点）。只有后者需要我们动手。
-_TURNSTILE_CLICK_HINTS = ('verify you are human', 'verifying you are human',
-                          'confirm you are human', 'i am human',
-                          '确认您是真人', '确认你是真人')
+# 被动形态自己放行需要多久。实测约 34 秒（标题 'Checking your Browser…'，
+# 全页面零个 checkbox）。**在这之前绝不能去点**——被动挑战被打断可能反而重置。
+_TURNSTILE_PASSIVE_GRACE_SEC = 40
+
+# 交互式复选框挂件的最小宽度。Cloudflare 的标准复选框挂件约 300×65；
+# 被动全页质询的挂件是隐藏的（尺寸为 0 或不可见）。
+# 用**可见尺寸**而不是文案来区分两种形态，因为文案根本读不到（见上）。
+_TURNSTILE_MIN_WIDGET_W = 120
 
 # 两次点击之间的最短间隔。Turnstile 点完要几秒才出结果，连点既没用又像机器人。
 _TURNSTILE_CLICK_GAP_SEC = 8
@@ -85,33 +96,45 @@ def _turnstile_frame(session):
     return None
 
 
-def _needs_click(fr):
-    """这个 Turnstile 是**交互式**的吗（渲染了复选框等人点）。
+def _widget_box(fr):
+    """挂件在页面上的可见包围盒。拿不到返回 None。
 
-    被动形态自己转几秒就过，不该去点——多点一下反而可能重置挑战。
+    必须走 `frame.frame_element()`——挂件的 iframe 在 closed shadow DOM 里，
+    `document.querySelectorAll('iframe')` 看不到它，因此
+    `page.locator("iframe[src*=...]")` 恒返回 0 个元素（实探确认）。
+    Playwright 的 frame 树不受 shadow DOM 影响，这是唯一能拿到该元素的入口。
     """
     try:
-        text = (fr.inner_text('body', timeout=2000) or '').lower()
+        el = fr.frame_element()
+        if not el.is_visible():
+            return None
+        return el.bounding_box()
     except Exception:
-        return False
-    return any(h in text for h in _TURNSTILE_CLICK_HINTS)
+        return None
 
 
 def click_turnstile_checkbox(session, monitor=None):
-    """点一下 Turnstile 的「Verify you are human」复选框。点到了返回 True。
+    """点一下 Turnstile 的交互式复选框。点到了返回 True。
 
-    两条路径，按可靠性排序：
+    **只处理交互形态。** 判据是挂件有可见且够宽的包围盒——不能靠读文案，
+    挂件内容在 closed shadow root 里，`inner_text` 恒为空串（实探确认）。
+    被动全页质询的挂件不可见/尺寸为 0，因此不会被误点。
 
-    1. 在挂件 frame 内直接定位复选框。多数情况可行。
-    2. **按坐标点**。Turnstile 有时把复选框放进 closed shadow DOM，
-       选择器穿不透（Playwright 只能穿 open shadow DOM）。这时只能拿到 iframe
-       元素的包围盒，往左侧偏一点点——复选框固定在挂件左端约 30px 处。
+    调用方负责在被动放行的宽限期之后才调它，见 `wait_past_turnstile`。
 
-    坐标兜底看着糙，但这是 closed shadow DOM 下唯一能用的办法，
-    没有它交互式挑战就完全无解。
+    两条路径：frame 内直接点（能命中就最好），失败则按包围盒坐标点——
+    复选框固定在挂件左端约 30px 处。坐标兜底看着糙，但 closed shadow DOM 下
+    选择器穿不透，没有它交互式挑战完全无解。
     """
     fr = _turnstile_frame(session)
-    if fr is None or not _needs_click(fr):
+    if fr is None:
+        return False
+
+    box = _widget_box(fr)
+    if not box or box['width'] < _TURNSTILE_MIN_WIDGET_W:
+        # 记一笔尺寸：这是下次遇到交互形态时唯一能拿来校准的数据。
+        _step(monitor, session,
+              f'Turnstile 挂件不可点（box={box}），继续等待自动放行')
         return False
 
     # 路径 1：frame 内直接点
@@ -126,19 +149,14 @@ def click_turnstile_checkbox(session, monitor=None):
         except Exception:
             continue
 
-    # 路径 2：按 iframe 的包围盒坐标点（closed shadow DOM 下的唯一出路）
+    # 路径 2：按包围盒坐标点
     try:
-        holder = session.page.locator(
-            f"iframe[src*='{_TURNSTILE_FRAME_MARK}']").first
-        box = holder.bounding_box(timeout=3000)
-        if box and box['width'] > 0:
-            session.page.mouse.click(box['x'] + 30, box['y'] + box['height'] / 2)
-            _step(monitor, session, '已按坐标点击 Turnstile 复选框')
-            return True
+        session.page.mouse.click(box['x'] + 30, box['y'] + box['height'] / 2)
+        _step(monitor, session,
+              f"已按坐标点击 Turnstile 复选框（box={box['width']:.0f}×{box['height']:.0f}）")
+        return True
     except Exception:
-        pass
-
-    return False
+        return False
 
 
 def wait_past_turnstile(session, monitor=None, timeout=90):
@@ -151,12 +169,18 @@ def wait_past_turnstile(session, monitor=None, timeout=90):
 
     实测 AdsPower 下约 30 秒自动放行，故默认给到 90 秒。
 
-    ⚠️ Turnstile 有两种形态：**被动**（自己转几秒就过）与**交互**（渲染一个
-    「Verify you are human」复选框等人点）。后者不点就永远不会过——而它的文案在
-    iframe 里，主文档的 innerText 读不到，所以只等不点的表现是干等到超时，
-    看起来像「AdsPower 这次没过」，极容易误判成环境问题。循环里会检测并自动勾选。
+    ⚠️ Turnstile 有两种形态，处置方式相反：
+
+    - **被动**（实测常见）：标题 'Checking your Browser…'，全页面零个 checkbox，
+      约 34 秒自己放行。这段时间**什么都不要做**——去点它反而可能重置挑战。
+    - **交互**：渲染一个复选框等人点，不点就永远不过。
+
+    所以顺序是「先等足 _TURNSTILE_PASSIVE_GRACE_SEC，仍未放行才考虑点」。
+    是否可点由挂件的可见包围盒判定，不是读文案——挂件内容在 closed shadow root 里，
+    读出来恒为空串（实探确认，见 scripts/probe_turnstile.py）。
     """
-    deadline = time.time() + timeout
+    started = time.time()
+    deadline = started + timeout
     notified = False
     last_click = 0.0
     while time.time() < deadline:
@@ -167,14 +191,15 @@ def wait_past_turnstile(session, monitor=None, timeout=90):
             _step(monitor, session, '等待 Cloudflare 验证页放行')
             notified = True
 
-        # 交互式挑战：自动勾选。限流是必要的——Turnstile 点完要几秒才出结果，
-        # 连点既没用，又是明显的机器人特征。
-        if time.time() - last_click >= _TURNSTILE_CLICK_GAP_SEC:
+        # 宽限期内绝不打扰：被动形态本来就会自己过，插一脚只会坏事。
+        waited = time.time() - started
+        if waited >= _TURNSTILE_PASSIVE_GRACE_SEC and \
+                time.time() - last_click >= _TURNSTILE_CLICK_GAP_SEC:
+            last_click = time.time()      # 无论点没点到都计时，避免每轮都去探
             try:
-                if click_turnstile_checkbox(session, monitor):
-                    last_click = time.time()
+                click_turnstile_checkbox(session, monitor)
             except Exception:
-                pass      # 点不到就继续等被动放行，不能让它把整个登录搞挂
+                pass      # 点不到就继续等，不能让它把整个登录搞挂
 
         time.sleep(3)
     return None
