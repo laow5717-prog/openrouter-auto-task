@@ -1480,3 +1480,26 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Status
 
 [OK] **Completed**
+
+
+## Session 43: 修复「开始充值」在 imported-only 场景启动被拒
+
+**Date**: 2026-08-05
+**Task**: 修复「开始充值」在 imported-only 场景启动被拒
+**Branch**: `main`
+
+### Summary
+
+用户报「账号列表只有已导入邮箱时，点开始充值提示无可充值账号」。根因是 /api/daily/start 启动门只数「有 login_password 的可充值账号」和「余额未满的已充值账号」，而 imported 账号的 GitHub 密码正是注册流程写回去的、天然没有，于是最常见的开局场景一律 400——而 run_daily_pipeline 的补号路径（领 imported → _register_one_account → 注册成功不入 done → 下一轮以 registered 身份登录充值）一直是好的，只是从没被 API 放进去过。修复：启动门补第三类计数 registerable_count，判据与 _registerable_imported() 逐条对齐（identity_status=='imported' 且 _hotmail_for_account 取得到收码数据；收码那条不能省，省了会把「启动被拒」换成「启动成功但空跑一轮就收敛」，更难查）。同一能力在三层各缺一块：代码进不去(db4dbc4)、测试测不到(ab9e017)、界面说不清(72044e1)。测试那道缝值得记：test_daily_start_gate 打桩 run_daily_pipeline 只测门，test_daily_pipeline 直接调 run_daily_pipeline 绕过门只测流水线，两层各自全绿合起来却跑不通——补的 test_daily_start_e2e 从 POST 进、不打桩流水线，临时回退修复后转红验证过有效。UI 文案原先「开始订阅」明写「未注册的先注册」而「开始充值」一字没提，读起来正好相反。全量 524 passed。遗留：服务未重启故修复未生效（用户选择等当前任务收敛后手动重启）；库里 imported 为 0，需导入新邮箱或跑 scripts/reset_failed_accounts_to_imported.py --apply 退回那 22 个 failed；另发现卡池质量已很差（当轮 success=0 fail=29 全是 declined/unionpay），与本次改动无关。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `db4dbc4` | (see git log) |
+| `ab9e017` | (see git log) |
+| `72044e1` | (see git log) |
+
+### Status
+
+[OK] **Completed**
