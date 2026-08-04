@@ -32,3 +32,18 @@
 - 动态领取 → 同账号跨次可能换 IP(用户已知悉)。proxies 表留 assigned_email 便于后续切固定绑定。
 - 代理凭据存 data/openrouter_auto.db(已 gitignore),不入 git;UI 列表打码。
 - 代理健康检查/失活剔除:首版不做,连不上则该次处理失败记日志。
+
+---
+
+## 收尾核实（2026-08-04）
+
+六条 AC 早已全部达成（含真机实测：两个 worker 分别经 10000/10001 端口，
+出口 IP 35.151.253.35 vs 174.74.220.46），但任务状态一直卡在 `planning` 没推进。
+纯流程遗漏，不是工作没做完。
+
+生产佐证：`proxies` 表 100 行，`ProxyRegistry`（`src/web/worker.py`）在用。
+
+后续演进：多平台并发任务（08-04）给 `ProxyRegistry` 加了 owner 维度——
+持有者身份从裸 `worker_id` 改成 `(worker_id, owner)`。原因是每个平台各有一套
+同名的 `W1..W4`，只比 worker_id 会让两个平台的 W1 互认成自己，
+**同一出口 IP 被同时发给两边**，本任务建立的反关联保证就失效了。
