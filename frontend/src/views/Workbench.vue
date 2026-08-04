@@ -210,8 +210,13 @@ async function handleStart() {
     // 金额区间取后端回显的值，而不是本地输入框——两者不一致时用户应当看见的是
     // 实际生效的那一套。
     const amount = `每笔 $${result.amount_min}–$${result.amount_max} · 余额上限 $${result.balance_cap}`
+    // 待注册账号单独列出来。只报 accounts 的话，「刚导入一批新邮箱」这个场景会
+    // 显示「可用账号 0 个」——任务其实靠补号跑得好好的，用户却以为启动歪了。
+    const registerable = result.registerable_accounts
+      ? ` · 待注册补号 ${result.registerable_accounts} 个`
+      : ''
     alert(result.group_name
-      ? `已启动每日充值任务（分组「${result.group_name}」未消耗卡 ${result.usable_cards} 张 · 可用账号 ${result.accounts} 个 · ${amount}）`
+      ? `已启动每日充值任务（分组「${result.group_name}」未消耗卡 ${result.usable_cards} 张 · 可用账号 ${result.accounts} 个${registerable} · ${amount}）`
       : '已启动每日充值任务')
   } catch (e) {
     alert('启动失败: ' + e.message)

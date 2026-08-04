@@ -130,9 +130,37 @@ The three policy fields are parsed by `_recharge_cfg_from(data)`, shared with
 platforms run concurrently against the same process-wide singleton.
 
 Success: `200 {"status": "started", "usable_cards": <int>, "accounts": <int>,
-"group_name": <str>, "amount_min": <int>, "amount_max": <int>,
-"balance_cap": <float>}`. The policy is echoed back so the UI can show what
-actually took effect rather than what was typed.
+"registerable_accounts": <int>, "reusable_accounts": <int>, "group_name": <str>,
+"amount_min": <int>, "amount_max": <int>, "balance_cap": <float>}`. The policy is
+echoed back so the UI can show what actually took effect rather than what was typed.
+
+### Admission gate: count all three account pools
+
+The gate must mirror, condition for condition, the three pools
+`run_daily_pipeline._try_claim()` actually draws from. It rejects only when **all
+three** are empty:
+
+| Pool | Predicate | Pipeline counterpart |
+|------|-----------|----------------------|
+| Rechargeable | has `login_password`, identity & platform status non-terminal | `_payable_now()` |
+| Pending registration | `identity_status == 'imported'` **and** `_hotmail_for_account(a)` resolves | `_registerable_imported()` |
+| Reusable | platform status `recharged` and balance below `balance_cap` | `_reusable_recharged()` |
+
+Two failure modes, both expensive to diagnose:
+
+- **Gate stricter than pipeline.** Freshly imported accounts have no
+  `login_password` — that password is written *by* the signup flow. Testing them
+  with the rechargeable predicate rejects the single most common opening scenario
+  ("I just imported a batch of mailboxes"), even though the pipeline's own
+  make-up-the-shortfall path (register GitHub → log in → recharge) handles it
+  fine. Shipped as a bug on 08-05; fixed in `tests/test_daily_start_gate.py`.
+- **Gate looser than pipeline.** Dropping the `_hotmail_for_account` check would
+  admit `imported` accounts the pipeline cannot claim (no verification-code
+  source). The task starts, burns one empty round, converges. Users read that as
+  "started but did nothing" — worse than a 400.
+
+`_registerable_imported()` additionally excludes `done` (this run's terminated
+set). The gate runs before the run, where `done` is empty, so it omits that term.
 
 ### Validation & Error Matrix
 
@@ -146,7 +174,7 @@ actually took effect rather than what was typed.
 | amount outside `RechargeConfig.AMOUNT_FLOOR..AMOUNT_CEILING` | `400` |
 | non-numeric amount / `balance_cap <= 0` | `400` |
 | no selectable cards in the group | `400 {"error": ...无事可做}` |
-| no rechargeable account | `400 {"error": ...无事可做}` |
+| all three account pools empty (rechargeable / pending-registration / reusable) | `400 {"error": ...无事可做}` |
 | otherwise | `200 started` |
 
 Policy validation **rejects with 400 rather than silently clamping**. A user who

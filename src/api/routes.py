@@ -1377,8 +1377,24 @@ def start_daily_pipeline():
         and ((pa_map.get(a['email']) or {}).get('credits_balance') is None
              or (pa_map.get(a['email']) or {}).get('credits_balance') < recharge_cfg.balance_cap)
     )
-    if account_count == 0 and reusable_count == 0:
-        return jsonify({"error": "无可充值账号（需有登录密码、身份与平台状态均非终态），"
+    # 待注册 imported 账号：刚导入、GitHub 还没注册的邮箱。**不能用 _usable 判**——
+    # 它要求 login_password 非空，而那个密码正是注册流程写回去的，imported 账号
+    # 天然没有。用 _usable 判的结果就是「账号列表里只有新导入的邮箱」这个最常见的
+    # 开局场景永远起不来，而流水线其实完全跑得动：_try_claim 领不到可充账号时会领
+    # 一个 imported 走 _register_one_account，注册成功者下一轮即以 registered 身份充值。
+    #
+    # 判据与 run_daily_pipeline._registerable_imported() 保持一致，改一处要改两处。
+    # 那边多一个 `not in done`（本次运行的终结集合），启动门在运行前判、done 恒空，故略去。
+    # 收码数据这一条不能省：没有它的 imported 账号流水线根本领不走，光放行会把
+    # 「启动就被拒」变成「启动成功但一轮空跑就收敛」，比 400 更难查。
+    registerable_count = sum(
+        1 for a in accts
+        if (a.get('identity_status') or '') == 'imported'
+        and state._hotmail_for_account(a)
+    )
+    if account_count == 0 and registerable_count == 0 and reusable_count == 0:
+        return jsonify({"error": "无可充值账号（需有登录密码、身份与平台状态均非终态）、"
+                                 "无待注册 imported 账号（需有收码链接）、"
                                  "也无余额未满的已充值账号可复用，无事可做"}), 400
 
     import threading
@@ -1394,7 +1410,9 @@ def start_daily_pipeline():
     # 把实际生效的策略回给前端，让它能回显——用户配的和跑的是不是同一套，
     # 应当一眼可见，而不是只能去翻日志。
     return jsonify({"status": "started", "usable_cards": eligible,
-                    "accounts": account_count, "reusable_accounts": reusable_count,
+                    "accounts": account_count,
+                    "registerable_accounts": registerable_count,
+                    "reusable_accounts": reusable_count,
                     "group_name": group['name'],
                     "amount_min": recharge_cfg.amount_min,
                     "amount_max": recharge_cfg.amount_max,
