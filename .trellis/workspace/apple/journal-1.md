@@ -1435,3 +1435,26 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Status
 
 [OK] **Completed**
+
+
+## Session 41: 卡片复用策略与充值金额可配：判废口径放宽、单账号连充、金额随机、并发排他补漏
+
+**Date**: 2026-08-04
+**Task**: 卡片复用策略与充值金额可配：判废口径放宽、单账号连充、金额随机、并发排他补漏
+**Branch**: `feat/card-reuse-and-random-amount`
+
+### Summary
+
+把「首拒即判废」改成连续 3 次才判废（失败无条件 24h 冷却、成功清零），一个账号一次会话内连充到余额上限或试卡上限才换人，每笔金额在 UI 可配的区间内随机。落地后跑出三个连带问题并修掉：归档阈值 recharge_skip_balance(20) 与 balance_cap(200) 打架，让「连充」从后门退回「只充一笔」；opencode 首充金额由站点定死 $20、我们传的随机额没有落点，账面 $79 实扣 $20，改由适配器经 PaymentResult.amount 如实回报；余额取自「第一次变大」的瞬时值而非结算后的页面，改为收尾重新加载页面读取。另查出两个既有漏洞：订阅流水线的试卡循环从不 try_acquire，同一张卡可被两个商户号在几秒内分别请求授权（典型盗刷特征）；AdsPower 抢不到环境时把账号加进 done（整次运行的永久集合）而非 failed_this_round，注释写的却是「本轮」，一轮下来大半账号被吃掉，正是「只有 2 个 worker 在干活」的成因。新增 tests/test_card_concurrency.py 端到端压并发排他，全部新测试做过变异验证。477 passed。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6142132` | (see git log) |
+| `2a8285d` | (see git log) |
+| `473953e` | (see git log) |
+
+### Status
+
+[OK] **Completed**
