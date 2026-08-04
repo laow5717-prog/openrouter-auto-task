@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 41
-- **Last Active**: 2026-08-04
+- **Total Sessions**: 42
+- **Last Active**: 2026-08-05
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1460 | Active |
+| `journal-1.md` | ~1482 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 42 | 2026-08-05 | 账号 Excel 导入 + AdsPower 配置迁到 UI | `58996f1`, `f89005d` | `main` |
 | 41 | 2026-08-04 | 卡片复用策略与充值金额可配：判废口径放宽、单账号连充、金额随机、并发排他补漏 | `6142132`, `2a8285d`, `473953e` | `feat/card-reuse-and-random-amount` |
 | 40 | 2026-08-04 | 多平台架构 + infron 接入 + 双平台并发 | `dead94d`, `a52ca62`, `1b43e08`, `34cc90b`, `1d5d897`, `530f713`, `9afb93e`, `386ec23`, `d6294cb`, `3d1fd3c`, `0c0e1bb`, `138f349`, `3f2d574`, `4c80f55`, `ae81dcf`, `351da3d`, `e6b3859`, `26e6687`, `f2acd33`, `b4a1284`, `907d8da`, `0ef4fac`, `5d8ea0a`, `3910566`, `b717065`, `f36cd68`, `3191c35`, `9adae94`, `1c2ecb5`, `f721f87`, `d86de71`, `8eeb8c2` | `main` |
 | 39 | 2026-08-03 | 每日充值任务停止条件修复 + 累积改动归档提交 | `db62285`, `4b0d965`, `08de230`, `3d97218`, `dc0b359` | `main` |

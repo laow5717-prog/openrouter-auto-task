@@ -1458,3 +1458,25 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Status
 
 [OK] **Completed**
+
+
+## Session 42: 账号 Excel 导入 + AdsPower 配置迁到 UI
+
+**Date**: 2026-08-05
+**Task**: 账号 Excel 导入 + AdsPower 配置迁到 UI
+**Branch**: `main`
+
+### Summary
+
+两件事。① 账号导入：此前只有导出没有导入，账号是手工塞进库的，光给模版没意义，所以模版（邮箱/邮箱密码/邮箱认证链接）和导入一起做。导入状态一律 imported（补号流程只认这个值，写成 registered 等于宣称 GitHub 已开好，账号既不会被注册又登录不了）；缺认证链接的账号入库后领不走（_hotmail_for_account 会过滤），接口单独回传这批，否则用户只看到「导入成功」却困惑于补号流程一个都不碰。② AdsPower 的 key/开关/地址迁到 UI：新增通用键值表 settings（V18），yaml 是默认值、DB 是覆盖值，不回写 yaml（safe_dump 会抹掉注释），只存用户真设过的项（全量灌入会让此后改 yaml 永不生效）。关键是缓存失效——client 惰性创建后缓存在共享状态上，改在**使用点**按 (api_key,base_url) 比对重建，而非依赖「保存时主动 invalidate」（后者漏一个入口就退化成「保存成功但毫无变化」）。API Key 初版做了掩码，按用户要求改回明文并配测试钉住：本机单人使用，掩码挡不住真实威胁却引入「提交的是新 key 还是掩码」的判断，判错就把真 key 覆盖成掩码串。连通性自检复用共享 client——初版每次新建，连点四次就撞 AdsPower 限流、还被错报成「key 不对」。顺带抽出 build_models() 让测试与生产共用模型构造：此前两个测试文件手抄 dict，漏掉 settings 后报错是被 except 吞掉的 KeyError，表面只看到「一个账号都没充成」。518 passed。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `58996f1` | (see git log) |
+| `f89005d` | (see git log) |
+
+### Status
+
+[OK] **Completed**
