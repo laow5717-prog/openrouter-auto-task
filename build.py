@@ -60,6 +60,19 @@ def build():
         '--collect-submodules', 'src',
         # Patchright: 运行时引擎，需带上其 node driver 资源（约 130MB）
         '--collect-all', 'patchright',
+        # 原版 playwright **也必须收**，它不是 patchright 的可选替代：
+        #   - adspower_driver.py 接管 AdsPower 环境走 connect_over_cdp
+        #   - driver.py 的 create_driver_vanilla 走 Stripe 付款页
+        # 两条路径都 import playwright.sync_api，而 sync_playwright().start() 要拉起
+        # playwright/driver/node 子进程。漏收的表现是 Windows 上一句
+        # `FileNotFoundError: [WinError 2] The system cannot find the file specified`
+        # ——AdsPower 环境已经建好、浏览器已经被打开，只是没人接管得了，于是窗口
+        # 一个个堆在桌面上停在空白页。2026-08-05 客户机现场踩到。
+        '--collect-all', 'playwright',
+        # 原始 CDP 前置注入（Stripe hCaptcha）用的 websocket-client。它在 cdp_inject.py
+        # 里是 try/except ImportError 的软依赖，缺了只打一行日志就静默降级，
+        # 所以必须显式带上——否则打包版永远过不了 hCaptcha 且不报错。
+        '--hidden-import', 'websocket',
         '--hidden-import', 'undetected_chromedriver',
         '--hidden-import', 'selenium.webdriver',
         '--hidden-import', 'selenium.webdriver.chrome',

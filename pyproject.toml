@@ -16,6 +16,10 @@ dependencies = [
     "selenium>=4.39.0",
     "undetected-chromedriver>=3.5.5",
     "waitress>=3.0.2",
+    # src/browser/cdp_inject.py 的原始 CDP 前置注入（Stripe hCaptcha）。那里是
+    # try/except ImportError 的软导入，缺了只打一行日志就静默降级——开发机装过所以
+    # 一直没暴露，而 CI 用 `pip install .` 装依赖，没声明就等于打包版必然缺。
+    "websocket-client>=1.7.0",
 ]
 
 [project.optional-dependencies]
