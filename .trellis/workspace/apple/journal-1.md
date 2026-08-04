@@ -1377,3 +1377,61 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Status
 
 [OK] **Completed**
+
+
+## Session 40: 多平台架构 + infron 接入 + 双平台并发
+
+**Date**: 2026-08-04
+**Task**: 多平台架构 + infron 接入 + 双平台并发
+**Branch**: `main`
+
+### Summary
+
+把单平台（opencode）项目改造成可并发跑多个平台。三件事顺序推进：(1) 抽象层——PlatformAdapter 协议、账号拆身份层/平台层、卡池占用按平台隔离，数据层完成隔离且生产验证；(2) 接入第二个平台 infron.ai——AdsPower 过 Turnstile、magic link 登录、嵌入式 Stripe Payment Element 填卡；(3) 双平台真并发——AppState 一分为二（共享资源 + 每平台运行上下文）、三个 registry 引入 owner、日志改 contextvar 分流、AdsPower 环境配额仲裁器（7/4/11 可借用）。测试 262 → 402。
+
+本次最大的收获是「不报错的缺陷」这一类。多平台改造里最危险的三个都不抛异常：snapshot 不区分 owner 会让轮转永不收敛（表现只是「跑着跑着不动了」）；收尾 release_all 无差别全清会让另一平台的排他保护瞬间蒸发；ProxyRegistry 只比裸 worker_id 会把同一出口 IP 发给两个平台。因此每个修复都做了缺陷注入验证（还原成旧写法确认测试变红），四个阶段共 16 个，全部有效。
+
+另一个教训是「靠猜写代码」。Turnstile 自动勾选第一版完全无效——我假设能从 frame 读文案、能用 CSS 选择器定位 iframe，实探后发现挂件在 closed shadow DOM 里，两条路径都是死的。第二版改用 frame_element() 并以可见包围盒为判据，但交互形态至今没实际观测到，如实标注未验证。
+
+顺带修掉六个既有缺陷，其中三个当前单平台下就已经错：启动门算的是上一次运行那个平台的卡数；current_card_task_id 从未被赋值导致清理接口会删掉正在跑的任务的绑卡记录；3DS 误判元组返回值使每笔付款一提交就判废（毁了 7 张好卡）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `dead94d` | (see git log) |
+| `a52ca62` | (see git log) |
+| `1b43e08` | (see git log) |
+| `34cc90b` | (see git log) |
+| `1d5d897` | (see git log) |
+| `530f713` | (see git log) |
+| `9afb93e` | (see git log) |
+| `386ec23` | (see git log) |
+| `d6294cb` | (see git log) |
+| `3d1fd3c` | (see git log) |
+| `0c0e1bb` | (see git log) |
+| `138f349` | (see git log) |
+| `3f2d574` | (see git log) |
+| `4c80f55` | (see git log) |
+| `ae81dcf` | (see git log) |
+| `351da3d` | (see git log) |
+| `e6b3859` | (see git log) |
+| `26e6687` | (see git log) |
+| `f2acd33` | (see git log) |
+| `b4a1284` | (see git log) |
+| `907d8da` | (see git log) |
+| `0ef4fac` | (see git log) |
+| `5d8ea0a` | (see git log) |
+| `3910566` | (see git log) |
+| `b717065` | (see git log) |
+| `f36cd68` | (see git log) |
+| `3191c35` | (see git log) |
+| `9adae94` | (see git log) |
+| `1c2ecb5` | (see git log) |
+| `f721f87` | (see git log) |
+| `d86de71` | (see git log) |
+| `8eeb8c2` | (see git log) |
+
+### Status
+
+[OK] **Completed**
