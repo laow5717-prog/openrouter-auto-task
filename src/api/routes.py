@@ -18,9 +18,36 @@ api = Blueprint('api', __name__)
 
 
 def get_app_state():
-    """获取全局 AppState（在 app.py 中注入）"""
+    """默认平台的运行上下文。
+
+    ⚠️ 多平台并发后，「AppState」已经不是全局唯一的了——每个平台一个。
+    凡是与**某次运行**有关的操作（启动/停止/看状态/看日志），都必须用
+    `get_ctx()` 按平台取，用这个函数会永远操作默认平台。
+
+    保留它是因为有一批接口只碰共享资源（models、db、registry），
+    用哪个 ctx 都一样；那些地方继续用它没问题。
+    """
     from flask import current_app
     return current_app.config['APP_STATE']
+
+
+def get_contexts():
+    """全部平台的运行上下文，{slug: ctx}。"""
+    from flask import current_app
+    return current_app.config.get('RUN_CONTEXTS') or {
+        current_app.config['APP_STATE'].platform: current_app.config['APP_STATE']
+    }
+
+
+def get_ctx(platform=None):
+    """取某个平台的运行上下文。platform 为空时用请求里的平台参数。
+
+    找不到对应平台时回落到默认 ctx 而不是报错：平台列表由代码里的适配器注册表
+    决定，传了未知 slug 属于调用方的问题，但让整个接口 500 更难查。
+    """
+    ctxs = get_contexts()
+    slug = platform or _req_platform()
+    return ctxs.get(slug) or get_app_state()
 
 
 def get_db():
@@ -36,9 +63,14 @@ def get_models():
 def _req_platform(required=False):
     """取本次请求的目标平台 slug。
 
-    读接口（账号/卡池列表）缺省时回落到 AppState 当前平台，让不带参数的老调用
-    仍能工作。写接口与卡池类接口应传 required=True——猜错平台会返回或写入混合
-    数据，那比直接报错糟糕得多。
+    读接口（账号/卡池列表）缺省时回落到**默认平台**，让不带参数的老调用仍能工作。
+    写接口与卡池类接口应传 required=True——猜错平台会返回或写入混合数据，
+    那比直接报错糟糕得多。
+
+    兜底值曾经是「AppState.platform」，也就是**上一次运行的那个平台**。单平台时
+    它恰好等于用户正在看的平台，所以一直没出事；两个平台同时跑之后，这个值会被
+    后启动的那个覆盖，于是不带参数的请求会随机地读到另一个平台的数据。
+    现在改成固定的默认平台常量——猜得稳定，总比猜得随机好。
     """
     value = (request.args.get('platform')
              or (request.get_json(silent=True) or {}).get('platform')
@@ -48,7 +80,8 @@ def _req_platform(required=False):
         return value
     if required:
         return None
-    return get_app_state().platform
+    from src.web.app import AppState
+    return AppState.DEFAULT_PLATFORM
 
 
 @api.route('/api/platforms')
@@ -60,7 +93,10 @@ def list_platforms():
     import src.platforms as platforms
     return jsonify({
         "data": platforms.describe_all(),
+        # 「当前」的语义已经变了：多平台并发时没有唯一的当前平台。这里返回**默认**
+        # 平台，仅供前端首次加载时选一个；真正在看哪个由前端 store 自己持有。
         "current": get_app_state().platform,
+        "running": [slug for slug, c in get_contexts().items() if c.is_running],
     })
 
 
@@ -70,13 +106,18 @@ def get_status():
 
     向后兼容：顶层字段全部保留原语义，workers 数组是新增的旁挂字段。
     串行运行时 workers 只有 W1，顶层 current_action 即 W1 的动作。
+
+    多平台：顶层字段是**所请求平台**的状态（platform 参数，缺省用默认平台）。
+    另外旁挂一个 `platforms` 汇总，让前端能看见**没在看的那个平台**是否在跑——
+    否则它出问题时用户完全看不见。
     """
-    state = get_app_state()
+    state = get_ctx()
     models = get_models()
 
     total_inventory = models['account'].count()
 
     return jsonify({
+        "platform": state.platform,
         "is_running": state.is_running,
         "current_action": state.current_action,
         "success": state.success_count,
@@ -93,6 +134,17 @@ def get_status():
             }
             for w in state.active_workers()
         ],
+        # 全平台概览。刻意只放很轻的字段——它每秒被轮询一次。
+        "platforms": {
+            slug: {
+                "is_running": c.is_running,
+                "current_action": c.current_action,
+                "success": c.success_count,
+                "fail": c.fail_count,
+            }
+            for slug, c in get_contexts().items()
+        },
+        "quota": state.quota.snapshot() if hasattr(state, 'quota') else None,
     })
 
 
@@ -102,8 +154,12 @@ def get_worker_logs(worker_id):
 
     index 传上次返回的 next_index；worker 不存在时回落到主 worker，
     保证前端在 worker 数变化时不会拿到 404。
+
+    必须按平台取 ctx：两个平台各有一套同名的 W1..W4，取错 ctx 会拿到
+    另一个平台那个 worker 的日志——而且因为有「回落主 worker」的兜底，
+    不会 404，只会安静地给错数据。
     """
-    state = get_app_state()
+    state = get_ctx()
     worker = state.get_worker(worker_id)
     logs, next_index = worker.get_logs(int(request.args.get('index', 0)))
     return jsonify({
@@ -117,9 +173,9 @@ def get_worker_logs(worker_id):
 
 @api.route('/api/start', methods=['POST'])
 def start_task():
-    state = get_app_state()
+    state = get_ctx()
     if state.is_running:
-        return jsonify({"error": "Task already running"}), 400
+        return jsonify({"error": f"{state.platform} 已有任务在运行"}), 400
 
     data = request.json or {}
     count = data.get('count', 1)
@@ -140,12 +196,13 @@ def start_task():
 
 @api.route('/api/stop', methods=['POST'])
 def stop_task():
-    state = get_app_state()
+    """停止**某一个平台**的任务，不影响另一个平台（AC2）。"""
+    state = get_ctx()
     if not state.is_running:
-        return jsonify({"error": "No running task"}), 400
+        return jsonify({"error": f"{state.platform} 没有正在运行的任务"}), 400
 
     state.force_stop()
-    return jsonify({"status": "stopping"})
+    return jsonify({"status": "stopping", "platform": state.platform})
 
 
 @api.route('/api/card/template')
@@ -213,10 +270,12 @@ def get_card_history():
 
 @api.route('/api/card/history/cleanup', methods=['POST'])
 def cleanup_card_history():
-    state = get_app_state()
     models = get_models()
-    active_task_id = state.current_card_task_id if state.is_running else None
-    deleted = models['card_binding'].cleanup_stale_pending(active_task_id)
+    # 保护**所有**平台正在跑的任务，不只当前这个——多平台并发时可能同时有两个
+    # 批量任务在跑，只保护其中一个会把另一个的绑卡记录删掉。
+    active = [c.current_card_task_id for c in get_contexts().values()
+              if c.is_running and c.current_card_task_id]
+    deleted = models['card_binding'].cleanup_stale_pending(active)
     return jsonify({"deleted": deleted})
 
 
@@ -387,14 +446,16 @@ def get_account_cards(email):
 
 @api.route('/api/accounts/recharge', methods=['POST'])
 def recharge_account():
-    state = get_app_state()
     models = get_models()
-
-    if state.is_running:
-        return jsonify({"error": "有任务正在运行，请等待完成后再操作"}), 400
 
     data = request.json or {}
     platform = _req_platform()
+    # 按平台取运行上下文——闸门、计数、日志全都是这个 ctx 的。
+    # 曾经这里取的是全局单例，于是 infron 的充值会被 opencode 正在跑的任务挡住。
+    state = get_ctx(platform)
+
+    if state.is_running:
+        return jsonify({"error": f"{platform} 已有任务在运行，请等待完成后再操作"}), 400
     email = data.get('email', '')
     payment_group_id = data.get('payment_group_id')
     captcha_api_key = data.get('captcha_api_key')
@@ -426,13 +487,9 @@ def recharge_account():
     # opencode 充值时直接在 Stripe Checkout 填卡，无需预先绑卡，故不再校验 bound 状态。
     # 支付卡来自 payment_group_id 指定的卡池分组（见 _recharge_one_account → recharge_account）。
 
-    # 目标平台落到 AppState —— _recharge_one_account 与它下游的选卡、记账全都读
-    # self.platform。此前这个端点收了 platform 参数却从没应用，于是不管传什么都跑
-    # opencode，是接第二个平台时才暴露出来的缺陷。
-    #
-    # 直接改 AppState 是当前设计允许的：一次只跑一个平台（见 multi-platform
-    # guidelines），两条流水线入口也是这么做的。
-    state.platform = platform
+    # 不再需要「把 platform 赋给 state」——ctx 本身就是按平台取的，它的 .platform
+    # 就是这个值。曾经那行赋值是单例时代的产物，多平台并发下改全局字段正是要消除的
+    # 竞态源（两个平台同时跑会互相覆盖）。
 
     # 标记为运行中，在后台线程执行充值。
     #
@@ -472,9 +529,10 @@ def recharge_account():
 @api.route('/api/accounts/open-browser', methods=['POST'])
 def open_account_browser():
     """打开浏览器查看账号（平台控制台），按账号独立，不阻塞全局任务"""
-    state = get_app_state()
     models = get_models()
     platform = _req_platform()
+    # 按平台取：下游要用这个 ctx 的 browser_factory 与该平台的适配器。
+    state = get_ctx(platform)
 
     data = request.json or {}
     email = data.get('email', '')
@@ -573,7 +631,11 @@ def open_account_browser():
 
 @api.route('/api/accounts/open-browsers')
 def get_open_browsers():
-    """获取当前打开的浏览器会话列表"""
+    """获取当前打开的浏览器会话列表。
+
+    open_browsers 是**共享**资源（Chrome profile 目录按 email，跨平台唯一），
+    取哪个 ctx 拿到的都是同一个集合——这里用默认 ctx 不是漏改。
+    """
     state = get_app_state()
     return jsonify({"emails": list(state.open_browsers)})
 
@@ -1026,10 +1088,6 @@ def export_valid_cards():
 @api.route('/api/daily/start', methods=['POST'])
 def start_daily_pipeline():
     """启动每日充值任务：选定卡池分组，逐账号轮转充值直到卡池消耗完。"""
-    state = get_app_state()
-    if state.is_running:
-        return jsonify({"error": "有任务正在运行"}), 400
-
     models = get_models()
     data = request.json or {}
 
@@ -1043,6 +1101,13 @@ def start_daily_pipeline():
     platform = _req_platform(required=True)
     if not platform:
         return jsonify({"error": "未指定平台"}), 400
+
+    # 闸门必须**在拿到 platform 之后**判，而且只判这个平台。
+    # 曾经是先取全局单例再判 is_running，于是一个平台在跑就挡住所有平台——
+    # 这正是 AC1 要解开的那道锁。
+    state = get_ctx(platform)
+    if state.is_running:
+        return jsonify({"error": f"{platform} 已有任务在运行"}), 400
 
     login_password = data.get('login_password') or None
     captcha_api_key = data.get('captcha_api_key')
@@ -1087,10 +1152,6 @@ def start_daily_pipeline():
 def start_daily_subscribe_pipeline():
     """启动每日订阅任务：账号轮转——未注册先注册、已注册登录订阅，成功即换下一个账号，
     直到无可选卡 / 无待订阅账号 / 用户停止。与每日充值任务互斥（共用 is_running 闸门）。"""
-    state = get_app_state()
-    if state.is_running:
-        return jsonify({"error": "有任务正在运行"}), 400
-
     models = get_models()
     data = request.json or {}
 
@@ -1104,6 +1165,11 @@ def start_daily_subscribe_pipeline():
     platform = _req_platform(required=True)
     if not platform:
         return jsonify({"error": "未指定平台"}), 400
+
+    # 闸门在拿到 platform 之后判，且只判这个平台（理由同每日充值端点）。
+    state = get_ctx(platform)
+    if state.is_running:
+        return jsonify({"error": f"{platform} 已有任务在运行"}), 400
 
     captcha_api_key = data.get('captcha_api_key')
     # 订阅默认用 Multibot 解 hCaptcha；可传 captcha_server='2captcha.com' 切回

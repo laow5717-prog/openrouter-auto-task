@@ -127,21 +127,23 @@ def test_single_account_recharge_applies_the_platform(client):
     `_recharge_one_account` 读的是 `AppState.platform`，于是不管传什么都跑 opencode。
     现象很隐蔽——日志里是另一个平台的登录流程，而请求明明指定了 infron。
 
-    把 _recharge_one_account 打桩，只验参数落地，不真的起浏览器。
+    多平台并发后语义变了：端点不再「把 platform 赋给全局 state」，而是**按平台取
+    对应的 ctx**。所以桩要打在 infron 那个 ctx 上——如果端点仍取全局单例，
+    这个桩根本不会被调用，seen 保持为空，测试照样红。
     """
     import time
 
     c, models = client
     models['account'].upsert('a@x.com', login_password='pw', identity_status='registered')
-    state = c.application.config['APP_STATE']
+    ctx = c.application.config['RUN_CONTEXTS']['infron']
 
     seen = {}
 
     def _stub(email, login_password, payment_group_id=None, **kw):
-        seen['platform'] = state.platform
+        seen['platform'] = ctx.platform
         return 'failed', 'stubbed'
 
-    state._recharge_one_account = _stub
+    ctx._recharge_one_account = _stub
 
     r = c.post('/api/accounts/recharge',
                json={'email': 'a@x.com', 'platform': 'infron', 'payment_group_id': 1})
@@ -168,16 +170,16 @@ def test_recharge_clears_stale_stop_flag(client):
 
     c, models = client
     models['account'].upsert('a@x.com', login_password='pw', identity_status='registered')
-    state = c.application.config['APP_STATE']
-    state.stop_requested = True          # 模拟上一轮停止后的残留
+    ctx = c.application.config['RUN_CONTEXTS']['infron']
+    ctx.stop_requested = True            # 模拟上一轮停止后的残留
 
     seen = {}
 
     def _stub(email, login_password, payment_group_id=None, **kw):
-        seen['stop'] = state.stop_requested
+        seen['stop'] = ctx.stop_requested
         return 'failed', 'stubbed'
 
-    state._recharge_one_account = _stub
+    ctx._recharge_one_account = _stub
 
     r = c.post('/api/accounts/recharge',
                json={'email': 'a@x.com', 'platform': 'infron', 'payment_group_id': 1})

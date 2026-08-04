@@ -367,15 +367,26 @@ class CardBindingModel:
         return cursor.rowcount
 
     def cleanup_stale_pending(self, active_task_id=None):
-        """清理属于已完成/停止/僵尸任务的未完成记录（pending + processing），返回删除行数"""
-        if active_task_id is not None:
+        """清理属于已完成/停止/僵尸任务的未完成记录（pending + processing），返回删除行数。
+
+        active_task_id 可以是单个 id，也可以是 id 的可迭代集合——多平台并发时
+        可能**同时有多个任务在跑**，只保护其中一个会把另一个的绑卡记录删掉。
+        """
+        ids = active_task_id
+        if ids is not None and not isinstance(ids, (list, tuple, set, frozenset)):
+            ids = [ids]
+        ids = [i for i in (ids or []) if i is not None]
+
+        if ids:
+            marks = ','.join('?' * len(ids))
             cursor = self.db.execute(
-                """DELETE FROM card_bindings
+                f"""DELETE FROM card_bindings
                    WHERE status IN ('pending','processing') AND (
                        task_id IN (SELECT id FROM tasks WHERE status IN ('stopped', 'completed'))
-                       OR (task_id IN (SELECT id FROM tasks WHERE status='running') AND task_id != ?)
+                       OR (task_id IN (SELECT id FROM tasks WHERE status='running')
+                           AND task_id NOT IN ({marks}))
                    )""",
-                (active_task_id,)
+                tuple(ids)
             )
         else:
             cursor = self.db.execute(
