@@ -8,6 +8,7 @@ const routes = [
   { path: '/card-history', name: 'cardHistory', component: () => import('../views/CardHistory.vue') },
   { path: '/recharge-logs', name: 'rechargeLogs', component: () => import('../views/RechargeLogs.vue') },
   { path: '/proxies', name: 'proxies', component: () => import('../views/Proxies.vue') },
+  { path: '/settings', name: 'settings', component: () => import('../views/Settings.vue') },
 ]
 
 export default createRouter({

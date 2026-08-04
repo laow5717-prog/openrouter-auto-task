@@ -84,6 +84,102 @@ def _req_platform(required=False):
     return AppState.DEFAULT_PLATFORM
 
 
+@api.route('/api/settings/adspower', methods=['GET'])
+def get_adspower_settings():
+    """AdsPower 的生效配置。api_key **明文**返回。
+
+    明文是有意的：本机单人使用，同一个库里 GitHub 密码、邮箱密码本来就明文躺着，
+    单给这一个字段打码挡不住任何真实威胁，却要引入「提交上来的是新 key 还是掩码」
+    的判断——判错就把真 key 覆盖成掩码串，那才是真实的破坏。
+
+    from_db 让界面能区分「这是我设的」还是「这是 config.yaml 的默认值」。
+    """
+    from src.models import settings as S
+    models = get_models()
+    eff = get_app_state().adspower_settings()
+    stored = models['settings'].get_many(
+        [S.KEY_ADSPOWER_ENABLED, S.KEY_ADSPOWER_API_KEY, S.KEY_ADSPOWER_BASE_URL])
+    return jsonify({
+        "enabled": eff['enabled'],
+        "base_url": eff['base_url'],
+        "api_key": eff['api_key'],
+        "from_db": {
+            "enabled": S.KEY_ADSPOWER_ENABLED in stored,
+            "api_key": S.KEY_ADSPOWER_API_KEY in stored,
+            "base_url": S.KEY_ADSPOWER_BASE_URL in stored,
+        },
+    })
+
+
+@api.route('/api/settings/adspower', methods=['PUT'])
+def save_adspower_settings():
+    """保存 AdsPower 配置。只写传上来的字段，没传的保持原样。
+
+    每个字段的三种取值语义：
+      - 不传（字段缺席）→ 不动
+      - 传空串          → **清除**覆盖值，回落 config.yaml 的默认值
+      - 传值            → 覆盖
+    「缺席」与「空串」必须区分：都当成清除的话，前端只想改开关也会把 key 抹掉。
+    """
+    from src.models import settings as S
+    models = get_models()
+    data = request.json or {}
+    sm = models['settings']
+
+    if 'enabled' in data:
+        sm.set(S.KEY_ADSPOWER_ENABLED, '1' if data.get('enabled') else '0')
+
+    if 'base_url' in data:
+        url = (data.get('base_url') or '').strip()
+        if url and not url.startswith(('http://', 'https://')):
+            return jsonify({"error": "地址需以 http:// 或 https:// 开头"}), 400
+        sm.set(S.KEY_ADSPOWER_BASE_URL, url or None)
+
+    if 'api_key' in data:
+        key = (data.get('api_key') or '').strip()
+        sm.set(S.KEY_ADSPOWER_API_KEY, key or None)
+
+    return get_adspower_settings()
+
+
+@api.route('/api/settings/adspower/test', methods=['POST'])
+def test_adspower_settings():
+    """连通性自检：客户端可达吗、key 有效吗。
+
+    没有它的话，key 填错只会在下一次跑任务时表现成一句「浏览器起不来」，
+    与配置页隔着十万八千里，用户根本对不上因果。
+    """
+    state = get_app_state()
+    s = state.adspower_settings()
+    if not s['api_key']:
+        return jsonify({"ok": False, "detail": "尚未配置 API Key"})
+
+    # 复用**共享**的那个客户端，不新建。AdsPowerClient 的 _throttle 限流状态是
+    # 实例级的（见 SharedResources 的 docstring）：多一个实例就等于多一倍请求速率，
+    # 会撞 AdsPower 本地接口的频率限制——任务正在跑时点一下检测，可能把任务一起撞挂。
+    # 2026-08-05 连点四次检测就复现过，第四次直接被拒、报成「API Key 不对」。
+    #
+    # 安全性由 _ensure_adspower 保证：它按 (api_key, base_url) 比对，配置变了会重建，
+    # 所以拿到的客户端一定是当前生效配置的那个，不存在「验的是旧参数」。
+    client, _pool = state._ensure_adspower()
+    if client is None:
+        # 开关关着时没有共享实例可用。此处只发一个请求，临时建一个可以接受——
+        # 而且这条路径下不会有任务在跑（任务用的就是这个开关）。
+        from src.services.adspower import AdsPowerClient
+        client = AdsPowerClient(s['base_url'], s['api_key'])
+    try:
+        profiles = client.list_profiles(page_size=1)
+        return jsonify({"ok": True,
+                        "detail": f"连接正常，当前环境数可读（返回 {len(profiles)} 条样本）"})
+    except Exception as e:
+        msg = str(e)[:200]
+        if 'Connection' in msg or 'refused' in msg or 'timed out' in msg.lower():
+            hint = "连不上客户端——请确认 AdsPower 已启动，且「本地API」开关已打开"
+        else:
+            hint = "客户端有响应但请求被拒——多半是 API Key 不对"
+        return jsonify({"ok": False, "detail": f"{hint}（{msg}）"})
+
+
 @api.route('/api/platforms')
 def list_platforms():
     """可用平台列表 + 当前选中平台。

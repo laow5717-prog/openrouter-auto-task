@@ -27,6 +27,9 @@
       <router-link to="/proxies" class="nav-item" active-class="active">
         <Icon name="monitor" /> 代理管理
       </router-link>
+      <router-link to="/settings" class="nav-item" active-class="active">
+        <Icon name="monitor" /> 系统设置
+      </router-link>
     </nav>
 
   </aside>

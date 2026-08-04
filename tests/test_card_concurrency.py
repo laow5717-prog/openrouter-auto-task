@@ -270,7 +270,7 @@ def test_subscribe_pipeline_also_takes_card_exclusion(db, monkeypatch):
     from src.config import cfg as _cfg
     from src.platforms.base import CAP_SUBSCRIBE
     import src.browser.driver as driver_module
-    from src.web.app import AppState
+    from src.web.app import AppState, build_models
 
     # 本用例盯的是选卡排他，不是浏览器供给：关掉 AdsPower 走 create_driver_vanilla，
     # 再把它换成假会话，全程不起真浏览器。
@@ -298,12 +298,9 @@ def test_subscribe_pipeline_also_takes_card_exclusion(db, monkeypatch):
         db.execute("INSERT INTO accounts (email, login_password, identity_status) "
                    "VALUES (?,?,?)", ('sub@x.com', 'pw', 'registered'))
 
-        state = AppState(db, {
-            'card_pool': pool, 'valid_card': ValidCardModel(db),
-            'card_state': CardPaymentStateModel(db), 'recharge_log': RechargeLogModel(db),
-            'platform_account': PlatformAccountModel(db), 'account': AccountModel(db),
-            'card_group': CardGroupModel(db),
-        }, platform=STUB)
+        # 用生产同一份构造：手抄的 dict 漏掉新加的模型时，报错会是流水线里
+        # 一句被吞掉的 KeyError，与被测行为毫无关系。
+        state = AppState(db, build_models(db), platform=STUB)
 
         # 充值侧先占住第 0 张卡（模拟另一条流水线正在刷它）
         held = raw[0]['number']

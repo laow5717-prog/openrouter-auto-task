@@ -128,3 +128,10 @@ export const getValidCards = (params) => get('/api/valid-cards', params)
 export const startDailyPipeline = (data) => post('/api/daily/start', data)
 // Daily subscribe pipeline（账号轮转：注册/登录 + Stripe 订阅）
 export const startDailySubscribe = (data) => post('/api/daily/subscribe/start', data)
+
+// Settings
+export const getAdspowerSettings = () => get('/api/settings/adspower')
+export const saveAdspowerSettings = (body) => request('/api/settings/adspower', {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+}).then(r => r.json())
+export const testAdspowerSettings = () => post('/api/settings/adspower/test')

@@ -26,6 +26,7 @@ from src.models.valid_card import ValidCardModel
 from src.models.card_payment_state import CardPaymentStateModel
 from src.models.proxy import ProxyModel
 from src.models.adspower_profile import AdsPowerProfileModel
+from src.models.settings import SettingsModel
 from src.services.adspower import AdsPowerError
 from src.utils import is_identity_terminal, is_platform_terminal
 from src.services import registration, card as card_service
@@ -148,10 +149,15 @@ class SharedResources:
         self.payment_registry = PaymentCardRegistry()
         self.proxy_registry = ProxyRegistry()
 
-        # AdsPower 指纹浏览器接入（cfg.adspower.enabled 为假时恒为 None，全链路不受影响）。
+        # AdsPower 指纹浏览器接入（生效配置的 enabled 为假时恒为 None，全链路不受影响）。
         # 惰性构造：启动时不去连 AdsPower，免得客户端没开就起不来服务。
         self._adspower_pool = None
         self._adspower_client = None
+        # 建池时用的 (api_key, base_url)。UI 上改了配置就与它对不上，据此重建。
+        # 光有「保存时主动 invalidate」是不够的：那条路径要求每个改配置的入口都记得调，
+        # 漏一个就退化成「保存成功但毫无变化」——这类 bug 从现象上完全看不出根因。
+        # 在使用点比对一次，是让新值生效这件事不依赖调用方的自觉。
+        self._adspower_creds = None
         # 只保护「客户端/池的惰性构造」。注意与 AppState._adspower_started 的锁不是
         # 同一把——那个是每平台各自的收尾集合，混用会让两个平台互相阻塞。
         self._adspower_lock = threading.Lock()
@@ -270,6 +276,17 @@ class AppState:
         self.shared._adspower_client = v
 
     @property
+    def _adspower_creds(self):
+        # 必须与它守护的 client 存在同一处。放在 AppState 上的话每个平台各记一份，
+        # 而 client 是共享的：A 平台按新配置重建完，B 平台一看自己记的还是旧值，
+        # 又拆掉重建一次。两个平台会来回互相拆对方刚建好的池。
+        return self.shared._adspower_creds
+
+    @_adspower_creds.setter
+    def _adspower_creds(self, v):
+        self.shared._adspower_creds = v
+
+    @property
     def _adspower_lock(self):
         return self.shared._adspower_lock
 
@@ -279,20 +296,40 @@ class AppState:
 
     # ---------- AdsPower 环境池 ----------
 
+    def adspower_settings(self):
+        """AdsPower 的**生效配置**：UI 存进 DB 的覆盖值优先，没设过回落 config.yaml。
+
+        每次读库而不是缓存：这三项在 UI 上随时可改，缓存一份就得再解决「什么时候
+        失效」的问题，而读一行 sqlite 的开销远小于那个复杂度。
+        """
+        return self.models['settings'].adspower_effective(cfg.adspower)
+
     @property
     def adspower_enabled(self):
-        return bool(cfg.adspower.enabled)
+        return bool(self.adspower_settings()['enabled'])
 
     def _ensure_adspower(self):
-        """惰性创建 AdsPower 客户端与环境池。未启用时返回 (None, None)。"""
+        """惰性创建 AdsPower 客户端与环境池。未启用时返回 (None, None)。
+
+        凭据（api_key / base_url）变了就**丢掉旧的重建**。不这样做的话，UI 上存了新
+        key 之后进程会继续拿着旧 client 跑，界面显示保存成功、行为却毫无变化——
+        这类 bug 从现象上完全看不出根因。
+        """
         if not self.adspower_enabled:
             return None, None
+        s = self.adspower_settings()
+        creds = (s['api_key'], s['base_url'])
         with self._adspower_lock:
+            if self._adspower_pool is not None and self._adspower_creds != creds:
+                # 只丢引用、不去关正在跑的环境：在飞的会话还攥着旧 client，
+                # 让它们各自跑完；新值只对之后创建的会话生效。
+                self.add_log("[AdsPower] 配置已变更，重建客户端与环境池")
+                self._adspower_pool = None
+                self._adspower_client = None
             if self._adspower_pool is None:
                 from src.services.adspower import AdsPowerClient
                 from src.browser.adspower_driver import AdsPowerProfilePool
-                self._adspower_client = AdsPowerClient(
-                    cfg.adspower.base_url, cfg.adspower.api_key)
+                self._adspower_client = AdsPowerClient(s['base_url'], s['api_key'])
                 self._adspower_pool = AdsPowerProfilePool(
                     self._adspower_client,
                     self.models['adspower_profile'],
@@ -304,6 +341,7 @@ class AppState:
                     # 会让那个 worker 的浏览器凭空消失。
                     is_busy=self.account_registry.is_claimed,
                 )
+                self._adspower_creds = creds
             return self._adspower_client, self._adspower_pool
 
     def browser_factory(self, track_for_teardown=True):
@@ -1772,6 +1810,26 @@ def gen_frames(worker):
         time.sleep(0.15)
 
 
+def build_models(db):
+    """构造全部模型。抽成函数是为了让测试能拿到与生产**同一份**模型集合——
+    在测试里手抄一份 dict，迟早会漏掉新加的 key，然后以「KeyError: 'settings'」
+    这种与被测行为毫无关系的方式失败。"""
+    return {
+        'account': AccountModel(db),
+        'platform_account': PlatformAccountModel(db),
+        'task': TaskModel(db),
+        'card_binding': CardBindingModel(db),
+        'recharge_log': RechargeLogModel(db),
+        'card_group': CardGroupModel(db),
+        'card_pool': CardPoolModel(db),
+        'valid_card': ValidCardModel(db),
+        'card_state': CardPaymentStateModel(db),
+        'proxy': ProxyModel(db),
+        'adspower_profile': AdsPowerProfileModel(db),
+        'settings': SettingsModel(db),
+    }
+
+
 def create_app(db_path=None):
     """Flask 应用工厂"""
     base_dir = get_base_dir()
@@ -1796,19 +1854,7 @@ def create_app(db_path=None):
     db = Database(db_path)
 
     # 创建模型
-    models = {
-        'account': AccountModel(db),
-        'platform_account': PlatformAccountModel(db),
-        'task': TaskModel(db),
-        'card_binding': CardBindingModel(db),
-        'recharge_log': RechargeLogModel(db),
-        'card_group': CardGroupModel(db),
-        'card_pool': CardPoolModel(db),
-        'valid_card': ValidCardModel(db),
-        'card_state': CardPaymentStateModel(db),
-        'proxy': ProxyModel(db),
-        'adspower_profile': AdsPowerProfileModel(db),
-    }
+    models = build_models(db)
 
     # 创建应用状态：一份共享资源 + 每个已注册平台一个运行上下文。
     #

@@ -25,7 +25,7 @@ from src.models.database import Database
 from src.models.proxy import ProxyModel
 from src.models.recharge_log import RechargeLogModel
 from src.models.valid_card import ValidCardModel
-from src.web.app import AppState
+from src.web.app import AppState, build_models
 
 
 def _full_cards(n):
@@ -151,13 +151,10 @@ def no_browser(monkeypatch):
 def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls=_Tracker):
     path = tempfile.mktemp(suffix='.db')
     db = Database(path)
-    models = {
-        'account': AccountModel(db), 'platform_account': PlatformAccountModel(db),
-        'recharge_log': RechargeLogModel(db),
-        'card_group': CardGroupModel(db), 'card_pool': CardPoolModel(db),
-        'valid_card': ValidCardModel(db), 'card_state': CardPaymentStateModel(db),
-        'proxy': ProxyModel(db),
-    }
+    # 用生产同一份构造，而不是在这里手抄一份：抄的那份漏掉新加的模型时，
+    # 失败现象是流水线内部一句「严重错误: 'settings'」被 except 吞掉，
+    # 表面上只看到「一个账号都没充成」，与真正的原因隔着十万八千里。
+    models = build_models(db)
     gid = models['card_group'].create('pay-group', 'pay')
     models['card_pool'].add_cards(gid, _full_cards(n_cards))
     for i in range(n_registered):

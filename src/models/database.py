@@ -388,6 +388,24 @@ ALTER TABLE card_payment_state ADD COLUMN fail_streak INTEGER DEFAULT 0;
 ALTER TABLE card_payment_state ADD COLUMN last_fail_at TEXT;
 """
 
+# 运行时可改的配置项。存在理由是分发形态：打包后 config.yaml 落在
+# ~/.openrouter-auto-task/ 下，换台机器、换个 AdsPower 账号都得让用户手工找到并编辑
+# 一个 YAML 文件。
+#
+# 做成**通用键值**而不是给 AdsPower 开几个专用列：将来再有配置项要搬到 UI，只是多写
+# 一个 key，不用再加一次迁移。value 一律存 TEXT，类型由读取方按 key 自己解释——
+# 配置项本来就是异构的，为它们造一套类型系统不值当。
+#
+# 不回写 config.yaml 是刻意的：那个文件手写、注释密集（config.example.yaml 里每项都有
+# 好几行说明），yaml.safe_dump 会把注释全部抹掉。yaml 保持为「默认值」，本表是「覆盖值」。
+_SCHEMA_V18 = """
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
+"""
+
 _ADD_COLUMN_RE = re.compile(r'^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)', re.I)
 
 _MIGRATIONS = {
@@ -408,6 +426,7 @@ _MIGRATIONS = {
     15: _SCHEMA_V15,
     16: _SCHEMA_V16,
     17: _SCHEMA_V17,
+    18: _SCHEMA_V18,
 }
 
 

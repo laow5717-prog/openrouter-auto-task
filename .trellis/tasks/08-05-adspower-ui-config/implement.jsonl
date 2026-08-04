@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/adspower-guidelines.md", "reason": "AdsPower 接入的配额/回收/代理绑定约束，改配置读取点前必须读"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "新增 settings 表要走既有迁移机制"}
+{"file": ".trellis/spec/backend/concurrency-guidelines.md", "reason": "client/pool 缓存在跨平台共享状态上，失效重建涉及锁与并发"}
+{"file": ".trellis/spec/api/index.md", "reason": "新增配置读写接口"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "新增配置界面"}
