@@ -163,14 +163,36 @@ def test_orchestration_runs_end_to_end_on_a_fictional_platform(stub, models):
     assert models['valid_card'].is_valid('opencode', '4111111111111111') is False
 
 
-def test_adapter_supplies_its_own_skip_balance(models):
-    """余额阈值来自 adapter，不是写死的 $20。"""
-    stub = StubAdapter(balance=60.0)      # 60 ≥ StubAdapter.recharge_skip_balance(50)
-    ok, _err, _r, _l4, outcome = _recharge(stub, models, [_card()])
+def test_archive_threshold_comes_from_the_recharge_policy(models):
+    """归档阈值取 RechargeConfig.balance_cap，**不再**是 adapter.recharge_skip_balance。
+
+    两者曾经并存且互相打架：skip_balance 两平台都写死 20，而 balance_cap 默认 200。
+    一个账号成功充过一笔后余额必然 ≥20，下次再来就被归档，哪怕它离 200 还差得远——
+    「成功后继续充」这条规则就这样从后门被绕回成「一个账号只充一笔」，而且披着
+    「已归档」的外衣，从日志上看像是账号真的满了。现在只保留 balance_cap 一个数：
+    它同时是连充循环的上限和归档的判据。
+    """
+    stub = StubAdapter(balance=60.0)
+    cfg = RechargeConfig(balance_cap=60.0, fail_cooldown_hours=0)
+    ok, _err, _r, _l4, outcome = _recharge(stub, models, [_card()], recharge_cfg=cfg)
 
     assert (ok, outcome) == (False, 'archived')
     assert models['platform_account'].get_status(STUB, 'a@x.com') == 'archived'
     assert ('top_up' not in [c[0] for c in stub.calls]), '已归档不该再试卡'
+
+
+def test_balance_above_the_adapter_skip_value_still_gets_charged(models):
+    """余额高于 adapter.recharge_skip_balance(50) 但低于 balance_cap 时照常充值。
+
+    这条是上面那条的反面，单独立出来是因为它才是「成功后继续充」真正依赖的性质：
+    充过一笔的账号必须还能被继续充，而不是一超过某个小阈值就被归档。
+    """
+    stub = StubAdapter(balance=60.0)      # 60 ≥ StubAdapter.recharge_skip_balance(50)
+    cfg = RechargeConfig(balance_cap=200.0, fail_cooldown_hours=0)
+    ok, _err, _r, _l4, outcome = _recharge(stub, models, [_card()], recharge_cfg=cfg)
+
+    assert (ok, outcome) == (True, 'topup'), '还没到 balance_cap 就被归档了'
+    assert 'top_up' in [c[0] for c in stub.calls]
 
 
 def test_adapter_supplies_its_own_attempt_cap(models):

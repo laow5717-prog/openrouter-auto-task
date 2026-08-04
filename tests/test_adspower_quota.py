@@ -300,3 +300,55 @@ def test_teardown_reconciles_leaked_quota():
     src = inspect.getsource(AppState._stop_started_adspower)
     assert 'quota.held(self.platform)' in src and 'quota.release' in src, \
         '收尾没有对账，泄漏的额度会一直占着'
+
+
+# ---------- 手动打开的会话（账号列表的「查看」） ----------
+
+
+def test_manual_open_uses_the_accounts_adspower_environment():
+    """「查看」必须开该账号的 AdsPower 环境，不能退回本地 Chrome profile。
+
+    登录态（GitHub cookie / 平台 session）全在那个环境里；本地
+    data/profiles/<email> 是另一个几乎空的目录。开错的后果不只是「看不到东西」：
+    ensure_session 会在这个错误的环境里重新走一遍 OAuth，白白给账号多一次
+    新设备登录记录。
+    """
+    import inspect
+    from src.api import routes
+
+    src = inspect.getsource(routes.open_account_browser)
+    i_factory = src.index('state.browser_factory(')
+    i_local = src.index('create_driver(headless=False')
+    assert i_factory < i_local, 'AdsPower 分支必须在本地 profile 分支之前'
+    assert 'track_for_teardown=False' in src, \
+        '手动会话必须声明不纳入任务收尾，否则跑完任务会被顺手关掉'
+
+
+def test_manual_session_is_not_tracked_for_pipeline_teardown():
+    """手动会话不进 _adspower_started。
+
+    进去的话，任何一次流水线跑完调 _stop_started_adspower() 都会关掉用户正在看的
+    浏览器；那里还有一段「把本平台仍持有的配额全部当泄漏还掉」的对账，会把手动
+    会话那一份也还掉，等用户真关浏览器时 _on_closed 再还一次——配额凭空多一个。
+    """
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState.browser_factory)
+    assert 'if pid and track_for_teardown:' in src, \
+        '手动会话仍会被登记进 _adspower_started'
+
+
+def test_manual_session_ignores_a_leftover_stop_flag():
+    """手动开浏览器不看 stop_requested——它是跨任务残留的。
+
+    只有三条流水线入口会复位它，「打开浏览器」不会。挂着它的话，只要之前停过一次
+    任务，此后每次点「查看」都会在第一次检查点立刻放弃、报「等待配额超时」，
+    而配额其实是空的。
+    """
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState.browser_factory)
+    assert '_should_stop = (lambda: self.stop_requested) if track_for_teardown else None' in src, \
+        '手动会话仍被任务的停止标志掐着'

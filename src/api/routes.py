@@ -609,12 +609,27 @@ def open_account_browser():
 
     def _do_open():
         from src.browser.driver import create_driver, close_driver
+        from src.services.adspower import AdsPowerError
         import src.platforms as platforms
         from src.platforms.base import Credentials
         adapter = platforms.get(platform)
         driver = None
         try:
-            driver = create_driver(headless=False, profile_id=email)
+            # 开哪个浏览器必须与**任务用的那个**一致，否则「查看」看到的根本不是
+            # 任务跑的那个账号环境：
+            #   AdsPower 开启时，登录态（GitHub cookie / opencode session）全在该账号
+            #   的 AdsPower 环境里；本地 data/profiles/<email> 是另一个几乎空的目录。
+            #   拿本地 profile 打开，用户看到的是未登录页，ensure_session 还会在这个
+            #   错误的环境里重新走一遍 OAuth——既看不到真实状态，又平白给账号多一次
+            #   新设备登录记录。
+            # 走同一个 pool 就能拿到同一个 profile_id（pool 按 email 映射），环境复用、
+            # 登录态自然还在。
+            factory = state.browser_factory(track_for_teardown=False)
+            if factory is not None:
+                driver = factory(email)
+                state.add_log(f"{email} 已接管其 AdsPower 环境")
+            else:
+                driver = create_driver(headless=False, profile_id=email)
 
             # 复用充值流程用的同一套会话建立逻辑（adapter.ensure_session）。
             # 遇新设备验证等人工环节，该流程会保持浏览器打开等待人工完成。
@@ -653,6 +668,10 @@ def open_account_browser():
                     time.sleep(2)
                 except Exception:
                     break
+        except AdsPowerError as e:
+            # 环境配额满 / 客户端没开 / Key 无效。单独报是因为这几种情况用户自己
+            # 就能处理（关掉别的环境、开客户端），而混进通用异常里只会看到一串栈。
+            state.add_log(f"{email} 打不开 AdsPower 环境: {e}")
         except Exception as e:
             state.add_log(f"{email} 打开浏览器异常: {e}")
         finally:
@@ -1195,14 +1214,30 @@ def start_daily_pipeline():
 
     accts = models['account'].get_all(order_desc=False)
     pa_map = models['platform_account'].map_by_email(platform)
+
+    def _usable(a):
+        return ((login_password or a.get('login_password'))
+                and not is_identity_terminal(a.get('identity_status')))
+
     account_count = sum(
         1 for a in accts
-        if (login_password or a.get('login_password'))
-        and not is_identity_terminal(a.get('identity_status'))
+        if _usable(a)
         and not is_platform_terminal((pa_map.get(a['email']) or {}).get('status'))
     )
-    if account_count == 0:
-        return jsonify({"error": "无可充值账号（需有登录密码、身份与平台状态均非终态），无事可做"}), 400
+    # 回退池：余额未满的已充值账号。必须算进启动门——它们平台状态是 recharged
+    # （终态），上面那个 count 看不见它们，而「新号跑完只剩老号加码」正是复用功能
+    # 存在的场景。漏了这一项，接口会在那个场景下直接 400，流水线根本进不去。
+    # 判据与 run_daily_pipeline._reusable_recharged 保持一致，改一处要改两处。
+    reusable_count = sum(
+        1 for a in accts
+        if _usable(a)
+        and ((pa_map.get(a['email']) or {}).get('status') or '') == 'recharged'
+        and ((pa_map.get(a['email']) or {}).get('credits_balance') is None
+             or (pa_map.get(a['email']) or {}).get('credits_balance') < recharge_cfg.balance_cap)
+    )
+    if account_count == 0 and reusable_count == 0:
+        return jsonify({"error": "无可充值账号（需有登录密码、身份与平台状态均非终态），"
+                                 "也无余额未满的已充值账号可复用，无事可做"}), 400
 
     import threading
     threading.Thread(
@@ -1217,7 +1252,8 @@ def start_daily_pipeline():
     # 把实际生效的策略回给前端，让它能回显——用户配的和跑的是不是同一套，
     # 应当一眼可见，而不是只能去翻日志。
     return jsonify({"status": "started", "usable_cards": eligible,
-                    "accounts": account_count, "group_name": group['name'],
+                    "accounts": account_count, "reusable_accounts": reusable_count,
+                    "group_name": group['name'],
                     "amount_min": recharge_cfg.amount_min,
                     "amount_max": recharge_cfg.amount_max,
                     "balance_cap": recharge_cfg.balance_cap})

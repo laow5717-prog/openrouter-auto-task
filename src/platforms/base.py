@@ -83,6 +83,17 @@ class PaymentResult:
     last4: str = ''
     mode: Optional[str] = None
     balance_after: Optional[float] = None
+    # **实际扣款金额**，可能不等于编排层传进来的 amount。
+    #
+    # 存在理由是 opencode 的首充：billing 页的 "Enable Billing" 只是跳转到后端预先
+    # 建好的 Stripe Checkout，金额由站点定死（$20），我们传的 amount 根本没有落点；
+    # 只有复充（"Add Balance" → 金额输入框）才认。若编排层拿「想充多少」去记账，
+    # 账面会写着 $79 而实际只扣了 $20——2026-08-04 线上就是这样对不上的。
+    #
+    # 由**适配器**回报而不是让编排层按 mode 去推，是因为「首充固定 20」是纯粹的站点
+    # 知识；编排层一旦开始按 mode 分支，就等于把 opencode 的规则焊进了平台无关的骨架，
+    # 下一个平台必然踩坑。None 表示适配器没说，编排层此时沿用请求金额。
+    amount: Optional[float] = None
     steps: list = field(default_factory=list)
 
     @classmethod
@@ -100,6 +111,7 @@ class PaymentResult:
             last4=d.get('last4') or '',
             mode=d.get('mode'),
             balance_after=d.get('balance_after'),
+            amount=d.get('amount'),
             steps=list(d.get('steps') or []),
         )
 

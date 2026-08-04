@@ -306,12 +306,19 @@ class AppState:
                 )
             return self._adspower_client, self._adspower_pool
 
-    def browser_factory(self):
+    def browser_factory(self, track_for_teardown=True):
         """返回 callable(email) -> BrowserSession；未启用 AdsPower 时返回 None。
 
         下游（registration.recharge_account / signup_one / _subscribe_one_account）
         统一以「factory 为 None 就走原路径」的方式接入，因此关掉开关时代码路径
         与接入前完全一致。
+
+        track_for_teardown=False 用于**手动打开的会话**（账号列表的「查看」）：
+        不把 profile 记进 _adspower_started。记进去的话，任何一次流水线跑完调用
+        _stop_started_adspower() 都会顺手关掉用户正在看的那个浏览器，而且那里还有
+        一段「把本平台仍持有的配额全部归还」的对账逻辑，会把手动会话的那一份也算成
+        泄漏还掉——等用户真关掉浏览器时 _on_closed 再还一次，配额凭空多出来一个。
+        手动会话的配额由它自己的 _on_closed 归还，生命周期与任务无关。
         """
         client, pool = self._ensure_adspower()
         if pool is None:
@@ -325,9 +332,15 @@ class AppState:
             #
             # 拿不到是**等待**而不是报错：配额是两个平台共用的资源，对方跑完就会
             # 释放，直接判失败会让账号白白进失败集合。
+            # 手动会话（track_for_teardown=False）**不看 stop_requested**。它是跨任务
+            # 残留的标志：上一次任务被用户停掉后一直是 True，而只有三条流水线入口会
+            # 复位它，「打开浏览器」不会。挂着它的话，只要之前停过一次任务，此后每次
+            # 点「查看」都会在第一次检查点立刻放弃，报「等待配额超时」——而配额其实是
+            # 空的。手动开的浏览器本来也不该被某个任务的停止操作掐掉。
+            _should_stop = (lambda: self.stop_requested) if track_for_teardown else None
             if not self.quota.acquire(self.platform,
                                       timeout=cfg.adspower.quota_wait_seconds,
-                                      should_stop=lambda: self.stop_requested):
+                                      should_stop=_should_stop):
                 snap = self.quota.snapshot()
                 raise AdsPowerError(
                     f"等待 AdsPower 环境配额超时（本平台 {snap['held'].get(self.platform, 0)}/"
@@ -349,7 +362,7 @@ class AppState:
 
             session._on_closed = _give_back
             pid = getattr(session, 'adspower_profile_id', None)
-            if pid:
+            if pid and track_for_teardown:
                 # 用本平台自己的锁，不是共享的 _adspower_lock —— 那把锁保护的是
                 # 客户端/池的惰性构造，拿它护每平台各自的集合会让两个平台互相阻塞。
                 with self._adspower_started_lock:
@@ -987,6 +1000,54 @@ class AppState:
                     and self._hotmail_for_account(a)
                 ]
 
+            # ── 回退池：余额未满的已充值账号 ──
+            # 只在「新账号 + 待注册账号都领不到」时才动它（见 _try_claim 的顺序），
+            # 所以钱优先铺开到新账号上，风险不集中在少数几个号里。
+            #
+            # 它同时是 AdsPower 环境紧张时的泄压阀：这些账号**已经有环境了**，复用
+            # 一个新环境都不用建。而环境上限只有 12、几十个新账号在排队抢，抢不到就
+            # 白跑一轮——此时改去充一个已有环境的账号，是纯赚。
+            #
+            # 判据是「余额还没到 balance_cap」而不是「状态非 recharged」：recharged 现在
+            # 的含义是「有一些余额」，不再是「这个账号做完了」。真正做完的是 archived
+            # （余额已达上限），它仍然是终态。
+            # 本次运行已经复用过的账号。**每个账号每次运行只复用一次**，理由有两条：
+            #
+            # 1. 够用。recharge_account 那一次会话内部本来就会连充到 balance_cap（或
+            #    max_card_attempts）才收手，再给第二次会话没有增量——会话提前结束的两个
+            #    原因（hCaptcha、试卡上限）都是「该躲开这个账号」的信号，不是「再来一次」。
+            #
+            # 2. 不这样会死循环。判据里的 DB 余额 credits_balance 可能是 NULL：
+            #    balance_after 读不到时 update_balance 会跳过（infron 常态，opencode 偶发）。
+            #    余额永远是 NULL 的账号会永远满足「未达上限」，被一轮轮反复领走反复充，
+            #    钱全堆到一个号上，而且任务不收敛——tests/test_daily_pipeline.py 一改就挂死，
+            #    正是这条路径。
+            reused_this_run = set()
+
+            def _reusable_recharged():
+                cap = (recharge_cfg or cfg.recharge).balance_cap
+                accounts = account_model.get_all(order_desc=False)
+                platform_status = platform_account_model.map_by_email(platform)
+                out = []
+                for a in accounts:
+                    if not (login_password or a.get('login_password')):
+                        continue
+                    if is_identity_terminal(a.get('identity_status')):
+                        continue
+                    if a['email'] in done or a['email'] in reused_this_run:
+                        continue
+                    row = platform_status.get(a['email']) or {}
+                    if (row.get('status') or '') != 'recharged':
+                        continue
+                    bal = row.get('credits_balance')
+                    # 余额未知（None）时放行一次：DB 余额本来就会随 credits 消耗而过时，
+                    # 因为没数就永不复用未免太保守。放行是安全的——reused_this_run 保证
+                    # 只此一次，而那一次会话内部有 balance_cap 兜着。
+                    if bal is not None and bal >= cap:
+                        continue
+                    out.append(a)
+                return out
+
             # 代理领取:每账号处理时领一个空闲代理出口 IP(反关联),用完释放。
             # 无代理配置时返回 (None, None) → 直连(行为同现状)。
             proxy_model = self.models['proxy']
@@ -1015,6 +1076,7 @@ class AppState:
 
             accounts = _payable_now()
             imported_pending = len(_registerable_imported())
+            reusable_pending = len(_reusable_recharged())
             eligible = len(self._eligible_cards(group_id, exclude_used=False))
             if self.adspower_enabled:
                 proxy_note = "浏览器走 AdsPower 指纹环境，代理由环境绑定"
@@ -1024,12 +1086,15 @@ class AppState:
                               f"{'（未配置代理，直连）' if not proxy_count else ''}")
             self._hooked_print(
                 f"可充值账号 {len(accounts)} 个，待注册 imported {imported_pending} 个，"
+                f"可复用已充值账号 {reusable_pending} 个，"
                 f"分组可选卡 {eligible} 张，{proxy_note}")
             if not eligible:
                 self._hooked_print("分组内无可选卡（全部无效/过期或冷却中），无事可做")
                 return
-            if not accounts and not imported_pending:
-                self._hooked_print("无可充值账号且无 imported 可注册，任务结束")
+            # 回退池也要算进启动门。漏了它的话，「新号全跑完、只剩老号可加码」——正是
+            # 复用功能存在的那个场景——任务会直接拒绝启动，功能等于没接。
+            if not accounts and not imported_pending and not reusable_pending:
+                self._hooked_print("无可充值账号、无 imported 可注册、也无余额未满的已充值账号，任务结束")
                 return
 
             # ── 生产者：每个 worker 反复原子领一个账号，按「轮」轮转。优先充值现有可充
@@ -1048,6 +1113,7 @@ class AppState:
                 'zero_rounds': 0,         # 连续零进展轮数；≥2 才停（容忍一轮瞬时抖动）
             }
             end_logged = [False]          # 收敛原因只打一次（多 worker 会各拿到一次 done）
+            reuse_logged = [False]        # 「开始复用老账号」也只打一次
 
             def _card_keys_now():
                 return frozenset(
@@ -1072,6 +1138,24 @@ class AppState:
                     if self.account_registry.claim(a['email'], owner=platform):
                         proxy, pkey = _acquire_proxy_for(a.get('id', 0))
                         return 'item', ('register', a, proxy, pkey)
+                # ── 回退：新账号和待注册账号都领不到了，改充余额未满的已充值账号 ──
+                # 排在前两档**之后**是刻意的：优先把钱铺开到更多账号上，只有实在没有
+                # 新号可用时才回头加码老号，免得余额集中在少数几个号里——一个被封就
+                # 全赔进去。这些账号已有 AdsPower 环境，复用不占新配额。
+                for a in _reusable_recharged():
+                    if a['email'] in failed_this_round:
+                        continue
+                    if self.account_registry.claim(a['email'], owner=platform):
+                        proxy, pkey = _acquire_proxy_for(a.get('id', 0))
+                        # 领到就登记，**不等结果**。等成功了再记的话，失败的那次不算数，
+                        # 账号会被一轮轮重领——正是要避免的循环。
+                        reused_this_run.add(a['email'])
+                        if not reuse_logged[0]:
+                            reuse_logged[0] = True
+                            self._hooked_print(
+                                "无新账号可领，开始复用余额未满的已充值账号"
+                                f"（上限 ${(recharge_cfg or cfg.recharge).balance_cap:.0f}）")
+                        return 'item', ('recharge', a, proxy, pkey)
                 # 「本轮还有账号在飞吗」——**必须只看本平台**。registry 是跨平台共享的，
                 # 不过滤的话本平台会把另一个平台正在跑的账号当成自己这轮在飞，于是永远
                 # 走 'wait'、轮边界永不触发、失败账号永不重试、zero_rounds 永不递增——
@@ -1079,7 +1163,7 @@ class AppState:
                 if self.account_registry.snapshot(owner=platform):
                     return 'wait', None
                 if not failed_this_round:
-                    return 'done', "无可充值账号且无 imported 可注册"
+                    return 'done', "无可充值账号、无 imported 可注册、也无余额未满的已充值账号可复用"
                 # ── 轮转边界：所有账号都试过一遍且无人在飞。有进展就开下一轮重试失败账号
                 with state_lock:
                     paid_now = stats['paid']
@@ -1192,8 +1276,15 @@ class AppState:
                     #
                     # 改为：只跳过本账号，并向借用方发一个归还请求。下一个账号还会重试，
                     # 真的持续不可用时由「整轮零进展」兜底收敛。
+                    #
+                    # 进 failed_this_round 而**不是** done。注释一直写着「本轮不再重领」，
+                    # 代码用的却是 done——那是**整次运行**的永久集合，从不清空。于是每一次
+                    # 抢不到环境就永久损失一个账号：AdsPower 环境上限只有 12，几十个账号
+                    # 排队抢，一轮下来大半账号被这条路径吃掉，并发度肉眼可见地塌下去，
+                    # 而日志上只有一句「跳过」，看不出账号再也不回来了。
+                    # 配额是会随别的账号跑完而释放的，下一轮重试完全合理。
                     with state_lock:
-                        done.add(email)   # 本轮不再重领，但账号状态保持原样
+                        failed_this_round.add(email)   # 本轮跳过，下一轮重试；账号状态不动
                     asked = self.quota.request_recall(self.platform)
                     note = f"；已向借用方请求归还 {asked} 个额度" if asked else ""
                     self._hooked_print(f"AdsPower 环境暂不可用，跳过 {email}: {e}{note}")
@@ -1425,58 +1516,77 @@ class AppState:
                     raise InterruptedError("用户请求停止")
                 num = card.get('number', '')
                 last4 = str(num)[-4:]
-                self.set_action(worker, f"{email} 订阅试卡 ****{last4}")
-                self.add_log(f"{email} 订阅试卡 ****{last4}（第 {i}/{len(cards)} 张）")
-                log_id = models['recharge_log'].create(platform, email, num, amount=5)
-                pay = adapter.subscribe(session, wid, card, monitor=monitor,
-                                        should_stop=lambda: self.stop_requested, dry=False)
-                res = vars(pay)
-                oc = pay.outcome
-                if oc == 'success':
-                    models['card_pool'].mark_status_by_number(platform, num, 'paid')
-                    try:
-                        models['valid_card'].record(platform, card, source_type='payment',
-                                                    source_email=email)
-                    except Exception:
-                        pass
-                    models['platform_account'].update_status(platform, email, 'subscribed')
-                    models['platform_account'].update_tenant_id(platform, email, wid)
-                    models['recharge_log'].mark_success(log_id, api_response={"result": res})
-                    self.add_log(f"{email} ✅ 订阅成功（卡 ****{last4}）")
-                    return "subscribed", f"****{last4}"
-                elif oc == 'failed':
+                # 卡排他。此前订阅侧**整个跳过了这一步**，只有充值侧
+                # （registration.recharge_account）在 acquire/release，于是：
+                #   - 订阅任务的多个 worker 会从各自的 _eligible_cards 快照里挑中同一张卡
+                #     并同时提交（快照是进入时一次性取的，挡不住这种同时选中）；
+                #   - 订阅任务与充值任务本就能并发跑（RUN_CONTEXTS 按平台拆开就是为了这个），
+                #     同一张卡会在几秒内被两个**商户号**分别请求授权。
+                # 后者正是 AppSharedState 那段 docstring 点名要防的事：这是典型盗刷特征，
+                # 直接触发发卡行风控，轻则拒付、重则锁卡。
+                # try_acquire 里的 _in_flight 刻意不按平台隔离，就是为了拦住跨平台这一路。
+                if not self.payment_registry.try_acquire(platform, num, email):
+                    self.add_log(f"{email} 卡 ****{last4} 正被其它 worker 使用，跳过")
+                    continue
+                try:
+                    self.set_action(worker, f"{email} 订阅试卡 ****{last4}")
+                    self.add_log(f"{email} 订阅试卡 ****{last4}（第 {i}/{len(cards)} 张）")
+                    log_id = models['recharge_log'].create(platform, email, num, amount=5)
+                    pay = adapter.subscribe(session, wid, card, monitor=monitor,
+                                            should_stop=lambda: self.stop_requested, dry=False)
+                    res = vars(pay)
+                    oc = pay.outcome
+                    if oc == 'success':
+                        models['card_pool'].mark_status_by_number(platform, num, 'paid')
+                        try:
+                            models['valid_card'].record(platform, card, source_type='payment',
+                                                        source_email=email)
+                        except Exception:
+                            pass
+                        models['platform_account'].update_status(platform, email, 'subscribed')
+                        models['platform_account'].update_tenant_id(platform, email, wid)
+                        models['recharge_log'].mark_success(log_id, api_response={"result": res})
+                        self.add_log(f"{email} ✅ 订阅成功（卡 ****{last4}）")
+                        return "subscribed", f"****{last4}"
+                    elif oc == 'failed':
                     # 判废口径必须与 registration.recharge_account 逐字一致：无条件冷却
                     # + 连续失败计数 +1，达 max_fail_streak 才判无效。
                     #
                     # 两条流水线写的是**同一张** card_platform_state 表。这里若还按老口径
                     # 「从未成功过的卡首拒即 invalid」，一张卡在订阅侧被拒一次就永久出局，
-                    # 充值侧那套「连续 3 次才判废」等于被静默绕过——用户配的阈值形同虚设，
-                    # 而且从充值日志里完全看不出卡是被谁判死的。
-                    # 直接取全局配置：max_fail_streak / fail_cooldown_hours 只在
-                    # config.yaml 里配，不像金额区间那样按次从 UI 覆盖。
-                    rc = cfg.recharge
-                    models['card_state'].set_cooldown(
-                        platform, num, hours=rc.fail_cooldown_hours, reason='订阅支付失败，冷却')
-                    streak = models['card_state'].bump_fail_streak(platform, num)
-                    if streak >= rc.fail_threshold():
-                        models['card_pool'].mark_invalid_by_number(platform, num)
-                        note = f'连续失败 {streak} 次，标 invalid'
-                    else:
-                        note = (f'连续失败 {streak}/{rc.fail_threshold()} 次，'
-                                f'冷却 {rc.fail_cooldown_hours}h')
-                    models['recharge_log'].mark_failed(log_id, error=res.get('err', ''),
-                                                       api_response={"result": res})
-                    self.add_log(f"{email} 卡 ****{last4} 拒付，{note}，换下一张")
-                elif oc == 'needs_captcha':
-                    # hCaptcha 未过：非卡问题，不标卡无效，换下一张（换次提交 token 可能就过）
-                    models['recharge_log'].mark_failed(log_id, error='hCaptcha 未过',
-                                                       api_response={"result": res})
-                    self.add_log(f"{email} 卡 ****{last4} hCaptcha 未过，换下一张")
-                else:  # error / unknown：不耗卡，换下一张
-                    models['recharge_log'].mark_failed(log_id, error=res.get('err', '') or oc,
-                                                       api_response={"result": res})
-                    self.add_log(f"{email} 卡 ****{last4} 未定案({oc}): "
-                                 f"{(res.get('err') or '')[:90]}，换下一张")
+                        # 充值侧那套「连续 3 次才判废」等于被静默绕过——用户配的阈值形同虚设，
+                        # 而且从充值日志里完全看不出卡是被谁判死的。
+                        # 直接取全局配置：max_fail_streak / fail_cooldown_hours 只在
+                        # config.yaml 里配，不像金额区间那样按次从 UI 覆盖。
+                        rc = cfg.recharge
+                        models['card_state'].set_cooldown(
+                            platform, num, hours=rc.fail_cooldown_hours,
+                            reason='订阅支付失败，冷却')
+                        streak = models['card_state'].bump_fail_streak(platform, num)
+                        if streak >= rc.fail_threshold():
+                            models['card_pool'].mark_invalid_by_number(platform, num)
+                            note = f'连续失败 {streak} 次，标 invalid'
+                        else:
+                            note = (f'连续失败 {streak}/{rc.fail_threshold()} 次，'
+                                    f'冷却 {rc.fail_cooldown_hours}h')
+                        models['recharge_log'].mark_failed(log_id, error=res.get('err', ''),
+                                                           api_response={"result": res})
+                        self.add_log(f"{email} 卡 ****{last4} 拒付，{note}，换下一张")
+                    elif oc == 'needs_captcha':
+                        # hCaptcha 未过：非卡问题，不标卡无效，换下一张（换次提交 token 可能就过）
+                        models['recharge_log'].mark_failed(log_id, error='hCaptcha 未过',
+                                                           api_response={"result": res})
+                        self.add_log(f"{email} 卡 ****{last4} hCaptcha 未过，换下一张")
+                    else:  # error / unknown：不耗卡，换下一张
+                        models['recharge_log'].mark_failed(
+                            log_id, error=res.get('err', '') or oc,
+                            api_response={"result": res})
+                        self.add_log(f"{email} 卡 ****{last4} 未定案({oc}): "
+                                     f"{(res.get('err') or '')[:90]}，换下一张")
+                finally:
+                    # 与充值侧同构：continue / return / 异常三条路径都要放开这张卡。
+                    # 漏掉的话它在本进程内永久 in-flight，谁也再选不中，且没有任何报错。
+                    self.payment_registry.release(num)
             return "registered_only", "账号内可选卡试尽未成功"
         except InterruptedError:
             raise

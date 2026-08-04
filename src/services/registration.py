@@ -65,7 +65,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
     编排：建浏览器会话（原生 Playwright 栈，hCaptcha token 注入仅在原生栈生效；与
     create_driver 复用同一 profile 目录，登录态不丢）→ 装 hCaptcha hook →
-    adapter.ensure_session → 读实时余额，≥ adapter.recharge_skip_balance 则跳过充值并
+    adapter.ensure_session → 读实时余额，≥ recharge_cfg.balance_cap 则跳过充值并
     归档 → 否则从 payment_cards 逐张 adapter.top_up。
 
     ## 一次成功后为什么不返回
@@ -79,8 +79,9 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
       - payment_cards 用尽
       - 用户停止
 
-    注意**不能**拿 adapter.recharge_skip_balance 当循环上限：那是登录时的归档预检阈值
-    （两平台都是 20），第一笔充完余额必然超过它，循环会立刻停——「成功后继续充」直接失效。
+    归档预检与循环上限现在是**同一个数** recharge_cfg.balance_cap。早先它们是两个：
+    归档用 adapter.recharge_skip_balance（20）、循环用 balance_cap（200），于是一个
+    充过一笔的账号下次来必被归档——「一个账号只能充一笔」的旧行为从后门溜回来了。
 
     ## 卡的判废与冷却
 
@@ -131,9 +132,18 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     if recharge_cfg is None:
         recharge_cfg = cfg.recharge
 
-    # 余额跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并归档账号。各平台不同。
-    # 注意这**只在登录后判一次**，不参与下面的连充循环——它是归档预检，不是循环上限。
-    skip_balance = adapter.recharge_skip_balance
+    # 归档阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并归档账号。只在登录后判一次。
+    #
+    # 用 balance_cap 而**不是** adapter.recharge_skip_balance。两者本是同一件事的两个
+    # 数字，而且在打架：skip_balance 两平台都是 20，balance_cap 默认 200——一个账号
+    # 成功充过一笔后余额必然 ≥20，下次再来就被归档，哪怕它离 200 还差得远。
+    # 结果是「一个账号只能充一笔」的旧行为从后门回来了，而且是以「已归档」的面目出现，
+    # 从日志上看像是账号真的满了。
+    #
+    # skip_balance 是「一个账号充 $20 就算完事」那个时代的产物，正是本次改造要取代的。
+    # 现在只保留 balance_cap 一个数：它同时是连充循环的上限和归档的判据，语义一致。
+    # adapter.recharge_skip_balance 保留但不再被编排层使用（见 platforms/base.py）。
+    skip_balance = recharge_cfg.balance_cap
 
     responses = []
 
@@ -293,7 +303,15 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                 pay = adapter.top_up(session, wid, card, amount=amount,
                                      monitor=monitor_callback, should_stop=should_stop)
                 result = vars(pay)
-                responses.append({"card_last4": card_last4, "amount": amount, **result})
+                # 记账、累计一律用**实扣金额**，不是请求金额。两者可能不同：opencode
+                # 首充的金额由站点定死（$20），我们传的随机额没有落点。适配器在
+                # PaymentResult.amount 里如实回报；它为 None 表示「没说」，才沿用请求额。
+                # 编排层刻意不去看 mode 自行推算——那是站点知识，不该焊进平台无关的骨架。
+                charged = result.get("amount")
+                if charged is None:
+                    charged = amount
+                    result["amount"] = charged
+                responses.append({"card_last4": card_last4, **result})
 
                 if pay.ok:
                     # 支付成功：标 paid + 记有效卡 + 账号状态 + 清失败计数 + 逐卡记账。
@@ -327,9 +345,9 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                             platform_account_model.update_tenant_id(platform, email, wid)
                         except Exception:
                             pass
-                    _log_card_attempt(card, True, "", result, amount)
+                    _log_card_attempt(card, True, "", result, charged)
                     paid_count += 1
-                    session_topped += amount
+                    session_topped += charged
                     last_paid4 = card_last4
 
                     # 余额上限：达到就换账号。两条判据**取或**，先判余额后判累计额：
@@ -394,7 +412,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                     # 已点 Pay 提交，但超时内未确认到账，也无明确拒付/3DS/captcha 信号。不确定
                     # 是否卡的问题，保守处理：记一条失败日志留痕，但不改卡状态、不消耗、
                     # 也不计入连续失败次数，留待重试。
-                    _log_card_attempt(card, False, reason, result, amount)
+                    _log_card_attempt(card, False, reason, result, charged)
                 else:
                     # failed（明确拒付 / 3DS 交互挑战 / 3DS 认证失败）：
                     #   1. 无条件进冷却——同一张卡两次使用之间至少隔 fail_cooldown_hours，
@@ -429,7 +447,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                             session,
                             f"卡{card_last4} 连续失败 {streak}/{recharge_cfg.fail_threshold()} 次，"
                             f"冷却 {recharge_cfg.fail_cooldown_hours}h 后再试")
-                    _log_card_attempt(card, False, reason, result, amount)
+                    _log_card_attempt(card, False, reason, result, charged)
 
                 if monitor_callback:
                     monitor_callback(session, f"{reason}；尝试下一张卡（{idx+1}/{len(cards)}）")
@@ -442,6 +460,25 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
         # _grab_apikey 放在这里而不是每笔成功后调：单账号连充 5 笔的话，放在循环里
         # 会白白多导航 4 次页面。
         if paid_count:
+            # 收尾重读一次余额并落库，**以刷新后页面显示的数字为准**。
+            #
+            # 为什么不能沿用循环里那个 balance_after：它来自 detect_payment_result 的
+            # _balance_grew()，那个函数在余额「第一次比原来大」的瞬间就返回并定案。
+            # 那一刻页面上的数字未必是结算完的终值——2026-08-04 实测首充 opencode
+            # 报 20.0，账号列表就一直显示 $20。R3 之后一个会话连充多笔，中间某笔的
+            # 瞬时值被当成最终余额的概率更高。
+            #
+            # read_balance 内部会重新 session.get(billing 页) 再读，是一次干净的
+            # 「刷新页面看余额」，不做任何加减推算——页面显示多少就是多少。
+            # best-effort：读不到就保留循环里写的值，不清空。
+            try:
+                final_bal = adapter.read_balance(session, wid, monitor_callback)
+                if final_bal is not None and platform_account_model:
+                    platform_account_model.update_balance(platform, email, final_bal)
+                    if monitor_callback:
+                        monitor_callback(session, f"{email} 充值后余额 ${final_bal}")
+            except Exception:
+                pass
             _grab_apikey(session, wid)
             note = stop_note or "可选卡已试完"
             summary = f"本次成功充值 {paid_count} 笔、合计 ${session_topped:.0f}（{note}）"

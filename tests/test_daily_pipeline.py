@@ -218,20 +218,48 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls
 def test_refill_registers_then_recharges_serially(no_browser):
     """0 可充 + 4 imported：全部注册→充值，最终都 recharged。"""
     r = _run_pipeline(1, n_registered=0, n_imported=4)
+    emails = [f'imp{i}@example.com' for i in range(4)]
     assert r['status_counts'].get('recharged') == 4
-    assert sorted(r['registered_calls']) == [f'imp{i}@example.com' for i in range(4)]
-    # 每个账号恰好充值一次（注册转正后被领来充值）
-    assert sorted(r['recharged_calls']) == [f'imp{i}@example.com' for i in range(4)]
+    assert sorted(r['registered_calls']) == emails
+    # 每个账号被充两次：注册转正后作为新账号充一次，四个都跑完后作为回退池再复用一次
+    # （回退池的语义见 test_recharged_accounts_are_reused_at_most_once）。
+    assert sorted(r['recharged_calls']) == sorted(emails * 2)
     assert r['is_running'] is False
     assert r['peak'] == 1, "串行模式出现并发"
 
 
-def test_recharged_not_charged_twice(no_browser):
-    """去重：已 recharged 账号不再被充值。"""
+def test_recharged_accounts_are_reused_at_most_once(no_browser):
+    """已充值账号可被复用，但每次运行至多一次。
+
+    旧行为是 recharged 永久退出轮转（「一个账号只充一笔」）。现在它的含义变成
+    「有一些余额」，没到 balance_cap 就还能加码——但**每次运行只给一次**：
+
+      - 够用：recharge_account 那一次会话内部就会连充到上限才收手，再给第二次
+        会话没有增量；
+      - 必须：判据里的 DB 余额可能是 NULL（balance_after 读不到时不落库），
+        不设这道闸的话该账号永远满足「未达上限」，被一轮轮反复领走、任务不收敛。
+    """
     r = _run_pipeline(2, n_registered=3, n_imported=0)
     assert r['status_counts'].get('recharged') == 3
-    # 每个 email 只出现一次
-    assert len(r['recharged_calls']) == len(set(r['recharged_calls'])) == 3
+
+    calls = r['recharged_calls']
+    per_email = {e: calls.count(e) for e in set(calls)}
+    assert set(per_email) == {f'reg{i}@example.com' for i in range(3)}
+    assert all(n == 2 for n in per_email.values()), \
+        f"每个账号应为「新账号一次 + 复用一次」，实际 {per_email}"
+
+
+def test_reuse_only_kicks_in_after_new_accounts_are_exhausted(no_browser):
+    """回退池排在最后：只要还有没跑过的账号，就不回头加码老账号。
+
+    顺序是有意的——先把钱铺开到更多账号上。余额集中在少数号里，一个被封就全赔进去。
+    """
+    r = _run_pipeline(1, n_registered=2, n_imported=0)
+    calls = r['recharged_calls']
+
+    assert sorted(calls[:2]) == ['reg0@example.com', 'reg1@example.com'], \
+        f"前两次应把两个新账号各跑一遍，实际 {calls[:2]}"
+    assert len(calls) == 4, f"随后才轮到复用，共 4 次，实际 {calls}"
 
 
 def test_parallel_true_concurrency_no_overlap(no_browser):
@@ -267,10 +295,11 @@ def test_failed_accounts_retried_next_round(no_browser):
     r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=8,
                       tracker_cls=_FlakyOnceTracker)
     assert r['status_counts'].get('recharged') == 2, "失败账号未被下一轮重试充成"
-    # 每个账号恰好被试了两次：第一轮失败 + 第二轮成功
+    # 每个账号被试三次：第一轮失败 → 第二轮成功 → 转 recharged 后作为回退池复用一次。
+    # 前两次是本用例的主题（跨轮重试），第三次来自「新账号领完才复用老账号」。
     calls = sorted(r['recharged_calls'])
-    assert calls == ['reg0@example.com'] * 2 + ['reg1@example.com'] * 2
-    # 每次失败烧掉一张卡，其余卡保持可用
+    assert calls == ['reg0@example.com'] * 3 + ['reg1@example.com'] * 3
+    # 只有每个账号的**第一次**失败烧卡（_FlakyOnceTracker 的语义），故仍是 2 张
     assert r['usable_cards_left'] == 8 - 2
     assert r['is_running'] is False
 

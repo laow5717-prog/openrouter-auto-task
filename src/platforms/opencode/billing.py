@@ -456,12 +456,26 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
     return {"outcome": "unknown", "detail": f"{timeout}s 内余额未增加，未确认成功"}
 
 
+# 首充的固定金额（美元）。**站点定的，我们改不了**：billing 页的 "Enable Billing"
+# 只是跳到后端预先建好的 Stripe Checkout，金额在那个 session 里已经写死，页面上没有
+# 任何可填金额的地方（见 start_recharge 的首充分支——它压根没用 amount 参数）。
+# 只有复充（"Add Balance" → 金额输入框）才认我们传的金额。
+#
+# 这个常量的用处是让 recharge_via_stripe 能**如实回报实扣金额**，否则上层会拿
+# 「想充多少」去记账：2026-08-04 线上出现过账面 $79、实扣 $20 的记录。
+FIRST_TOPUP_AMOUNT = 20.0
+
+
 def recharge_via_stripe(session, card, wid, amount=20, monitor=None, should_stop=None):
-    """完整充值编排。返回 dict{ok, outcome, err, last4, mode, steps}。
+    """完整充值编排。返回 dict{ok, outcome, err, last4, mode, amount, steps}。
 
     自动区分两种路径（由 billing 页当前入口决定）：
-      - mode="first"：首充，走 Stripe Checkout 填 card 参数的卡 + 点 Pay
-      - mode="reload"：复充，start_recharge 已用账号已存卡点了 Add，直接判定余额
+      - mode="first"：首充，走 Stripe Checkout 填 card 参数的卡 + 点 Pay。
+        **金额固定 FIRST_TOPUP_AMOUNT，传入的 amount 无效**（站点限制，见该常量注释）。
+      - mode="reload"：复充，start_recharge 已用账号已存卡点了 Add，直接判定余额。
+        金额就是传入的 amount。
+
+    返回的 `amount` 是**实际扣款额**，不是请求额——两者在首充时不同，上层按它记账。
     outcome：success / failed（拒付或 3DS 交互挑战）/ needs_captcha / unknown（同
     detect_payment_result）；另有 error —— 付款前的页面/基础设施故障（未找到入口 / 选卡失败 /
     填卡失败 / 点 Pay 失败），非卡问题，上层据此不消耗该卡、留待重试。
@@ -532,5 +546,7 @@ def recharge_via_stripe(session, card, wid, amount=20, monitor=None, should_stop
         # 成功时携带充值后余额（美元），供上层落库刷新 accounts.credits_balance；
         # 非成功为 None（detect_payment_result 只有余额增长才判 success，故成功必有值）
         "balance_after": result.get("balance_after"),
+        # 实际扣款额。首充由站点定死，与请求额无关——上层照请求额记账就会账实不符。
+        "amount": FIRST_TOPUP_AMOUNT if mode == "first" else amount,
         "steps": steps,
     }
