@@ -110,14 +110,26 @@ class PaymentConfig:
 class ConcurrencyConfig:
     """每日流水线的并发执行配置。
 
-    max_workers: 同时驱动的浏览器 worker 数。默认 1（串行，与改造前等价）。
-                 有效范围 1-4，越界由 WorkerPool 夹紧；上限 4 源于有头 Chrome
-                 每实例约 300-500MB 内存的开销。
+    max_workers: **每个平台**同时驱动的浏览器 worker 数，作为未单独配置的平台的
+                 默认值。有效范围 1-4，越界由 WorkerPool 夹紧；上限 4 源于有头
+                 Chrome 每实例约 300-500MB 内存的开销。
+                 多平台并发时总数要按平台累加，还受 adspower.total_quota 约束。
+    platform_workers: 按平台覆盖，如 {opencode: 4, infron: 2}。没列到的平台用
+                 max_workers。分开配的理由很实际——不同平台单账号耗时差很多，
+                 慢的那个多开几个才不至于拖住整体。
     claim_timeout_minutes: 卡被领取（processing 态）后多久无进展视为 worker 失联，
                  由回收线程重置回 pending。
     """
     max_workers: int = 1
+    platform_workers: dict = field(default_factory=dict)
     claim_timeout_minutes: int = 20
+
+    def workers_for(self, platform):
+        """该平台的并发度。未单独配置时回落到 max_workers。"""
+        try:
+            return int(self.platform_workers[platform])
+        except (KeyError, TypeError, ValueError):
+            return self.max_workers
 
 
 @dataclass
@@ -295,6 +307,7 @@ class ConfigLoader:
             conc = self.raw_config['concurrency']
             self.config.concurrency = ConcurrencyConfig(
                 max_workers=conc.get('max_workers', 1),
+                platform_workers=dict(conc.get('platform_workers') or {}),
                 claim_timeout_minutes=conc.get('claim_timeout_minutes', 20),
             )
 

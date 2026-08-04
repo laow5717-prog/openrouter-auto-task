@@ -149,17 +149,57 @@ def test_each_platform_gets_its_own_worker_pool(app):
 
 
 def test_total_browsers_stay_within_the_quota():
-    """每平台 max_workers × 平台数 不能超过 AdsPower 总配额。
+    """各平台并发度**累加**后不能超过 AdsPower 总配额。
 
-    这条是配置层面的清醒检查：现在 2 × 2 = 4，离 11 还很远；
-    哪天有人把 max_workers 拉到 4 又接了第三个平台（4 × 3 = 12 > 11），
-    这条会先红，而不是等生产上撞配额。
+    注意是累加不是相乘——并发度现在按平台单独配（opencode 4 / infron 2），
+    合计 6。哪天有人把某个平台拉高或再接一个平台，这条会先红，
+    而不是等生产上撞配额。
     """
     import src.platforms as platforms
     from src.browser.adspower_quota import AdsPowerQuota
     from src.config import cfg
 
-    worst_case = cfg.concurrency.max_workers * len(list(platforms.all_slugs()))
-    assert worst_case <= AdsPowerQuota.TOTAL, (
-        f'满负荷需要 {worst_case} 个环境，超过配额 {AdsPowerQuota.TOTAL}——'
-        '要么降 max_workers，要么这个组合跑不起来')
+    slugs = list(platforms.all_slugs())
+    worst = sum(cfg.concurrency.workers_for(s) for s in slugs)
+    assert worst <= AdsPowerQuota.TOTAL, (
+        f'满负荷需要 {worst} 个环境，超过配额 {AdsPowerQuota.TOTAL}——'
+        '要么降并发度，要么这个组合跑不起来')
+
+
+def test_per_platform_workers_fit_their_reserved_quota():
+    """单个平台的并发度不能超过它自己的配额额度。
+
+    超了的话它每轮都得去借，而借用要看对方脸色——对方满负荷时就只能干等，
+    表现是「配了 4 个 worker 却总有一个卡在等环境」。
+    """
+    import src.platforms as platforms
+    from src.config import cfg
+
+    reserved = cfg.adspower.platform_quota or {}
+    for slug in platforms.all_slugs():
+        want = cfg.concurrency.workers_for(slug)
+        have = reserved.get(slug)
+        if have is None:
+            continue
+        assert want <= have, (
+            f'{slug} 配了 {want} 个 worker 但自有额度只有 {have}——'
+            '会长期依赖借用，对方忙时就卡住')
+
+
+def test_workers_for_falls_back_to_the_default():
+    """没单独配的平台用 max_workers，不能拿不到 worker。"""
+    from src.config import ConcurrencyConfig
+
+    c = ConcurrencyConfig(max_workers=3, platform_workers={'opencode': 4})
+    assert c.workers_for('opencode') == 4
+    assert c.workers_for('从没听说过的平台') == 3
+
+
+def test_pipeline_uses_the_per_platform_worker_count():
+    """流水线必须按**自己这个平台**取并发度，不能读全局 max_workers。"""
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState.run_daily_pipeline)
+    assert 'workers_for(self.platform)' in src, \
+        '仍在用全局 max_workers，按平台配的值不会生效'

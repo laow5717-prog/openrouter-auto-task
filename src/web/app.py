@@ -927,7 +927,9 @@ class AppState:
         state_lock = threading.Lock()     # 护 done + stats 的读写
 
         # 并发度读 config（clamp 1-4）。max_workers=1 仍走 WorkerPool 同线程分支（应急串行）。
-        pool = WorkerPool(self, cfg.concurrency.max_workers)
+        # 并发度按平台取：不同平台单账号耗时差很多，慢的那个多开几个才不至于
+        # 拖住整体。未单独配置的平台回落到 concurrency.max_workers。
+        pool = WorkerPool(self, cfg.concurrency.workers_for(self.platform))
 
         try:
             self._hooked_print(f"\n{'#' * 50}")

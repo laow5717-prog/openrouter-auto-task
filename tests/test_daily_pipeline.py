@@ -174,12 +174,18 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls
     state._register_one_account = tracker.register
     state._recharge_one_account = tracker.recharge
 
-    original = cfg.concurrency.max_workers
+    # 并发度按平台取（cfg.concurrency.workers_for），所以**两个都要覆盖**：
+    # 只改 max_workers 的话，config.yaml 里 platform_workers 给 opencode 配的值
+    # 会盖过它，测试想要的串行/并行就控制不住了。
+    orig_max = cfg.concurrency.max_workers
+    orig_per = dict(cfg.concurrency.platform_workers)
     cfg.concurrency.max_workers = workers
+    cfg.concurrency.platform_workers = {}
     try:
         state.run_daily_pipeline('opencode', gid, login_password=None, captcha_api_key=None)
     finally:
-        cfg.concurrency.max_workers = original
+        cfg.concurrency.max_workers = orig_max
+        cfg.concurrency.platform_workers = orig_per
 
     # 账号最终状态 = 平台状态优先（recharged 等），没有平台行则看身份状态。
     # 两层拆分后「一个账号处于什么状态」不再是单列，这里合成出旧口径供断言复用。
