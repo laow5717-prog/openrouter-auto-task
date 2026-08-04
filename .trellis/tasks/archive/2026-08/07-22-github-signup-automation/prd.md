@@ -36,17 +36,41 @@ OAuth 前置。本任务只交付注册流程的自动填表与提交，验证�
 
 ## Acceptance Criteria
 
-- [ ] 提供一个可独立运行的入口（脚本或函数），单次调用完成：建 mail.tm 邮箱 → 打开 signup 页 →
+- [x] 提供一个可独立运行的入口（脚本或函数），单次调用完成：建 mail.tm 邮箱 → 打开 signup 页 →
       填表 → 提交，推进到验证码出现为止。
-- [ ] 表单字段选择器来自实跑侦察确认，能在当前 GitHub signup 页真实填入邮箱/密码/用户名。
-- [ ] 运行到 Arkose 验证码出现时，脚本主动停下并输出：所用邮箱、当前 URL、状态截图路径、明确的
+- [x] 表单字段选择器来自实跑侦察确认，能在当前 GitHub signup 页真实填入邮箱/密码/用户名。
+- [x] 运行到 Arkose 验证码出现时，脚本主动停下并输出：所用邮箱、当前 URL、状态截图路径、明确的
       「已到达验证码」日志，而非崩溃或空转。
-- [ ] 若 GitHub 在邮箱/用户名校验阶段拒绝，脚本识别并输出该拒绝原因，返回可区分的失败状态
+- [x] 若 GitHub 在邮箱/用户名校验阶段拒绝，脚本识别并输出该拒绝原因，返回可区分的失败状态
       （「被 GitHub 拒绝」vs「脚本异常」）。
-- [ ] 全流程日志清晰（每一步做了什么、结果如何），便于后续接入验证码/邮件收尾。
+- [x] 全流程日志清晰（每一步做了什么、结果如何），便于后续接入验证码/邮件收尾。
 
 ## Notes
 
 - 侦察阶段允许实跑真实 GitHub 页面观察 DOM；这是确定选择器的唯一可靠方式。
 - 产出的 GitHub 页面操作代码应与 driver.py 的 Cloudflare LEGACY 方法隔离，放独立模块，
   避免污染既有 opencode 改造面。
+
+
+---
+
+## 收尾核实（2026-08-04）
+
+**交付物已完成，但方案在生产中被取代。**
+
+五条 AC 全部达成，对应产物仍在仓库里：
+- `scripts/run_github_signup.py` —— 可独立运行的入口，默认跑到 Arkose 停下
+- `src/services/github_signup_service.py` —— 建 mail.tm 邮箱 → 填表 → 提交，
+  `outcome=reached_captcha` 时输出所用邮箱与当前状态；另有 `--semi-auto`
+  （人工过码后自动收码回填）与全自动分支
+- 选择器均来自 `scripts/probe_github_signup.py` 的实跑侦察
+
+**为什么没继续用**：mail.tm 这类临时邮箱注册出来的 GitHub 账号会被判定为可疑并
+**挂起**（suspended），拿不到可用的 OAuth 身份。后来改用真实 hotmail
+（`hotmail.xlsx` + 持久 profile），注册即 `registered` 不挂起——
+生产链路是 `scripts/run_hotmail_github_signup.py`。
+
+mail.tm 那套代码保留未删：它的收码逻辑（`src/services/email.py`）仍被其它流程复用，
+且这条路径将来若换个邮箱供应商仍有参考价值。
+
+归档时状态为「已完成但被更好的方案取代」，不是「没做完」。
