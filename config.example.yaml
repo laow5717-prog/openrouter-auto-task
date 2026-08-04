@@ -39,8 +39,10 @@ batch:
 
 # 每日流水线并发配置
 concurrency:
-  max_workers: 2              # 同时驱动的浏览器数，1-4。设为 1 即退回串行（应急止血用）
-                              # 每个实例是有头 Chrome，约占 300-500MB 内存
+  max_workers: 2              # **每个平台**同时驱动的浏览器数，1-4。设为 1 即退回串行
+                              # 两个平台并发时总数要乘以平台数：2 × 2 = 4 个浏览器。
+                              # 每个实例是有头 Chrome，约占 300-500MB 内存；
+                              # 总数还受 adspower.total_quota（11）约束。
   claim_timeout_minutes: 20   # 卡被领取后多久无进展视为 worker 失联，自动回收为 pending
 
 # AdsPower 指纹浏览器（每日任务的浏览器启动方式）

@@ -122,3 +122,44 @@ def test_app_state_still_constructible_without_shared():
 
 def test_app_state_config_points_at_the_default_platform(app):
     assert app.config['APP_STATE'] is app.config['RUN_CONTEXTS'][AppState.DEFAULT_PLATFORM]
+
+
+# ---------- 并发度是「每平台」的 ----------
+
+def test_each_platform_gets_its_own_worker_pool(app):
+    """max_workers 是**每个平台**的并发度，不是全局的。
+
+    两个平台各建各的 WorkerPool（构造时传的是自己的 ctx），所以
+    max_workers=2 意味着总共 4 个浏览器。把池挪到 SharedResources 会让
+    两个平台抢同一批 worker——那不是并发，是把并发度砍半。
+    """
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState.run_daily_pipeline)
+    assert 'WorkerPool(self,' in src, '池必须用本平台的 ctx 构造'
+    assert 'WorkerPool(self.shared' not in src, '池挪到共享层会让两个平台抢同一批 worker'
+
+    # 两个 ctx 的 worker 实体确实是分开的
+    ctxs = list(app.config['RUN_CONTEXTS'].values())
+    a, b = ctxs[0], ctxs[1]
+    a.ensure_workers(2)
+    b.ensure_workers(2)
+    assert set(map(id, a.workers.values())).isdisjoint(map(id, b.workers.values()))
+
+
+def test_total_browsers_stay_within_the_quota():
+    """每平台 max_workers × 平台数 不能超过 AdsPower 总配额。
+
+    这条是配置层面的清醒检查：现在 2 × 2 = 4，离 11 还很远；
+    哪天有人把 max_workers 拉到 4 又接了第三个平台（4 × 3 = 12 > 11），
+    这条会先红，而不是等生产上撞配额。
+    """
+    import src.platforms as platforms
+    from src.browser.adspower_quota import AdsPowerQuota
+    from src.config import cfg
+
+    worst_case = cfg.concurrency.max_workers * len(list(platforms.all_slugs()))
+    assert worst_case <= AdsPowerQuota.TOTAL, (
+        f'满负荷需要 {worst_case} 个环境，超过配额 {AdsPowerQuota.TOTAL}——'
+        '要么降 max_workers，要么这个组合跑不起来')
