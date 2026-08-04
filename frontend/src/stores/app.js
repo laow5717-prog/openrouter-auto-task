@@ -36,11 +36,29 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  // 各平台的运行状态概览（来自 /api/status 的 platforms 字段）。
+  // 存在的意义是让用户看见**没在看的那个平台**——它出问题时否则完全不可见。
+  const platformStates = ref({})
+  // AdsPower 环境配额快照 { total, total_held, reserved, held, recall }
+  const quota = ref(null)
+
   function switchPlatform(slug) {
     if (!slug || slug === platform.value) return
     platform.value = slug
     localStorage.setItem('platform', slug)
     setPlatform(slug)
+
+    // 切平台必须把「属于上一个平台」的运行态清掉：日志、worker、计数全是
+    // 那个平台的。不清的话新平台的日志会**追加**在旧平台的后面，两个平台的
+    // 输出混成一片——而且因为 logIndex 还停在旧位置，新平台开头那段还会丢。
+    logs.value = []
+    logIndex.value = 0
+    workers.value = []
+    isRunning.value = false
+    currentAction.value = 'Idle'
+    successCount.value = 0
+    failCount.value = 0
+    poll()          // 立刻拉一次，别让界面空着等到下一个轮询周期
   }
 
   let pollTimer = null
@@ -103,6 +121,8 @@ export const useAppStore = defineStore('app', () => {
       failCount.value = data.fail
       totalInventory.value = data.total_inventory
       parallelMode.value = !!data.parallel_mode
+      platformStates.value = data.platforms || {}
+      quota.value = data.quota || null
       syncWorkers(data.workers)
 
       if (data.logs && data.logs.length > 0) {
@@ -141,7 +161,7 @@ export const useAppStore = defineStore('app', () => {
   return {
     isRunning, currentAction, successCount, failCount, totalInventory,
     logs, logIndex, workers, parallelMode,
-    platforms, platform, loadPlatforms, switchPlatform,
+    platforms, platform, loadPlatforms, switchPlatform, platformStates, quota,
     startPolling, stopPolling, clearLogs, poll,
   }
 })

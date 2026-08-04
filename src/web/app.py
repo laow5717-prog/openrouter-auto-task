@@ -1717,11 +1717,16 @@ def create_app(db_path=None):
     def index():
         return send_from_directory(static_dir, 'index.html')
 
-    # MJPEG 流。?worker=W2 指定 worker；缺省取主 worker（老 URL 保持可用）
+    # MJPEG 流。?worker=W2 指定 worker，?platform=infron 指定平台；
+    # 两个都缺省时取默认平台的主 worker（老 URL 保持可用）。
+    #
+    # platform 不能省：两个平台各有一套同名的 W1..W4，而 get_worker 对未知 id
+    # 会**回落到主 worker**——取错 ctx 不会 404，只会安静地播另一个平台的画面。
     @app.route('/video_feed')
     def video_feed():
         from flask import request
-        worker = state.get_worker(request.args.get('worker'))
+        ctx = contexts.get(request.args.get('platform') or '') or state
+        worker = ctx.get_worker(request.args.get('worker'))
         return Response(gen_frames(worker),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 

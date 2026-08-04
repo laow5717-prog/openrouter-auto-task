@@ -218,3 +218,30 @@ def test_cleanup_protects_running_tasks_on_every_platform(app, client):
 
     assert len(cb.get_pending(ta)) == 1, 'A 平台正在跑的任务的记录被删了'
     assert len(cb.get_pending(tb)) == 1, 'B 平台正在跑的任务的记录被删了'
+
+
+# ---------- 视频流也要按平台寻址 ----------
+
+def test_video_feed_is_scoped_by_platform(app):
+    """两个平台各有一套同名的 W1..W4，而 get_worker 对未知 id 会**回落到主 worker**
+    —— 取错 ctx 不会 404，只会安静地播另一个平台的画面。
+    """
+    import inspect
+    import src.web.app as app_mod
+
+    src = inspect.getsource(app_mod.create_app)
+    i = src.index("@app.route('/video_feed')")
+    block = src[i:i + 600]
+    assert "request.args.get('platform')" in block, \
+        '/video_feed 没有平台维度，会播错平台的画面'
+    assert 'ctx.get_worker' in block
+
+
+def test_frontend_video_urls_carry_the_platform():
+    """前端三处 video_feed URL 都要带 platform。Workbench 里那个原本是写死的。"""
+    import pathlib
+    for name in ('Dashboard.vue', 'Workbench.vue'):
+        text = pathlib.Path('frontend/src/views', name).read_text()
+        for line in text.splitlines():
+            if '/video_feed' in line and 'platform=' not in line and '//' not in line.strip()[:2]:
+                raise AssertionError(f'{name} 有一处 video_feed 没带 platform：{line.strip()}')

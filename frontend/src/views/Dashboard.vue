@@ -60,7 +60,11 @@ const logContainer = ref(null)
 const selectedWorker = ref('W1')
 // 单 worker 时不带参数，与改造前的 URL 完全一致
 const videoFeedUrl = computed(() =>
-  store.workers.length > 1 ? `/video_feed?worker=${selectedWorker.value}` : '/video_feed'
+  // platform 必须带：两个平台各有一套同名的 W1..W4，服务端对未知 worker 会回落到
+  // 主 worker，取错 ctx 不会报错、只会安静地播另一个平台的画面。
+  store.workers.length > 1
+    ? `/video_feed?platform=${store.platform}&worker=${selectedWorker.value}`
+    : `/video_feed?platform=${store.platform}`
 )
 
 watch(() => store.logs.length, () => {

@@ -100,7 +100,7 @@
       </div>
       <div class="worker-action" :title="w.currentAction">{{ w.currentAction }}</div>
       <div class="monitor-body worker-monitor">
-        <img v-if="w.busy" class="monitor-img" :src="`/video_feed?worker=${w.id}`" :alt="w.id">
+        <img v-if="w.busy" class="monitor-img" :src="`/video_feed?platform=${store.platform}&worker=${w.id}`" :alt="w.id">
         <div v-else style="color:#666;font-size:12px">等待信号...</div>
       </div>
       <div class="log-body worker-log">
@@ -123,7 +123,8 @@ const settings = useSettingsStore()
 
 const groups = ref([])
 const logContainer = ref(null)
-const videoFeedUrl = '/video_feed'
+// 同样要带 platform，理由见 Dashboard.vue 里的注释
+const videoFeedUrl = computed(() => `/video_feed?platform=${store.platform}`)
 
 // 只有真正多开 worker 时才切分栏布局，串行时保持原有的双栏视觉
 const isParallel = computed(() => appStore.workers.length > 1)
