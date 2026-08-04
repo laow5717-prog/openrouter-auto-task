@@ -1,13 +1,17 @@
 """
 充值记录数据模型
 
-每条记录带 platform：它是「这张卡在这个平台上付款成功过没有」的唯一真值来源，
-而那个判断直接决定拒付时是**判废**还是**只冷却**（见 registration.recharge_account）。
-漏掉 platform 过滤的后果很具体：一张在 opencode 成功过的卡，到了新平台被拒也只会
-进冷却、永远标不成 invalid，于是每轮都被重新选中、反复拒付，把额度和风控配额一起耗光。
+每条记录带 platform：它是「这张卡在这个平台上付款成功过没有」的唯一真值来源。
+漏掉 platform 过滤的后果很具体：一张在 opencode 成功过的卡，到了新平台会被当成
+「好卡」排到队尾，而它在那边其实一次都没试过，本该优先消耗。
+
+**它已经不再决定拒付时判废还是只冷却。** 那套「按 last_success_at 分岔」的逻辑在
+连续失败计数（card_payment_state.fail_streak）落地时删掉了：现在拒付一律冷却，
+判废只看连续失败次数，好卡的豁免收口在 mark_invalid_by_number 的 valid_cards 守卫。
+`last_success_at` / `success_count_since` 因此已无生产调用方，保留只为排障查询。
 
 统计类查询（all_success_card_numbers / last_success_at / success_count_since /
-count_success_by_last4 / get_success_card_numbers）因此一律要求 platform。
+count_success_by_last4 / get_success_card_numbers）一律要求 platform。
 create/mark_* 这类按 id 操作的写入不需要——记录建的时候平台就定死了。
 """
 

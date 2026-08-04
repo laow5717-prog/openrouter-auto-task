@@ -108,29 +108,52 @@ execution is exposed as **additive** fields only:
 
 ### `/api/daily/start` request contract
 
+> The three-stage bind→register→recharge shape below (`bind_group_id`,
+> `cf_password`, `max_bindable_cards`) is **Cloudflare-era and gone**. opencode
+> and infron fill the card straight into the payment page; there is no separate
+> bind stage. The section further down describing three stages is stale for the
+> same reason — read `AppState.run_daily_pipeline` for the real flow.
+
 | Field | Type | Required | Note |
 |-------|------|----------|------|
-| `bind_group_id` | int/str | yes | Bind card group id |
-| `payment_group_id` | int/str | no | Falsy → `None` → recharge does Top-up only, skips unpaid invoices |
-| `cf_password` | str | no | Empty → new accounts get a random password |
-| `max_bindable_cards` | int | no | Default 2 |
-| `captcha_api_key` | str | no | 2Captcha key |
+| `group_id` | int/str | yes | Payment card-pool group |
+| `platform` | str | yes | Adapter slug. Each platform has its own run context and its own `is_running` gate |
+| `login_password` | str | no | Overrides each account's own password; normally left empty |
+| `captcha_api_key` | str | no | Solver key for the payment page's hCaptcha |
+| `captcha_server` | str | no | Default `api.multibot.cloud`; pass `2captcha.com` to switch |
+| `amount_min` / `amount_max` | int | no | Per-charge random range, in whole dollars. Default from `cfg.recharge` |
+| `balance_cap` | number | no | Switch accounts once one reaches this balance. Default from `cfg.recharge` |
 
-Success: `200 {"status": "started", "usable_cards": <int>, "group_name": <str>}`.
+The three policy fields are parsed by `_recharge_cfg_from(data)`, shared with
+`/api/accounts/recharge` so the two endpoints cannot drift. It returns a **new**
+`RechargeConfig` — never mutates the global `cfg.recharge`, because two
+platforms run concurrently against the same process-wide singleton.
+
+Success: `200 {"status": "started", "usable_cards": <int>, "accounts": <int>,
+"group_name": <str>, "amount_min": <int>, "amount_max": <int>,
+"balance_cap": <float>}`. The policy is echoed back so the UI can show what
+actually took effect rather than what was typed.
 
 ### Validation & Error Matrix
 
 | Condition | Response |
 |-----------|----------|
-| `state.is_running` truthy | `400 {"error": "有任务正在运行"}` |
-| missing `bind_group_id` | `400 {"error": "未指定绑卡分组"}` |
-| bind group id not found | `404 {"error": "绑卡分组不存在"}` |
-| no usable cards AND no rechargeable account | `400 {"error": ...无事可做}` |
+| `state.is_running` truthy for **that platform** | `400 {"error": "<platform> 已有任务在运行"}` |
+| missing `group_id` | `400 {"error": "未指定卡池分组"}` |
+| group id not found | `404 {"error": "卡池分组不存在"}` |
+| missing `platform` | `400 {"error": "未指定平台"}` |
+| `amount_min > amount_max` | `400` naming both bounds |
+| amount outside `RechargeConfig.AMOUNT_FLOOR..AMOUNT_CEILING` | `400` |
+| non-numeric amount / `balance_cap <= 0` | `400` |
+| no selectable cards in the group | `400 {"error": ...无事可做}` |
+| no rechargeable account | `400 {"error": ...无事可做}` |
 | otherwise | `200 started` |
 
-> "Nothing to do" guard: if the bind group has zero usable cards, the route must still allow
-> start **iff** some account has real bound cards (`count_by_emails >= 1`) and no `has_today_record`
-> today — the recharge stage alone is valid work.
+Policy validation **rejects with 400 rather than silently clamping**. A user who
+configured 20–100 and unknowingly ran something else has a much harder problem
+to diagnose than one who got an error. Clamping is reserved for
+`RechargeConfig.bounds()`, which is a last-resort guard against a hand-edited
+`config.yaml`, not a substitute for validation.
 
 ### Worker lifecycle contract (MUST hold)
 

@@ -169,7 +169,10 @@
   <Modal :visible="rechargeConfirmVisible" title="充值确认" @close="rechargeConfirmVisible = false">
     <div style="margin-bottom:16px">
       <div style="font-size:14px;margin-bottom:8px">账号: <strong>{{ rechargeTargetEmail }}</strong></div>
-      <div style="font-size:13px;color:var(--text-sub);margin-bottom:12px">在 opencode Zen 充值 $20 credits（Stripe 美元结算，含手续费约 $21.23）</div>
+      <div style="font-size:13px;color:var(--text-sub);margin-bottom:12px">
+        按 config.yaml 的 recharge 策略充值：每笔金额在配置区间内随机（默认 $20–$100，Stripe 美元结算另收手续费），
+        同一账号会连充到余额上限或试卡上限为止。
+      </div>
     </div>
     <div style="margin-bottom:16px">
       <label style="display:block;font-size:13px;font-weight:500;margin-bottom:6px;color:#555">

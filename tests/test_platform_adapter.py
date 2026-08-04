@@ -26,6 +26,7 @@ from src.models.card_payment_state import CardPaymentStateModel
 from src.models.recharge_log import RechargeLogModel
 from src.models.platform_account import PlatformAccountModel
 from src.models.account import AccountModel
+from src.config import RechargeConfig
 from src.services import registration
 
 STUB = 'stubplatform'
@@ -218,25 +219,74 @@ def test_needs_captcha_stops_immediately_without_consuming_cards(models):
         platforms.unregister(STUB)
 
 
-def test_declined_card_never_succeeded_here_is_invalidated(models):
-    """明确拒付 + 本平台从未成功过 → 判废。"""
+def test_declined_card_is_invalidated_only_after_the_streak_is_reached(models):
+    """明确拒付 → 前两次只冷却，连续第 3 次才判废。
+
+    改造前是首次被拒即永久 invalid，一次发卡行的瞬时抖动就能烧掉一张好卡。
+
+    这里把冷却时长设成 0，好让三次拒付能在同一个测试里连着发生——真实配置下
+    每次失败会锁 24h，判废一张坏卡实际要花 3 天。冷却本身由
+    test_declined_card_enters_cooldown_and_is_filtered_out 单独盯。
+    """
+    cfg = RechargeConfig(fail_cooldown_hours=0, max_fail_streak=3)
+    num = '4111111111111111'
+
+    for i in (1, 2):
+        stub = StubAdapter(outcomes=['failed'])
+        platforms.register(stub)
+        try:
+            _recharge(stub, models, [_card(num)], recharge_cfg=cfg)
+        finally:
+            platforms.unregister(STUB)
+        assert models['card_pool'].get_platform_status(STUB, num) == '', \
+            f'第 {i} 次被拒不该判废'
+        assert models['card_state'].get_fail_streak(STUB, num) == i
+
+    stub = StubAdapter(outcomes=['failed'])
+    platforms.register(stub)
+    try:
+        _recharge(stub, models, [_card(num)], recharge_cfg=cfg)
+    finally:
+        platforms.unregister(STUB)
+
+    assert models['card_pool'].get_platform_status(STUB, num) == 'invalid'
+
+
+def test_declined_card_enters_cooldown_and_is_filtered_out(models):
+    """拒付一次即进冷却，冷却期内再传进来也不会被试。
+
+    「同一张卡两次使用间隔 ≥24h」靠的就是这道过滤——它在编排层入口处，
+    上层选卡漏过滤时是最后一道网。
+    """
     stub = StubAdapter(outcomes=['failed'])
     platforms.register(stub)
     try:
         num = '4111111111111111'
         _recharge(stub, models, [_card(num)])
-        assert models['card_pool'].get_platform_status(STUB, num) == 'invalid'
+        assert models['card_state'].in_cooldown(STUB, num) is True
+
+        tried_before = len([c for c in stub.calls if c[0] == 'top_up'])
+        ok, err, _r, _l4, outcome = _recharge(stub, models, [_card(num)])
+
+        assert (ok, outcome) == (False, 'failed')
+        assert '冷却' in err
+        assert len([c for c in stub.calls if c[0] == 'top_up']) == tried_before, \
+            '冷却中的卡不该再被提交给发卡行'
     finally:
         platforms.unregister(STUB)
 
 
 def test_declined_card_that_succeeded_here_only_cools_down(models):
-    """明确拒付 + 本平台成功过 → 只进 24h 冷却，不判废。"""
+    """明确拒付 + 本平台成功过 → 只进冷却，不判废。
+
+    豁免不再靠编排层查 last_success_at，而是靠 mark_invalid_by_number 底层那道
+    valid_cards 守卫——所以即便失败计数将来超过阈值，好卡也不会被标废。
+    """
     stub = StubAdapter(outcomes=['success', 'failed'])
     platforms.register(stub)
     try:
         num = '4111111111111111'
-        _recharge(stub, models, [_card(num)])          # 先成功一次，留下 recharge_logs
+        _recharge(stub, models, [_card(num)])          # 先成功一次，进 valid_cards
         _recharge(stub, models, [_card(num)])          # 再被拒
 
         assert models['card_pool'].get_platform_status(STUB, num) != 'invalid'

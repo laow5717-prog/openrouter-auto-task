@@ -138,6 +138,49 @@ passed but has not been re-stamped yet would otherwise be counted as
 Do not confuse this with `card_bindings.status`, whose `'pending'` is a real
 stored value for the *binding task*, unrelated to the card pool.
 
+#### `card_payment_state` carries two independent things
+
+Same primary key `(card_number, platform)`, two unrelated meanings. Both are
+written by `registration.recharge_account` and read by `_eligible_cards`:
+
+| Columns | Meaning | Written when |
+|---|---|---|
+| `tds_until`, `tds_reason` | **Temporary cooldown** — "don't pick this card again until then" | Any declined payment, or a 3DS challenge |
+| `fail_streak`, `last_fail_at` | **Consecutive-failure count** — how many times in a row this card was declined *on this platform* | +1 on every decline, reset to 0 on any success |
+
+The two must not clobber each other. `set_cooldown`'s `ON CONFLICT DO UPDATE`
+lists only the `tds_*` columns; `reset_fail_streak` only `UPDATE`s (never
+inserts), so a card that has never failed does not get a row of zeroes.
+
+**A card is invalidated only when `fail_streak` reaches
+`cfg.recharge.fail_threshold()` (default 3).** Read the threshold through that
+method, never `max_fail_streak` directly: the comparison is `streak >=
+threshold` and `streak` counts from 1, so a hand-edited `0` in `config.yaml`
+would make the condition vacuously true and write off every card on its first
+decline. `fail_threshold()` floors it at 1. Before that, a decline just cools
+the card down. Combined with `fail_cooldown_hours` (default 24), writing off a
+genuinely dead card takes three days. That slowness is the point — the previous
+rule invalidated on the *first* decline, so one issuer hiccup permanently burned
+a good card.
+
+Two consequences that surprise people reading the pipeline logs:
+
+- The "分组可选卡耗尽" stop condition now fires with most cards merely *cooling
+  down*, not invalid. Card counts in the UI will not drop the way they used to.
+- A successful payment does **not** cool the card down. It must not — one
+  account now tops up repeatedly in a single session (see
+  `recharge_account`'s loop), and cooling successful cards would leave it with
+  nothing to charge on the second round.
+
+`bump_fail_streak` does its upsert and read-back inside `Database.transaction()`.
+Splitting them into two `execute()` calls loses counts under concurrency: two
+workers declining the same card would each read the same old value, the counter
+would only advance by one, and a bad card could never reach the threshold.
+
+The three outcomes in `OUTCOMES_KEEPING_CARD` (`error`, `needs_captcha`,
+`unknown`) touch **neither** column. They are not the card's fault, and a
+network blip must never push a good card toward being written off.
+
 ### Multi-statement transactions
 
 `Database.execute()` commits every statement. When a batch must be atomic, use

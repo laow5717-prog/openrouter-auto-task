@@ -42,6 +42,24 @@
         </div>
       </div>
 
+      <div class="settings-row">
+        <div class="setting-item">
+          <label class="setting-label">单笔充值金额（美元，区间内随机）</label>
+          <div class="range-row">
+            <input type="number" v-model.number="settings.amountMin" class="ctrl-input"
+                   min="1" max="1000" :disabled="appStore.isRunning">
+            <span class="range-sep">–</span>
+            <input type="number" v-model.number="settings.amountMax" class="ctrl-input"
+                   min="1" max="1000" :disabled="appStore.isRunning">
+          </div>
+        </div>
+        <div class="setting-item">
+          <label class="setting-label">单账号余额上限（充到此额换下一个账号）</label>
+          <input type="number" v-model.number="settings.balanceCap" class="ctrl-input"
+                 min="1" :disabled="appStore.isRunning">
+        </div>
+      </div>
+
       <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <template v-if="!appStore.isRunning">
           <button class="btn btn-primary" style="width:auto;padding:8px 24px"
@@ -157,21 +175,43 @@ async function loadGroups() {
   } catch (e) { console.error(e) }
 }
 
+// 前端先挡一道明显的笔误，省一次往返。真正的权威校验在后端 _recharge_cfg_from，
+// 两边口径要一致（1–1000、min ≤ max、余额上限为正）。
+function validateRechargePolicy() {
+  const { amountMin: lo, amountMax: hi, balanceCap: cap } = settings
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo < 1 || hi > 1000) {
+    return '单笔充值金额需在 $1–$1000 之间'
+  }
+  if (lo > hi) return `充值金额区间非法：下界 $${lo} 大于上界 $${hi}`
+  if (!Number.isFinite(cap) || cap <= 0) return '单账号余额上限必须大于 0'
+  return ''
+}
+
 async function handleStart() {
   if (appStore.isRunning) { alert('任务已在运行中'); return }
   if (!settings.dailyGroupId) { alert('请选择卡池分组'); return }
+  const policyErr = validateRechargePolicy()
+  if (policyErr) { alert(policyErr); return }
   appStore.clearLogs()
   settings.save()
 
-  const body = { group_id: settings.dailyGroupId }
+  const body = {
+    group_id: settings.dailyGroupId,
+    amount_min: settings.amountMin,
+    amount_max: settings.amountMax,
+    balance_cap: settings.balanceCap,
+  }
   if (settings.loginPassword) body.login_password = settings.loginPassword
   if (settings.captchaApiKey) body.captcha_api_key = settings.captchaApiKey
 
   try {
     const result = await startDailyPipeline(body)
     appStore.poll()
+    // 金额区间取后端回显的值，而不是本地输入框——两者不一致时用户应当看见的是
+    // 实际生效的那一套。
+    const amount = `每笔 $${result.amount_min}–$${result.amount_max} · 余额上限 $${result.balance_cap}`
     alert(result.group_name
-      ? `已启动每日充值任务（分组「${result.group_name}」未消耗卡 ${result.usable_cards} 张 · 可用账号 ${result.accounts} 个）`
+      ? `已启动每日充值任务（分组「${result.group_name}」未消耗卡 ${result.usable_cards} 张 · 可用账号 ${result.accounts} 个 · ${amount}）`
       : '已启动每日充值任务')
   } catch (e) {
     alert('启动失败: ' + e.message)
@@ -245,6 +285,13 @@ onMounted(loadGroups)
   margin-bottom: 4px;
   color: #555;
 }
+.range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.range-row .ctrl-input { flex: 1; min-width: 0; }
+.range-sep { color: #9ca3af; flex-shrink: 0; }
 
 .btn-primary .icon, .btn-danger .icon { display: inline-block; vertical-align: -2px; margin-right: 4px; }
 

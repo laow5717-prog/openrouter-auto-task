@@ -31,7 +31,8 @@ PaymentResult.outcome 的六个取值直接决定编排层「这张卡消耗不�
 线上事故换来的：
 
     success      付款成功
-    failed       明确拒付 → 卡按「本平台是否成功过」判冷却或判废
+    failed       明确拒付 → 卡在本平台无条件进冷却，连续失败达阈值才判废
+                 （阈值/冷却时长见 config.RechargeConfig；成功一次即清零）
     needs_captcha 账号级风控拦截 → 立即停手，**不消耗卡**
     error        付款**前**的页面故障 → **不消耗卡**
     unknown      未定案 → **不消耗卡**

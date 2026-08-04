@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "代码规范与禁用模式"}
+{"file": ".trellis/spec/backend/multi-platform-guidelines.md", "reason": "校验平台隔离没有被破坏——这是本次改动最容易出错的维度"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "校验迁移幂等、列语义与既有表约定一致"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验失败归因与 OUTCOMES_KEEPING_CARD 硬约束未被破坏"}

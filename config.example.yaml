@@ -50,6 +50,21 @@ concurrency:
     infron: 2
   claim_timeout_minutes: 20   # 卡被领取后多久无进展视为 worker 失联，自动回收为 pending
 
+# 充值策略。amount_min/amount_max/balance_cap 可在 UI（工作台侧栏）上按次覆盖，
+# 这里配的是缺省值；max_fail_streak/fail_cooldown_hours 只在这里配。
+recharge:
+  amount_min: 20              # 每笔充值金额的随机区间下界（美元，整数）
+  amount_max: 100             # 上界。按**笔**取值，同账号连充几笔金额各不相同
+  balance_cap: 200            # 单账号余额上限：一个账号连续充到这个数就换下一个账号。
+                              # ⚠️ 与各平台的 recharge_skip_balance（登录时的归档预检
+                              #    阈值，两平台都是 20）是两回事，别混。设成 20 会让
+                              #    「成功后继续充」退化成「充一笔就换账号」。
+  max_fail_streak: 3          # 一张卡在某平台**连续**失败几次才判废。中间成功一次即清零。
+                              # 设为 1 即退回改造前的「首次被拒即永久 invalid」。
+                              # 下限是 1：写 0 会被兜成 1，而不是「一次都不容忍」。
+  fail_cooldown_hours: 24     # 一张卡失败后多久内不再被选中。成功的卡**不**冷却。
+                              # 与 max_fail_streak 相乘 = 判废一张坏卡最快需要的时间（默认 3 天）
+
 # AdsPower 指纹浏览器（每日任务的浏览器启动方式）
 # enabled=false 时走本地 Chrome 持久 profile（data/profiles/<email>），与接入前一致；
 # enabled=true 时每个账号绑定一个 AdsPower 环境，环境创建时绑定一个独立代理出口 IP。

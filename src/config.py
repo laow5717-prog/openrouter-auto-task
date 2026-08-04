@@ -3,6 +3,7 @@
 从 config.yaml 文件加载配置，支持数据类的类型安全访问
 """
 
+import random
 import sys
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -133,6 +134,81 @@ class ConcurrencyConfig:
 
 
 @dataclass
+class RechargeConfig:
+    """充值策略参数。四个字段各对应一条业务规则，全部可在 config.yaml 里调。
+
+    amount_min / amount_max: 每笔充值的随机金额区间（美元，取整数）。
+             **按笔取值**而非按账号——同一个账号连充几笔时每笔金额都不同，更像真人。
+             两个平台的充值页都接受任意金额：infron 命中不了预设档位会回退自定义
+             输入框，opencode 直接把数字敲进输入框。
+
+    balance_cap: 单账号余额上限。一个账号在一次会话里连续充值，余额达到此值就换下
+             一个账号。**不能拿 adapter.recharge_skip_balance 代替**——那是登录时的
+             归档预检阈值（两平台都是 20），拿来当循环上限的话第一笔充完就会停，
+             「成功后继续充」这条规则直接失效。
+
+    max_fail_streak: 一张卡在某平台**连续**失败多少次才判废。中间成功一次即清零。
+             此前的口径是首次被拒即永久 invalid，一次发卡行瞬时抖动就能烧掉一张好卡。
+
+    fail_cooldown_hours: 一张卡失败后多久内不再被选中。与 max_fail_streak 叠加的
+             效果是：判废一张坏卡最快需要 max_fail_streak × fail_cooldown_hours
+             （默认 3 天）。这是有意的——宁可慢，不可误杀。
+             注意**只有失败才冷却**，成功的卡可立即复用，否则「成功后继续充」无从谈起。
+    """
+    amount_min: int = 20
+    amount_max: int = 100
+    balance_cap: float = 200.0
+    max_fail_streak: int = 3
+    fail_cooldown_hours: int = 24
+
+    # 金额的绝对边界。夹紧而非报错：一个越界的配置值不该让整条充值流水线停摆。
+    AMOUNT_FLOOR = 1
+    AMOUNT_CEILING = 1000
+
+    def bounds(self):
+        """夹紧后的 (min, max)。min > max 时以 min 为准，两端都取它。"""
+        lo = max(self.AMOUNT_FLOOR, min(self.AMOUNT_CEILING, int(self.amount_min)))
+        hi = max(self.AMOUNT_FLOOR, min(self.AMOUNT_CEILING, int(self.amount_max)))
+        return (lo, hi) if lo <= hi else (lo, lo)
+
+    def fail_threshold(self):
+        """判废所需的连续失败次数，至少为 1。
+
+        下限不是形式主义：编排层判的是 `streak >= max_fail_streak`，而 streak 从 1 起数。
+        配成 0 或负数会让这个条件恒真——**连计数都不用读**，第一次拒付就判废，
+        比改造前还激进。手改 config.yaml 时把它当成开关写个 0 是很自然的笔误，
+        而后果（整池好卡被一次性烧掉）不可逆。
+        """
+        try:
+            return max(1, int(self.max_fail_streak))
+        except (TypeError, ValueError):
+            return 1
+
+    def pick_amount(self):
+        """取一笔充值金额（整数美元）。
+
+        这里再夹一次而不是信任调用方：API 层虽然会校验，但 config.yaml 是人手写的，
+        也可能直接构造实例。让它永远返回一个可用的数，而不是抛异常打断充值。
+        """
+        lo, hi = self.bounds()
+        return random.randint(lo, hi)
+
+    def with_overrides(self, **kw):
+        """按传入的非 None 值产出一个**新实例**（UI 覆盖 yaml 默认值）。
+
+        必须返回新对象、绝不原地改：cfg 是进程级全局单例，两个平台并发跑时原地改
+        会让后启动的那个平台把前一个的参数覆盖掉——这类竞态不报错、不留日志。
+        """
+        vals = {f: getattr(self, f) for f in
+                ('amount_min', 'amount_max', 'balance_cap',
+                 'max_fail_streak', 'fail_cooldown_hours')}
+        for k, v in kw.items():
+            if k in vals and v is not None:
+                vals[k] = v
+        return RechargeConfig(**vals)
+
+
+@dataclass
 class AdsPowerConfig:
     """AdsPower 指纹浏览器接入配置。
 
@@ -178,6 +254,7 @@ class AppConfig:
     payment: PaymentConfig = field(default_factory=PaymentConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     adspower: AdsPowerConfig = field(default_factory=AdsPowerConfig)
+    recharge: RechargeConfig = field(default_factory=RechargeConfig)
 
 
 def get_base_dir():
@@ -323,6 +400,16 @@ class ConfigLoader:
                 total_quota=int(ads.get('total_quota', 11)),
                 platform_quota=dict(ads.get('platform_quota') or {}),
                 quota_wait_seconds=int(ads.get('quota_wait_seconds', 300)),
+            )
+
+        if 'recharge' in self.raw_config:
+            rc = self.raw_config['recharge']
+            self.config.recharge = RechargeConfig(
+                amount_min=int(rc.get('amount_min', 20)),
+                amount_max=int(rc.get('amount_max', 100)),
+                balance_cap=float(rc.get('balance_cap', 200)),
+                max_fail_streak=int(rc.get('max_fail_streak', 3)),
+                fail_cooldown_hours=int(rc.get('fail_cooldown_hours', 24)),
             )
 
         if 'captcha' in self.raw_config:

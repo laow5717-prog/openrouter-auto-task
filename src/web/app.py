@@ -762,10 +762,12 @@ class AppState:
         在别的平台的遭遇不会影响这里的结果。
 
         可选 = get_usable_cards_as_list（已排除 expired/invalid/bound）且不处于临时冷却
-        （3DS / 「曾成功卡本次被拒」的速率冷却）中。排序：
+        （3DS / 充值失败冷却）中。排序：
           - 新卡（从未成功付款过）优先，先把卡池的新卡消耗掉；
           - 之后才复用已成功过的好卡（paid 卡可反复支付）。
-        成功卡不被永久消耗，只有被拒（好卡→冷却，坏卡→无效）或过期才退出可选集。
+        成功卡不被永久消耗、也**不进冷却**（否则同一账号连充第二笔就无卡可用）。
+        一张卡退出可选集只有三种方式：被拒后进冷却（默认 24h，到期自动回来）、
+        连续被拒达阈值判无效（默认 3 次，永久）、或过期。
 
         exclude_used=True 时再剔除本轮已被其它账号试过的卡（见 _exclude_used_this_run）。
         统计用途（启动前算「分组有多少可选卡」）应传 False，否则数字会随本轮进度缩水。"""
@@ -795,9 +797,15 @@ class AppState:
     def _recharge_one_account(self, email, login_password, payment_group_id=None,
                               worker=None, captcha_api_key=None,
                               captcha_server="api.multibot.cloud", proxy=None,
-                              verify_link=None):
+                              verify_link=None, recharge_cfg=None):
         """为单个账号执行一次充值访问，返回 (result, err)，
-        result ∈ {"success", "failed", "archived"(余额≥$20 已归档、未扣款)}。
+        result ∈ {"success", "failed", "archived"(余额≥平台阈值已归档、未扣款)}。
+
+        一次访问内账号可能连充**多笔**（见 registration.recharge_account 的连充循环），
+        "success" 表示至少成功一笔。
+
+        recharge_cfg: RechargeConfig（金额区间 / 余额上限 / 判废阈值 / 冷却时长）。
+                      None 时由 recharge_account 回落到 cfg.recharge。
 
         captcha_api_key/captcha_server 透传给 registration.recharge_account 用于自动解 hCaptcha。
 
@@ -810,6 +818,8 @@ class AppState:
         InterruptedError 向上抛出，供轮转循环感知停止。
 
         worker: 执行本次操作的 WorkerState；为 None 时用主 worker（串行路径）。"""
+        import src.platforms as platforms
+
         models = self.models
         worker = worker or self.primary_worker
         monitor = worker.make_monitor(self)
@@ -838,17 +848,24 @@ class AppState:
                 verify_link=verify_link,
                 platform=self.platform,
                 platform_account_model=models['platform_account'],
+                recharge_cfg=recharge_cfg,
             )
 
             if outcome == "topup":
-                self.set_action(worker, f"{email} 充值成功（卡 {card_last4}）")
-                self.add_log(f"{email} AI Credits 充值 $20 成功（卡 {card_last4}）")
+                # 一次访问可能充了多笔。金额是每笔随机的，所以从 responses 现算
+                # ——写死 "$20" 的旧文案在金额随机化后只会误导人。
+                paid = [r for r in responses if r.get('ok')]
+                total = sum(r.get('amount') or 0 for r in paid)
+                self.set_action(worker, f"{email} 充值成功 {len(paid)} 笔（卡 {card_last4}）")
+                self.add_log(f"{email} 充值成功 {len(paid)} 笔、合计 ${total:.0f}"
+                             f"（末张卡 {card_last4}）：{err}")
                 return "success", ''
 
             if outcome == "archived":
                 # 余额≥阈值已归档（未扣款）：既非成功也非失败，该账号退出后续轮转
-                self.set_action(worker, f"{email} 余额≥$20，已归档跳过")
-                self.add_log(f"{email} 余额≥$20，已归档跳过充值（{err}）")
+                skip_at = platforms.get(self.platform).recharge_skip_balance
+                self.set_action(worker, f"{email} 余额≥${skip_at:.0f}，已归档跳过")
+                self.add_log(f"{email} 余额≥${skip_at:.0f}，已归档跳过充值（{err}）")
                 return "archived", err or 'archived'
 
             if outcome == "flagged":
@@ -870,14 +887,16 @@ class AppState:
             return "failed", str(e)
 
     def run_daily_pipeline(self, platform, group_id, login_password=None, captcha_api_key=None,
-                           captcha_server="api.multibot.cloud"):
+                           captcha_server="api.multibot.cloud", recharge_cfg=None):
         """每日充值任务：卡池驱动的账号轮转充值，串行跑在单个后台线程。
 
         platform 是目标平台 slug。账号状态、卡的占用与冷却全部按它隔离——同一邮箱、
         同一张卡在别的平台上的记录不影响本次运行。一次只能跑一个平台（AppState 单例）。
 
-        选定一个卡池分组，用账号列表逐账号轮转充值：一个账号在其会话内充成 1 张卡后即轮转
-        到下一个账号。**以刷完卡池为第一标准**：只要分组还有可选卡且还有账号可用就继续跑；
+        选定一个卡池分组，用账号列表逐账号轮转充值：一个账号在其会话内**连续充多笔**，
+        直到试卡上限 / 余额上限 / 风控拦截 / 无卡可用才轮转到下一个账号（连充循环在
+        registration.recharge_account 内部，见那里的 docstring）。
+        **以刷完卡池为第一标准**：只要分组还有可选卡且还有账号可用就继续跑；
         充值失败的账号只跳过**本轮**，一轮轮完（所有账号都试过一遍）后清空失败名单、
         回到头部开下一轮重试（A 失败→换 B→…→下一轮再试 A）。停止条件（满足其一）：
           1. 分组可选卡耗尽（全部无效/过期或冷却中）；
@@ -886,16 +905,18 @@ class AppState:
              容忍一轮零进展是为了吸收登录/网络类瞬时抖动）；
           3. 用户手动停止。
 
-        选卡资格（见 _eligible_cards）：新卡优先，付款成功过的好卡可反复复用；只有从未成功
-        的坏卡被拒（判无效）、好卡被拒（24h 速率冷却）或过期，才退出可选集。逐卡的卡状态
-        标记与 recharge_logs 记账在 recharge_account 内部完成；本方法只负责取可选卡、轮转
-        账号、计数与收尾。
+        选卡资格（见 _eligible_cards）：新卡优先，付款成功过的好卡可反复复用；卡退出可选集
+        的方式有三种——被拒后进冷却（默认 24h，成功的卡不冷却）、连续被拒达阈值判无效、
+        或过期。逐卡的卡状态标记与 recharge_logs 记账在 recharge_account 内部完成；
+        本方法只负责取可选卡、轮转账号、计数与收尾。
 
         captcha_api_key/captcha_server 透传给充值流程用于自动解 hCaptcha（server 默认 Multibot）。
+        recharge_cfg 透传充值策略（金额区间 / 余额上限 / 判废阈值 / 冷却时长），None 时
+        由下游回落到 cfg.recharge。
         账号选取排除身份层终态（banned/suspended/rejected/flagged）与本平台的平台层终态
-        （archived/recharged/subscribed，见 utils 里的两组终态常量）；登录后实时余额 ≥$20
-        的账号会在本平台被归档并退出后续轮转；GitHub 被 flag 无法授权 OAuth 的账号会被标
-        身份层 flagged——那是 GitHub 侧的封禁，对所有平台一致。
+        （archived/recharged/subscribed，见 utils 里的两组终态常量）；登录后实时余额 ≥
+        该平台 recharge_skip_balance 的账号会在本平台被归档并退出后续轮转；GitHub 被 flag
+        无法授权 OAuth 的账号会被标身份层 flagged——那是 GitHub 侧的封禁，对所有平台一致。
 
         账号耗尽自动补号：当某轮无可充值账号时，从 imported 账号（hotmail.xlsx 有收码数据）
         取一个自动注册（复用 _register_one_account，全自动碰 Arkose 跳过），注册成功者
@@ -1139,7 +1160,8 @@ class AppState:
                             proxy=proxy,
                             # GitHub 新设备验证自动收码要用；指纹浏览器下每个账号都是
                             # 全新环境，这一关几乎必然触发。
-                            verify_link=acct.get('email_verify_link'))
+                            verify_link=acct.get('email_verify_link'),
+                            recharge_cfg=recharge_cfg)
                         with state_lock:
                             if result == "success":
                                 stats['paid'] += 1
@@ -1423,16 +1445,25 @@ class AppState:
                     self.add_log(f"{email} ✅ 订阅成功（卡 ****{last4}）")
                     return "subscribed", f"****{last4}"
                 elif oc == 'failed':
-                    # 曾成功过的有效卡（in valid_cards）本次被拒：不判无效，改打 24h 速率冷却，
-                    # 本轮跳过、到期恢复可用；从未成功过的卡才判无效。与 registration.py 一致。
-                    # 判据按平台算：卡在别的平台成功过不算数，那边的商户与风控都不同。
-                    if models['valid_card'].is_valid(platform, num):
-                        models['card_state'].set_cooldown(
-                            platform, num, hours=24, reason='曾成功卡本次支付失败，速率冷却')
-                        note = '曾成功有效卡，24h 冷却'
-                    else:
+                    # 判废口径必须与 registration.recharge_account 逐字一致：无条件冷却
+                    # + 连续失败计数 +1，达 max_fail_streak 才判无效。
+                    #
+                    # 两条流水线写的是**同一张** card_platform_state 表。这里若还按老口径
+                    # 「从未成功过的卡首拒即 invalid」，一张卡在订阅侧被拒一次就永久出局，
+                    # 充值侧那套「连续 3 次才判废」等于被静默绕过——用户配的阈值形同虚设，
+                    # 而且从充值日志里完全看不出卡是被谁判死的。
+                    # 直接取全局配置：max_fail_streak / fail_cooldown_hours 只在
+                    # config.yaml 里配，不像金额区间那样按次从 UI 覆盖。
+                    rc = cfg.recharge
+                    models['card_state'].set_cooldown(
+                        platform, num, hours=rc.fail_cooldown_hours, reason='订阅支付失败，冷却')
+                    streak = models['card_state'].bump_fail_streak(platform, num)
+                    if streak >= rc.fail_threshold():
                         models['card_pool'].mark_invalid_by_number(platform, num)
-                        note = '标 invalid'
+                        note = f'连续失败 {streak} 次，标 invalid'
+                    else:
+                        note = (f'连续失败 {streak}/{rc.fail_threshold()} 次，'
+                                f'冷却 {rc.fail_cooldown_hours}h')
                     models['recharge_log'].mark_failed(log_id, error=res.get('err', ''),
                                                        api_response={"result": res})
                     self.add_log(f"{email} 卡 ****{last4} 拒付，{note}，换下一张")

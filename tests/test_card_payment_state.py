@@ -68,3 +68,72 @@ def test_alias_names_share_the_platform_signature(db):
     st.set_tds(OC, NUM, hours=24)
     assert st.in_tds_cooldown(OC, NUM) is True
     assert st.in_tds_cooldown(OTHER, NUM) is False
+
+
+# ---------- 连续失败计数 ----------
+
+
+def test_fail_streak_starts_at_zero_without_a_row(db):
+    """没有记录 = 从没失败过 = 计数 0，不该报错也不该建行。"""
+    st = CardPaymentStateModel(db)
+    assert st.get_fail_streak(OC, NUM) == 0
+    assert st.get_state_map(OC) == {}
+
+
+def test_bump_fail_streak_increments_and_returns_new_value(db):
+    st = CardPaymentStateModel(db)
+    assert st.bump_fail_streak(OC, NUM) == 1
+    assert st.bump_fail_streak(OC, NUM) == 2
+    assert st.bump_fail_streak(OC, NUM) == 3
+    assert st.get_fail_streak(OC, NUM) == 3
+
+
+def test_reset_fail_streak_clears_the_count(db):
+    st = CardPaymentStateModel(db)
+    st.bump_fail_streak(OC, NUM)
+    st.bump_fail_streak(OC, NUM)
+
+    st.reset_fail_streak(OC, NUM)
+
+    assert st.get_fail_streak(OC, NUM) == 0
+    assert st.bump_fail_streak(OC, NUM) == 1, '清零后应从 1 重新数起'
+
+
+def test_fail_streak_is_isolated_per_platform(db):
+    """AC3：在一个平台失败 3 次，另一个平台的计数仍是 0。"""
+    st = CardPaymentStateModel(db)
+    for _ in range(3):
+        st.bump_fail_streak(OC, NUM)
+
+    assert st.get_fail_streak(OC, NUM) == 3
+    assert st.get_fail_streak(OTHER, NUM) == 0
+
+
+def test_cooldown_and_fail_streak_do_not_clobber_each_other(db):
+    """两者共用一行但语义独立：标冷却不清计数，清计数不解冷却。"""
+    st = CardPaymentStateModel(db)
+    st.bump_fail_streak(OC, NUM)
+    st.bump_fail_streak(OC, NUM)
+
+    st.set_cooldown(OC, NUM, hours=24, reason='充值失败')
+    assert st.get_fail_streak(OC, NUM) == 2, 'set_cooldown 不该清掉计数'
+
+    st.reset_fail_streak(OC, NUM)
+    assert st.in_cooldown(OC, NUM) is True, 'reset_fail_streak 不该解掉冷却'
+
+
+def test_state_map_carries_the_fail_streak(db):
+    st = CardPaymentStateModel(db)
+    st.bump_fail_streak(OC, NUM)
+    st.set_cooldown(OC, NUM, hours=24, reason='充值失败')
+
+    entry = st.get_state_map(OC)[NUM]
+    assert entry['fail_streak'] == 1
+    assert entry['in_cooldown'] is True
+
+
+def test_reset_does_not_create_a_row_for_an_untouched_card(db):
+    """从没失败过的卡不该因为一次成功就凭空多出一行全零噪声。"""
+    st = CardPaymentStateModel(db)
+    st.reset_fail_streak(OC, NUM)
+    assert st.get_state_map(OC) == {}

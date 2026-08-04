@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/multi-platform-guidelines.md", "reason": "新增的失败计数与冷却必须按 (card_number, platform) 隔离；本文定义什么按平台隔离、什么全局"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Step 1 要加 schema V17 迁移并新增 card_payment_state 列，迁移机制与 row-name 坑在这里"}
+{"file": ".trellis/spec/backend/concurrency-guidelines.md", "reason": "bump_fail_streak 的原子性、PaymentCardRegistry 排他、R3 让单账号连续占多张卡"}
+{"file": ".trellis/spec/api/index.md", "reason": "Step 5 要改 /api/daily/start 与 /api/accounts/recharge 的请求契约"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Step 6 要在 Workbench 侧栏加配置项并走 settings store 的 localStorage 模式"}

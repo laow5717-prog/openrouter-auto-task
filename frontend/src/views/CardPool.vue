@@ -122,9 +122,14 @@
               <span v-else-if="card.status === 'bound'" class="status-tag bound">已绑定</span>
               <span v-else-if="card.is_valid" class="status-tag success">有效</span>
               <span v-else class="status-tag">待验证</span>
-              <!-- 选卡规则状态：告知用户为何该卡暂不被选用 -->
-              <span v-if="card.tds_cooldown" class="status-tag" style="background:#fef3c7;color:#92400e;margin-left:4px">3DS临时冷却</span>
-              <span v-if="card.rate_cooldown" class="status-tag" style="background:#fef3c7;color:#92400e;margin-left:4px">24h达2次冷却</span>
+              <!-- 选卡规则状态：告知用户为何该卡暂不被选用，以及它离判废还有多远。
+                   两个标记的含义不同——冷却是暂时的（到期自动恢复），连续失败次数
+                   攒满才会真的把卡判废。 -->
+              <span v-if="card.tds_cooldown" class="status-tag" style="background:#fef3c7;color:#92400e;margin-left:4px"
+                    :title="card.tds_until ? `冷却至 ${card.tds_until}` : ''">冷却中</span>
+              <span v-if="card.fail_streak" class="status-tag" style="background:#fee2e2;color:#991b1b;margin-left:4px">
+                连续失败 {{ card.fail_streak }}/{{ card.max_fail_streak }}
+              </span>
             </td>
             <td>
               <button class="mini-btn danger" @click="deleteCard(card.id)">删除</button>
@@ -296,7 +301,7 @@
             </td>
             <td :style="{ color: c.recharge_today ? '#059669' : 'inherit' }">{{ c.recharge_today || 0 }}</td>
             <td>
-              <span class="status-tag" :class="(c.tds_cooldown || c.rate_cooldown) ? 'fail' : 'success'">
+              <span class="status-tag" :class="(c.tds_cooldown || c.fail_streak) ? 'fail' : 'success'">
                 {{ c.status_text || '可用' }}
               </span>
             </td>

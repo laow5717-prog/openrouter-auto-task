@@ -140,8 +140,8 @@ class AccountRegistry:
 class PaymentCardRegistry:
     """支付卡的运行时排他（in-flight 登记）。
 
-    为什么需要它：registration.py 的选卡资格闸门（一卡绑一账号 / 单卡 24h≤2 次 /
-    3DS 冷却）全部从 DB 实时派生，且 _eligible_cards 是**进入时一次性快照**。
+    为什么需要它：选卡资格闸门（可用状态 / 3DS 与失败冷却 / 连续失败判废）全部从 DB
+    实时派生，且 _eligible_cards 是**进入时一次性快照**。
     并发下两个 worker 会同时把同一张卡判为合格，各自拿去给不同账号支付，等 DB
     记录写下时违规已经发生——闸门形同虚设。
 

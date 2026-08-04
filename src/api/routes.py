@@ -8,7 +8,7 @@ import io
 import json
 from flask import Blueprint, jsonify, request, send_from_directory, send_file
 
-from src.config import cfg, get_data_dir
+from src.config import cfg, get_data_dir, RechargeConfig
 from src.services import card as card_service
 from src.services import registration
 from src.models.card_pool import CardPoolModel
@@ -444,6 +444,41 @@ def get_account_cards(email):
     return jsonify(cards)
 
 
+def _recharge_cfg_from(data):
+    """从请求体解析充值策略覆盖，返回 (RechargeConfig, err)。err 非空时应回 400。
+
+    校验放在这一层做一次、模型层不重复。**非法值返回 400 而不是静默夹紧**：
+    用户配的是 20-100、实际跑的却是别的，比直接报错难查得多。
+    只有越界（超出 RechargeConfig 的绝对边界）才夹紧——那是防呆，不是改语义。
+
+    三个字段都可缺省；全缺省时返回 cfg.recharge 本身（不复制，因为没改动）。
+    """
+    keys = ('amount_min', 'amount_max', 'balance_cap')
+    if not any(data.get(k) is not None for k in keys):
+        return cfg.recharge, ''
+
+    try:
+        amount_min = None if data.get('amount_min') is None else int(data['amount_min'])
+        amount_max = None if data.get('amount_max') is None else int(data['amount_max'])
+        balance_cap = None if data.get('balance_cap') is None else float(data['balance_cap'])
+    except (TypeError, ValueError):
+        return None, "充值金额与余额上限必须是数字"
+
+    # 只给一端时另一端沿用当前配置，否则「只改下界」会变成一个倒挂区间。
+    lo = amount_min if amount_min is not None else cfg.recharge.amount_min
+    hi = amount_max if amount_max is not None else cfg.recharge.amount_max
+    if lo > hi:
+        return None, f"充值金额区间非法：下界 ${lo} 大于上界 ${hi}"
+    if lo < RechargeConfig.AMOUNT_FLOOR or hi > RechargeConfig.AMOUNT_CEILING:
+        return None, (f"充值金额需在 ${RechargeConfig.AMOUNT_FLOOR}–"
+                      f"${RechargeConfig.AMOUNT_CEILING} 之间")
+    if balance_cap is not None and balance_cap <= 0:
+        return None, "账号余额上限必须大于 0"
+
+    return cfg.recharge.with_overrides(
+        amount_min=lo, amount_max=hi, balance_cap=balance_cap), ''
+
+
 @api.route('/api/accounts/recharge', methods=['POST'])
 def recharge_account():
     models = get_models()
@@ -461,6 +496,9 @@ def recharge_account():
     captcha_api_key = data.get('captcha_api_key')
     # 充值默认用 Multibot 解支付页 hCaptcha；可传 captcha_server='2captcha.com' 切回
     captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
+    recharge_cfg, cfg_err = _recharge_cfg_from(data)
+    if cfg_err:
+        return jsonify({"error": cfg_err}), 400
     if not email:
         return jsonify({"error": "未指定账号"}), 400
 
@@ -512,7 +550,8 @@ def recharge_account():
         try:
             state._recharge_one_account(email, login_password, payment_group_id,
                                         captcha_api_key=captcha_api_key,
-                                        captcha_server=captcha_server)
+                                        captcha_server=captcha_server,
+                                        recharge_cfg=recharge_cfg)
         except InterruptedError:
             state.add_log("充值已中断")
         except Exception as e:
@@ -828,14 +867,23 @@ def get_card_pool(group_id):
     cards, total = models['card_pool'].get_by_group(
         platform, group_id, page=page, page_size=page_size, bucket=bucket)
 
-    # 标记有效卡 + 选卡规则状态（供列表状态列展示 3DS临时/24h次数冷却）。
+    # 标记有效卡 + 选卡规则状态（供列表状态列展示冷却与连续失败次数）。
     # 全部按当前平台算——同一张卡在别的平台的冷却与绑定跟这个列表无关。
+    #
+    # 这里**不再**报「24h 内成功 ≥2 次」那个标记。它从来没有真正参与选卡
+    # （_eligible_cards 只看 card_state 的冷却），而现在同一张卡在一个账号的会话里
+    # 连着成功多笔本就是预期行为，把它显示成冷却会让整列好卡看起来都出了问题。
+    # 取而代之的是连续失败次数——那才是「这张卡快被判废了」的真信号。
+    state_map = models['card_state'].get_state_map(platform)
     recharge_counts = models['recharge_log'].count_success_by_last4(platform)
     for card in cards:
         num = card['card_number']
+        st = state_map.get(num) or {}
         card['is_valid'] = models['valid_card'].is_valid(platform, num)
-        card['tds_cooldown'] = models['card_state'].in_tds_cooldown(platform, num)
-        card['rate_cooldown'] = models['recharge_log'].success_count_since(platform, num, 24) >= 2
+        card['tds_cooldown'] = bool(st.get('in_cooldown'))
+        card['tds_until'] = st.get('tds_until')
+        card['fail_streak'] = st.get('fail_streak') or 0
+        card['max_fail_streak'] = cfg.recharge.fail_threshold()
         card['bound_email'] = models['valid_card'].get_bound_email(platform, num)
         _attach_recharge_counts(card, recharge_counts)
 
@@ -977,18 +1025,31 @@ _POOL_STATUS_ZH = {'': '在库(未验证)', 'paid': '有效(已支付)', 'invali
                    'expired': '已过期', 'bound': '已绑定'}
 
 
-def _valid_card_status(models, card, platform):
-    """给一张有效卡补充选卡状态：绑定账号、3DS临时冷却、24h次数冷却、汇总状态文案、池内分组/状态。
+def _valid_card_status(models, card, platform, state_map=None):
+    """给一张有效卡补充选卡状态：绑定账号、冷却、连续失败次数、汇总状态文案、池内分组/状态。
 
-    全部按 platform 算：冷却、池内状态在各平台各不相同。"""
+    全部按 platform 算：冷却、失败计数、池内状态在各平台各不相同。
+
+    与列表接口同口径：不再报「24h 内成功 ≥2 次」——它不参与选卡，而同一张卡连着
+    成功多笔现在是预期行为，标成冷却只会误导。
+
+    state_map: `card_state.get_state_map(platform)` 的结果。**调用方必须在循环外取一次
+    并传进来**——它是该平台的整表扫描，放在这里现取的话，导出接口（全量有效卡、可上千行）
+    会把它跑成 O(卡数²)。省略时退化为自取，只为单卡调用方便。"""
     num = card.get('card_number', '')
-    tds = models['card_state'].in_tds_cooldown(platform, num)
-    rate = models['recharge_log'].success_count_since(platform, num, 24) >= 2
+    if state_map is None:
+        state_map = models['card_state'].get_state_map(platform)
+    st = state_map.get(num) or {}
+    tds = bool(st.get('in_cooldown'))
+    streak = st.get('fail_streak') or 0
+    cap = cfg.recharge.fail_threshold()
     card['bound_email'] = card.get('source_email', '') if card.get('source_type') == 'payment' else ''
-    card['tds_cooldown'] = bool(tds)
-    card['rate_cooldown'] = bool(rate)
-    card['tds_until'] = models['card_state'].get_tds_until(platform, num)
-    card['status_text'] = '3DS临时冷却' if tds else ('24h达2次冷却' if rate else '可用')
+    card['tds_cooldown'] = tds
+    card['tds_until'] = st.get('tds_until')
+    card['fail_streak'] = streak
+    card['max_fail_streak'] = cap
+    card['status_text'] = ('冷却中' if tds
+                           else (f'连续失败 {streak}/{cap}' if streak else '可用'))
     # 池内位置：该有效卡当前在卡池哪个分组、什么状态（解释"为何不计入某分组的有效桶"）
     locs = models['card_pool'].get_locations_by_number(platform, num)
     if locs:
@@ -1013,8 +1074,9 @@ def get_valid_cards():
         source_type=source_type, keyword=keyword,
     )
     recharge_counts = models['recharge_log'].count_success_by_last4(platform)
+    state_map = models['card_state'].get_state_map(platform)
     for c in cards:
-        _valid_card_status(models, c, platform)
+        _valid_card_status(models, c, platform, state_map)
         _attach_recharge_counts(c, recharge_counts)
     summary = models['valid_card'].get_summary(platform)
     return jsonify({"data": cards, "total": total, "page": page, "page_size": page_size,
@@ -1046,8 +1108,9 @@ def export_valid_cards():
     ws.title = '有效卡'
     ws.append(headers)
     recharge_counts = models['recharge_log'].count_success_by_last4(platform)
+    state_map = models['card_state'].get_state_map(platform)
     for c in cards:
-        _valid_card_status(models, c, platform)
+        _valid_card_status(models, c, platform, state_map)
         _attach_recharge_counts(c, recharge_counts)
         email = c.get('source_email', '') or ''
         acct = acct_map.get(email, {})
@@ -1114,6 +1177,10 @@ def start_daily_pipeline():
     # 充值默认用 Multibot 解支付页 hCaptcha；可传 captcha_server='2captcha.com' 切回
     captcha_server = data.get('captcha_server') or 'api.multibot.cloud'
 
+    recharge_cfg, cfg_err = _recharge_cfg_from(data)
+    if cfg_err:
+        return jsonify({"error": cfg_err}), 400
+
     # 启动门：分组要有可选卡（排除无效/过期/冷却），且要有可充值账号。
     # 账号判据必须与 run_daily_pipeline._payable_now 用同一组常量——此前这里只排除
     # ('banned','archived') 而流水线排除四项，于是「启动时说有 N 个可充值账号，
@@ -1140,12 +1207,20 @@ def start_daily_pipeline():
     import threading
     threading.Thread(
         target=state.run_daily_pipeline,
-        args=(platform, group_id, login_password, captcha_api_key, captcha_server),
+        # ⚠️ 位置参数：run_daily_pipeline 的形参顺序一变，这里必须跟着改。
+        # 参数错位不会报错，只会把 captcha_server 当成 recharge_cfg 之类静默跑歪。
+        args=(platform, group_id, login_password, captcha_api_key, captcha_server,
+              recharge_cfg),
         daemon=True,
     ).start()
 
+    # 把实际生效的策略回给前端，让它能回显——用户配的和跑的是不是同一套，
+    # 应当一眼可见，而不是只能去翻日志。
     return jsonify({"status": "started", "usable_cards": eligible,
-                    "accounts": account_count, "group_name": group['name']})
+                    "accounts": account_count, "group_name": group['name'],
+                    "amount_min": recharge_cfg.amount_min,
+                    "amount_max": recharge_cfg.amount_max,
+                    "balance_cap": recharge_cfg.balance_cap})
 
 
 @api.route('/api/daily/subscribe/start', methods=['POST'])

@@ -296,7 +296,9 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
       - 3DS 挑战 Lightbox（iframe#challengeFrame，需持卡人在发卡行侧验证）出现且
         _THREEDS_CHALLENGE_GRACE_SEC 内未自动消失 → 点 Cancel 关弹窗后判 failed；
       - 直到超时挑战弹窗**仍未自动消失**（未解决）。
-    failed 由上层按「是否曾成功」判定消耗（好卡→24h 冷却，坏卡→invalid）。
+    failed 由上层统一消耗：无条件进冷却（默认 24h）+ 连续失败计数 +1，
+    计数达阈值（默认 3）才判 invalid；成功一次计数清零。好卡的豁免靠
+    mark_invalid_by_number 底层那道 valid_cards 守卫，不在这里也不在编排层判。
 
     其它：hCaptcha → 记录并继续等（人工点 Verify 后余额增长即 success），超时未完成 →
     needs_captcha（账号级风控）；都没有 → unknown。

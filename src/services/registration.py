@@ -55,8 +55,9 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      payment_registry=None, captcha_api_key=None,
                      captcha_server="api.multibot.cloud", proxy=None,
                      browser_factory=None, verify_link=None,
-                     platform='opencode', platform_account_model=None, adapter=None):
-    """登录目标平台并逐卡尝试付款充值。
+                     platform='opencode', platform_account_model=None, adapter=None,
+                     recharge_cfg=None):
+    """登录目标平台并逐卡尝试付款充值，**一个账号连续充多笔**直到充不动为止。
 
     **本函数是平台无关的编排骨架**：余额预检 → 逐卡试付 → 按 outcome 分派 → 卡状态与
     记账。平台特有的动作（怎么登录、余额在哪读、付款怎么点、结果怎么判）全部经
@@ -65,8 +66,31 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     编排：建浏览器会话（原生 Playwright 栈，hCaptcha token 注入仅在原生栈生效；与
     create_driver 复用同一 profile 目录，登录态不丢）→ 装 hCaptcha hook →
     adapter.ensure_session → 读实时余额，≥ adapter.recharge_skip_balance 则跳过充值并
-    归档 → 否则从 payment_cards 逐张 adapter.top_up，付成一张即返回。
-    沿途把明确拒付的卡标为 invalid、逐卡写 recharge_logs（成功/失败+原因）。
+    归档 → 否则从 payment_cards 逐张 adapter.top_up。
+
+    ## 一次成功后为什么不返回
+
+    早先的实现是「付成一张卡即 return」，一个账号一轮只充一笔。现在成功后继续用下一张
+    卡充，直到下列任一条件成立才收手换账号：
+
+      - 达到 adapter.max_card_attempts（试卡上限，防发卡行 velocity 风控）
+      - 余额达到 recharge_cfg.balance_cap（单账号余额上限）
+      - 遇 needs_captcha（账号级拦截，立即停手）
+      - payment_cards 用尽
+      - 用户停止
+
+    注意**不能**拿 adapter.recharge_skip_balance 当循环上限：那是登录时的归档预检阈值
+    （两平台都是 20），第一笔充完余额必然超过它，循环会立刻停——「成功后继续充」直接失效。
+
+    ## 卡的判废与冷却
+
+    每次明确拒付：无条件进 recharge_cfg.fail_cooldown_hours 冷却 + 连续失败计数 +1；
+    计数达到 recharge_cfg.fail_threshold() 才判 invalid。成功一次即计数清零，且成功的卡
+    **不冷却**（否则同账号连充无从谈起）。好卡的豁免不再靠这里查 last_success_at，而是
+    靠 mark_invalid_by_number 底层那道 valid_cards 守卫——它本就是所有「标无效」入口的
+    最终收口，现在成了唯一收口。
+
+    逐卡写 recharge_logs（成功/失败+原因+该笔实际金额）。
 
     captcha_api_key: 传入则 init_solver(key, server=captcha_server) 并装 hook 自动解 hCaptcha；
                      不传则退化为旧行为（检测到 hCaptcha 提示人工、超时 needs_captcha）。
@@ -79,6 +103,9 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                      都是全新环境，新设备验证几乎必然触发，缺它会让流水线停下来等人。
 
     adapter:         PlatformAdapter；省略时按 platform 从注册表解析。
+    recharge_cfg:    RechargeConfig（金额区间 / 余额上限 / 判废阈值 / 冷却时长）。
+                     省略时用 cfg.recharge。UI 传来的覆盖值由 API 层构造成新实例，
+                     绝不原地改全局单例——两个平台并发时那会互相覆盖。
     platform / platform_account_model: 目标平台 slug 与平台账号模型。归档、充值成功、
                      余额落库都写到 platform_accounts 的 (platform, email) 那一行，
                      所以同一邮箱在别的平台的进度不受影响。GitHub 被 flag 是例外——
@@ -89,18 +116,23 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                "flagged"(GitHub 账号被 flag 无法授权 OAuth，已标身份层 flagged)}。
 
     卡消耗与逐卡记账集中在本函数：成功→card_pool 标 paid + valid_card + recharge_logs
-    success；明确拒付→card_pool 标 invalid + recharge_logs failed（带原因）。调用方无需
-    再预建占位 log。payment_registry 传入时对每张卡做 in-flight 排他（并发安全网）。
+    success；连续拒付达阈值→card_pool 标 invalid + recharge_logs failed（带原因）。
+    调用方无需再预建占位 log。payment_registry 传入时对每张卡做 in-flight 排他
+    （并发安全网）。成功笔数可由调用方从 responses 里数 ok=True 的条目得到。
     """
     from src.browser.driver import create_driver_vanilla, close_driver
     from src.services import captcha as captcha_solver
+    from src.config import cfg
     import src.platforms as platforms
     from src.platforms.base import Credentials
 
     if adapter is None:
         adapter = platforms.get(platform)
+    if recharge_cfg is None:
+        recharge_cfg = cfg.recharge
 
     # 余额跳过阈值（美元）：登录后实时余额 ≥ 此值即跳过充值并归档账号。各平台不同。
+    # 注意这**只在登录后判一次**，不参与下面的连充循环——它是归档预检，不是循环上限。
     skip_balance = adapter.recharge_skip_balance
 
     responses = []
@@ -125,12 +157,16 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
         except Exception:
             pass
 
-    def _log_card_attempt(card, ok, reason, result):
-        """逐卡写一条 recharge_logs（成功/失败）。记账集中于此，避免上层重复。"""
+    def _log_card_attempt(card, ok, reason, result, amount):
+        """逐卡写一条 recharge_logs（成功/失败），amount 是**这一笔的实际金额**。
+
+        此前这里写死 20，于是金额随机化后账面全是 20、对不上真实扣款。
+        """
         if not recharge_log_model:
             return
         try:
-            log_id = recharge_log_model.create(platform, email, card.get("number", ""), amount=20)
+            log_id = recharge_log_model.create(platform, email, card.get("number", ""),
+                                               amount=amount)
             if ok:
                 recharge_log_model.mark_success(log_id, api_response={"result": result})
             else:
@@ -143,8 +179,8 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     if not payment_cards:
         return (False, "无可用支付卡（card_pool 为空或该分组无可用卡）", responses, "", "failed")
 
-    # 过滤掉处于临时冷却期的卡（3DS 或「曾成功卡本次被拒」的速率冷却）。上层选卡通常已预过滤，
-    # 这里是安全网。
+    # 过滤掉处于临时冷却期的卡（3DS，或上一次充值被拒后的 fail_cooldown_hours 冷却）。
+    # 上层选卡通常已预过滤，这里是安全网——「同一张卡两次使用间隔 ≥24h」最终靠它兜住。
     cards = payment_cards
     if card_state_model:
         try:
@@ -222,12 +258,24 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
         errs = []
         attempts = 0
+        # ── 连充状态 ──
+        # paid_count    本次会话成功的笔数。非零即返回 topup，哪怕后面被风控打断。
+        # session_topped 本次会话累计充了多少钱。它是 balance_cap 的**兜底判据**：
+        #               PaymentResult.balance_after 是 Optional，适配器读不到就是 None
+        #               （infron 很常见），只看余额的话循环会一直跑到 max_attempts。
+        # stop_note     跳出原因，写进返回的 err 供上层记日志。
+        paid_count = 0
+        session_topped = 0.0
+        last_paid4 = ''
+        stop_note = ''
+        stop_err = ''      # 非空时作为「一笔都没成」情况下返回的 err，覆盖 errs 汇总
         for idx, card in enumerate(cards):
             if should_stop and should_stop():
                 raise InterruptedError("用户请求停止")
             if attempts >= max_attempts:
                 errs.append(f"已达单次最多尝试 {max_attempts} 张卡上限，"
                             f"停止以避免触发风控（剩余 {len(cards) - idx} 张未试）")
+                stop_note = errs[-1]
                 if monitor_callback:
                     monitor_callback(session, errs[-1])
                 break
@@ -241,15 +289,16 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                 card_last4 = str(num)[-4:]
                 last4 = card_last4
 
-                pay = adapter.top_up(session, wid, card,
+                amount = recharge_cfg.pick_amount()
+                pay = adapter.top_up(session, wid, card, amount=amount,
                                      monitor=monitor_callback, should_stop=should_stop)
                 result = vars(pay)
-                responses.append({"card_last4": card_last4, **result})
+                responses.append({"card_last4": card_last4, "amount": amount, **result})
 
                 if pay.ok:
-                    # 支付成功：标 paid + 记有效卡 + 账号状态 + 逐卡记账。
+                    # 支付成功：标 paid + 记有效卡 + 账号状态 + 清失败计数 + 逐卡记账。
                     # 注意：paid 卡「不」永久消耗——paid 不在 NOT_SELECTABLE 内，后续仍可复选
-                    # 复用；仅当这张曾成功的卡再次被拒时才进入 24h 速率冷却（见下方 else 分支）。
+                    # 复用；成功的卡也**不进冷却**，否则同一账号连充下去就无卡可用了。
                     if card_pool_model:
                         try:
                             card_pool_model.mark_status_by_number(platform, num, "paid")
@@ -259,6 +308,12 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                         try:
                             valid_card_model.record(platform, card, source_type="payment",
                                                     source_email=email)
+                        except Exception:
+                            pass
+                    if card_state_model:
+                        # 「连续」失败才判废，成功一次就把之前攒的次数抹掉。
+                        try:
+                            card_state_model.reset_fail_streak(platform, num)
                         except Exception:
                             pass
                     if platform_account_model:
@@ -272,9 +327,49 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                             platform_account_model.update_tenant_id(platform, email, wid)
                         except Exception:
                             pass
-                    _grab_apikey(session, wid)
-                    _log_card_attempt(card, True, "", result)
-                    return (True, "", responses, card_last4, "topup")
+                    _log_card_attempt(card, True, "", result, amount)
+                    paid_count += 1
+                    session_topped += amount
+                    last_paid4 = card_last4
+
+                    # 余额上限：达到就换账号。两条判据**取或**，先判余额后判累计额：
+                    #
+                    #   balance_after >= cap   适配器报得出实时余额时的正解
+                    #   session_topped >= cap  本次会话已投入的钱，兜底
+                    #
+                    # 两条都要，不能只留第一条。balance_after 是 Optional，infron 这类
+                    # 读不到余额的平台永远是 None；更隐蔽的是「报得出但报得不对」——
+                    # 只要有个适配器把 success 判成功却回了个陈旧或零的余额，第一条判据
+                    # 就永远不成立，循环会一路刷到 max_attempts，单个账号能吃掉
+                    # 8 × $100 = $800。加上第二条之后 balance_cap 才是**硬**上限，
+                    # 不依赖任何适配器把余额读对。
+                    #
+                    # 余额低于上限但累计额超了，也该停：那说明账号在一边充一边烧
+                    # credits，余额永远追不上上限，但我们的投入是实打实的。
+                    #
+                    # 判定结果先落在**本轮局部变量**上再赋给 stop_note：直接判
+                    # `if stop_note` 的话，将来只要有人在循环里加一处不 break 的
+                    # stop_note 赋值，之后每一笔成功都会被误判成「已达上限」。
+                    cap = recharge_cfg.balance_cap
+                    bal = result.get("balance_after")
+                    cap_note = ''
+                    if bal is not None and bal >= cap:
+                        cap_note = f"余额 ${bal} 已达单账号上限 ${cap}"
+                    elif session_topped >= cap:
+                        cap_note = (f"本次已累计充值 ${session_topped:.0f}，"
+                                    f"达单账号上限 ${cap}")
+                    if cap_note:
+                        stop_note = cap_note
+                        if monitor_callback:
+                            monitor_callback(session, f"{cap_note}，换下一个账号")
+                        break
+
+                    if monitor_callback:
+                        monitor_callback(
+                            session,
+                            f"卡{card_last4} 充值 ${amount} 成功（本次第 {paid_count} 笔），"
+                            f"继续用本账号充下一张（{idx+1}/{len(cards)}）")
+                    continue
 
                 outcome = result.get("outcome")
                 reason = f"卡{card_last4}: {outcome} - {result.get('err','')}"
@@ -283,10 +378,13 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                 if outcome == "needs_captcha":
                     # hCaptcha 是账号/风控级拦截，换卡无用且会持续触发风控——立即停手。
                     # 不标卡无效、不写卡消耗日志，保留其余卡交人工过验证码后重试。
+                    # 已成功的笔数照常算数，所以这里是 break 而不是 return——出口处
+                    # 按 paid_count 决定返回 topup 还是 failed。
                     if monitor_callback:
                         monitor_callback(session, f"{reason}；需人工过 hCaptcha，停止换卡")
-                    return (False, "hCaptcha 人机验证拦截，需人工完成后重试：" + reason,
-                            responses, card_last4, "failed")
+                    stop_note = "遇 hCaptcha 拦截，停止换卡"
+                    stop_err = "hCaptcha 人机验证拦截，需人工完成后重试：" + reason
+                    break
                 elif outcome == "error":
                     # 页面/基础设施故障（未找到入口/选卡失败/填卡失败/点 Pay 失败），非卡问题：
                     # 不判无效、不冷却、不记账、不消耗——留着这张卡下次重试，避免因页面故障误烧卡。
@@ -294,34 +392,44 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                         monitor_callback(session, f"{reason}；页面/基础设施异常，跳过不消耗此卡")
                 elif outcome == "unknown":
                     # 已点 Pay 提交，但超时内未确认到账，也无明确拒付/3DS/captcha 信号。不确定
-                    # 是否卡的问题，保守处理：记一条失败日志留痕，但不改卡状态、不消耗，留待重试。
-                    _log_card_attempt(card, False, reason, result)
+                    # 是否卡的问题，保守处理：记一条失败日志留痕，但不改卡状态、不消耗、
+                    # 也不计入连续失败次数，留待重试。
+                    _log_card_attempt(card, False, reason, result, amount)
                 else:
-                    # failed（明确拒付 / 3DS 交互挑战 / 3DS 认证失败）：按用户规则——
-                    #   曾成功过的卡 → 24h 速率冷却，不判无效（可复用）；
-                    #   从未成功过的卡 → 判无效（坏卡，永久剔除）。
-                    # 「曾成功过」按**本平台**算：在别的平台成功过不能豁免这里的判废，
-                    # 否则跨平台复用的坏卡在新平台永远只进冷却、每轮被重选，白耗额度。
-                    prior_success = False
-                    if recharge_log_model:
+                    # failed（明确拒付 / 3DS 交互挑战 / 3DS 认证失败）：
+                    #   1. 无条件进冷却——同一张卡两次使用之间至少隔 fail_cooldown_hours，
+                    #      免得在发卡行那里连着撞 velocity 风控；
+                    #   2. 连续失败计数 +1，达到 max_fail_streak 才判废。
+                    #
+                    # 此前这里按「本平台是否成功过」分岔成「冷却 or 判废」。那个分岔已删除：
+                    # 冷却对所有失败一视同仁，判废只看计数。好卡的豁免不靠这里查
+                    # last_success_at，而是靠 mark_invalid_by_number 底层那道 valid_cards
+                    # 守卫——它本就是所有「标无效」入口的最终收口，现在成了唯一收口。
+                    streak = 0
+                    if card_state_model:
                         try:
-                            prior_success = recharge_log_model.last_success_at(platform, num) is not None
+                            card_state_model.set_cooldown(
+                                platform, num, hours=recharge_cfg.fail_cooldown_hours,
+                                reason="充值失败，冷却")
+                            streak = card_state_model.bump_fail_streak(platform, num)
                         except Exception:
-                            prior_success = False
-                    if prior_success:
-                        if card_state_model:
+                            streak = 0
+                    if streak >= recharge_cfg.fail_threshold():
+                        if card_pool_model:
                             try:
-                                card_state_model.set_cooldown(
-                                    platform, num, hours=24,
-                                    reason="曾成功卡本次支付失败，速率冷却")
+                                card_pool_model.mark_invalid_by_number(platform, num)
                             except Exception:
                                 pass
-                    elif card_pool_model:
-                        try:
-                            card_pool_model.mark_invalid_by_number(platform, num)
-                        except Exception:
-                            pass
-                    _log_card_attempt(card, False, reason, result)
+                        if monitor_callback:
+                            monitor_callback(
+                                session,
+                                f"卡{card_last4} 已连续失败 {streak} 次，判为无效")
+                    elif monitor_callback and streak:
+                        monitor_callback(
+                            session,
+                            f"卡{card_last4} 连续失败 {streak}/{recharge_cfg.fail_threshold()} 次，"
+                            f"冷却 {recharge_cfg.fail_cooldown_hours}h 后再试")
+                    _log_card_attempt(card, False, reason, result, amount)
 
                 if monitor_callback:
                     monitor_callback(session, f"{reason}；尝试下一张卡（{idx+1}/{len(cards)}）")
@@ -329,6 +437,19 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                 if payment_registry is not None:
                     payment_registry.release(num)
 
+        # ── 单一出口 ──
+        # 只要成功过一笔就算 topup，哪怕循环最后是被 hCaptcha 或试卡上限打断的。
+        # _grab_apikey 放在这里而不是每笔成功后调：单账号连充 5 笔的话，放在循环里
+        # 会白白多导航 4 次页面。
+        if paid_count:
+            _grab_apikey(session, wid)
+            note = stop_note or "可选卡已试完"
+            summary = f"本次成功充值 {paid_count} 笔、合计 ${session_topped:.0f}（{note}）"
+            if monitor_callback:
+                monitor_callback(session, summary)
+            return (True, summary, responses, last_paid4 or last4, "topup")
+        if stop_err:
+            return (False, stop_err, responses, last4, "failed")
         return (False, "所有支付卡均未成功：" + " | ".join(errs), responses, last4, "failed")
 
     except InterruptedError:

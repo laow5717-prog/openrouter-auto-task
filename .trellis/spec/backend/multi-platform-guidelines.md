@@ -51,12 +51,39 @@ Per-platform tuning lives on the adapter as plain attributes, not in environment
 variables: `max_card_attempts`, `recharge_skip_balance`, `default_topup_amount`.
 Risk thresholds genuinely differ between sites.
 
+**Adapter attributes vs `cfg.recharge`** — two different kinds of knob, and
+mixing them up breaks things quietly:
+
+| Knob | Lives on | Because |
+|---|---|---|
+| `max_card_attempts`, `recharge_skip_balance` | the adapter | The *site's* risk tolerance. opencode allows 8 cards per session, infron 5 |
+| `amount_min/max`, `balance_cap`, `max_fail_streak`, `fail_cooldown_hours` | `cfg.recharge` (`RechargeConfig`) | *Our* policy. Identical across sites; the operator tunes it from the UI |
+
+`recharge_skip_balance` is specifically **not** a ceiling for the top-up loop.
+It is the archive pre-check read once right after login: balance already high
+enough, skip this account entirely. Both platforms set it to 20, so using it as
+the loop ceiling would stop after the first $20–100 charge and silently undo the
+"keep charging the same account" behaviour. That is what `balance_cap` is for.
+
+`balance_cap` is enforced against **both** `PaymentResult.balance_after` *and*
+the running session total, whichever trips first. That second condition is what
+keeps it a hard ceiling: `balance_after` is `Optional`, and an adapter that
+reports `success` while returning a stale or zero balance would otherwise charge
+all the way to `max_card_attempts`. Do not "simplify" it back into a
+None-fallback — it exists precisely so a new adapter cannot blow the cap by
+getting its balance read wrong.
+
+`default_topup_amount` is now only a fallback. The orchestration layer passes an
+explicit `amount=` on every `top_up` call (drawn per-charge from
+`cfg.recharge`), so an adapter that ignores the argument will charge the wrong
+amount and the logs will not show it.
+
 ## `PaymentResult.outcome` — a hard contract
 
 | outcome | Card consumed? | Meaning |
 |---|---|---|
 | `success` | yes (marked `paid`) | Payment went through |
-| `failed` | yes | Explicit decline → invalidate if never succeeded **on this platform**, else 24h cooldown |
+| `failed` | yes | Explicit decline → always cool down (`fail_cooldown_hours`) and increment the per-platform consecutive-failure count; invalidate only once that count reaches `max_fail_streak` |
 | `needs_captcha` | **no** | Account-level risk block. Stop immediately, do not try more cards |
 | `error` | **no** | Page/infrastructure failure *before* payment |
 | `unknown` | **no** | Submitted, no confirmation, no clear signal |

@@ -374,6 +374,20 @@ CREATE INDEX IF NOT EXISTS idx_rl_platform_card ON recharge_logs(platform, card_
 CREATE INDEX IF NOT EXISTS idx_cb_platform_status ON card_bindings(platform, status);
 """
 
+# 连续失败计数：一张卡在某平台连续失败 N 次才判废（此前是首次被拒即永久 invalid）。
+#
+# 挂在 card_payment_state 而不是 card_pool，理由是主键已经就是 (card_number, platform)
+# ——正是这个计数要求的隔离粒度。card_pool.status 只装平台无关的 expired，放不下。
+#
+# 不从 recharge_logs 派生的理由：那张表里 outcome='unknown' 也会写 status='failed'
+# 的一行，而 unknown 按硬约束是「不消耗卡」的，派生就得在 SQL 里去 api_response 的
+# JSON 里翻是哪种 failed。显式计数列让判定留在编排层，SQL 保持诚实。
+_SCHEMA_V17 = """
+ALTER TABLE card_payment_state ADD COLUMN fail_streak INTEGER DEFAULT 0;
+
+ALTER TABLE card_payment_state ADD COLUMN last_fail_at TEXT;
+"""
+
 _ADD_COLUMN_RE = re.compile(r'^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)', re.I)
 
 _MIGRATIONS = {
@@ -393,6 +407,7 @@ _MIGRATIONS = {
     14: _SCHEMA_V14,
     15: _SCHEMA_V15,
     16: _SCHEMA_V16,
+    17: _SCHEMA_V17,
 }
 
 
