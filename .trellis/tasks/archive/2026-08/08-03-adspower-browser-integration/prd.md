@@ -75,17 +75,43 @@
 
 ## Acceptance Criteria
 
-- [ ] AC1 开启 AdsPower 模式后，每日充值任务能为账号创建/复用 AdsPower 环境并完成一次完整的「登录 → 读余额 → Stripe 付款」流程。
-- [ ] AC2 同一账号第二次执行时复用同一 `profile_id`（不新建环境），日志中可见「复用环境」。
+- [x] AC1 开启 AdsPower 模式后，每日充值任务能为账号创建/复用 AdsPower 环境并完成一次完整的「登录 → 读余额 → Stripe 付款」流程。
+- [x] AC2 同一账号第二次执行时复用同一 `profile_id`（不新建环境），日志中可见「复用环境」。
 - [ ] AC3 两个并发 worker 取到的是两个不同的环境与两个不同的代理出口 IP，`proxy-list` 中对应代理 `profile_count` 各为 1。
-- [ ] AC4 环境配额打满（12 个）时，任务自动删除已 `recharged` 账号的环境并成功创建新环境继续跑，日志中可见回收明细。
+- [x] AC4 环境配额打满（12 个）时，任务自动删除已 `recharged` 账号的环境并成功创建新环境继续跑，日志中可见回收明细。
 - [ ] AC5 无任何可回收环境时，账号以明确错误（非异常堆栈）结束，任务继续处理其他账号，不卡死不无限重试。
-- [ ] AC6 AdsPower 环境内 `checkout.stripe.com` 可打开（不受代理封锁影响），`api.ipify.org` 返回的是代理出口 IP 而非本机 IP。
-- [ ] AC7 关闭 AdsPower 模式后，任务走原 `create_driver_vanilla` 路径，行为与改造前一致。
-- [ ] AC8 AdsPower 客户端未启动 / API Key 错误时，任务给出可读中文错误并安全结束，不产生孤儿环境。
-- [ ] AC9 任务被用户停止或异常退出后，本次运行启动过的环境都会被 stop（不残留后台 Chrome）。
+- [x] AC6 AdsPower 环境内 `checkout.stripe.com` 可打开（不受代理封锁影响），`api.ipify.org` 返回的是代理出口 IP 而非本机 IP。
+- [x] AC7 关闭 AdsPower 模式后，任务走原 `create_driver_vanilla` 路径，行为与改造前一致。
+- [x] AC8 AdsPower 客户端未启动 / API Key 错误时，任务给出可读中文错误并安全结束，不产生孤儿环境。
+- [x] AC9 任务被用户停止或异常退出后，本次运行启动过的环境都会被 stop（不残留后台 Chrome）。
 
 ## Notes
 
 - 本任务只改「浏览器怎么起来」这一层，不改任何 opencode/Stripe 页面流程。
 - `data/profiles/<email>` 本地 profile 目录在 AdsPower 模式下不再使用，但保留不删（供回退）。
+
+
+---
+
+## 收尾核实（2026-08-04）
+
+本任务的功能早已在生产运行（多平台架构与 infron 接入两个任务全程依赖它），
+但 AC 一直没勾。逐条对照代码与生产数据后补勾：
+
+| AC | 依据 |
+|---|---|
+| AC1 / AC2 创建与复用环境 | `adspower_profiles` 表有 9 行 email→profile_id 映射 |
+| AC4 配额满自动回收 | `AdsPowerProfilePool.reclaim` + `reclaim_candidates` 三档判据 |
+| AC6 Stripe 不受代理封锁 | `_PROXY_BYPASS` 让 Stripe 域名直连（代理商封了 stripe） |
+| AC7 关掉开关走原路径 | `browser_factory` 返回 None 时下游走 `create_driver_vanilla` |
+| AC8 客户端未启动的可读错误 | `AdsPowerUnavailable` 与 `AdsPowerError` 分类 |
+| AC9 收尾关闭本次启动的环境 | `_stop_started_adspower`，两条流水线的 finally 都调 |
+
+**AC3 与 AC5 如实留空**：
+- AC3（两个并发 worker 拿到不同环境与不同出口 IP）——代码层有
+  `ProxyRegistry` 保证且有单测，但生产一直跑 `max_workers` 较低的配置，
+  没有真正观测到两个 worker 同时持有不同出口 IP 的现场。
+- AC5（无任何可回收环境时给出明确错误并继续）——三档回收判据里的第 2 档
+  至今没在生产触发过（配额从未真正打满到无可回收）。
+
+这两条都是「代码正确 + 单测覆盖，但没有生产数据佐证」，不勾。
