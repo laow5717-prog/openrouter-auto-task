@@ -31,6 +31,20 @@ _TURNSTILE_TITLE = 'just a moment'
 _TURNSTILE_BODY_HINTS = ('performing security verification',
                          'verifies you are not a bot')
 
+# Turnstile 挂件所在的 iframe。**它的内容读不进主文档的 innerText**——
+# 所以只看 document.body 永远发现不了「需要手动打勾」这个状态，
+# 表现是干等到超时，看起来像「AdsPower 这次没过」。
+_TURNSTILE_FRAME_MARK = 'challenges.cloudflare.com'
+
+# 交互式挑战的文案。Turnstile 有两种形态：被动（自己转几秒就过）与交互
+# （渲染一个复选框等人点）。只有后者需要我们动手。
+_TURNSTILE_CLICK_HINTS = ('verify you are human', 'verifying you are human',
+                          'confirm you are human', 'i am human',
+                          '确认您是真人', '确认你是真人')
+
+# 两次点击之间的最短间隔。Turnstile 点完要几秒才出结果，连点既没用又像机器人。
+_TURNSTILE_CLICK_GAP_SEC = 8
+
 _PAGE_JS = """
 () => {
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -60,6 +74,73 @@ def _is_turnstile(page):
     return any(h in body for h in _TURNSTILE_BODY_HINTS)
 
 
+def _turnstile_frame(session):
+    """找 Turnstile 挂件的 frame。没有返回 None。"""
+    try:
+        for fr in session.page.frames:
+            if _TURNSTILE_FRAME_MARK in (fr.url or ''):
+                return fr
+    except Exception:
+        pass
+    return None
+
+
+def _needs_click(fr):
+    """这个 Turnstile 是**交互式**的吗（渲染了复选框等人点）。
+
+    被动形态自己转几秒就过，不该去点——多点一下反而可能重置挑战。
+    """
+    try:
+        text = (fr.inner_text('body', timeout=2000) or '').lower()
+    except Exception:
+        return False
+    return any(h in text for h in _TURNSTILE_CLICK_HINTS)
+
+
+def click_turnstile_checkbox(session, monitor=None):
+    """点一下 Turnstile 的「Verify you are human」复选框。点到了返回 True。
+
+    两条路径，按可靠性排序：
+
+    1. 在挂件 frame 内直接定位复选框。多数情况可行。
+    2. **按坐标点**。Turnstile 有时把复选框放进 closed shadow DOM，
+       选择器穿不透（Playwright 只能穿 open shadow DOM）。这时只能拿到 iframe
+       元素的包围盒，往左侧偏一点点——复选框固定在挂件左端约 30px 处。
+
+    坐标兜底看着糙，但这是 closed shadow DOM 下唯一能用的办法，
+    没有它交互式挑战就完全无解。
+    """
+    fr = _turnstile_frame(session)
+    if fr is None or not _needs_click(fr):
+        return False
+
+    # 路径 1：frame 内直接点
+    for sel in ("input[type='checkbox']", "#challenge-stage input",
+                "label[for]", ".cb-lb input", "#checkbox"):
+        try:
+            loc = fr.locator(sel).first
+            if loc.count() > 0:
+                loc.click(timeout=3000)
+                _step(monitor, session, '已勾选 Turnstile「确认是真人」')
+                return True
+        except Exception:
+            continue
+
+    # 路径 2：按 iframe 的包围盒坐标点（closed shadow DOM 下的唯一出路）
+    try:
+        holder = session.page.locator(
+            f"iframe[src*='{_TURNSTILE_FRAME_MARK}']").first
+        box = holder.bounding_box(timeout=3000)
+        if box and box['width'] > 0:
+            session.page.mouse.click(box['x'] + 30, box['y'] + box['height'] / 2)
+            _step(monitor, session, '已按坐标点击 Turnstile 复选框')
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 def wait_past_turnstile(session, monitor=None, timeout=90):
     """等 Cloudflare 质询页放行。放行返回页面快照，超时返回 None。
 
@@ -69,9 +150,15 @@ def wait_past_turnstile(session, monitor=None, timeout=90):
     "Just a moment..."）看起来像网络问题，能查很久。
 
     实测 AdsPower 下约 30 秒自动放行，故默认给到 90 秒。
+
+    ⚠️ Turnstile 有两种形态：**被动**（自己转几秒就过）与**交互**（渲染一个
+    「Verify you are human」复选框等人点）。后者不点就永远不会过——而它的文案在
+    iframe 里，主文档的 innerText 读不到，所以只等不点的表现是干等到超时，
+    看起来像「AdsPower 这次没过」，极容易误判成环境问题。循环里会检测并自动勾选。
     """
     deadline = time.time() + timeout
     notified = False
+    last_click = 0.0
     while time.time() < deadline:
         page = _read(session)
         if page and not _is_turnstile(page) and page['interactive'] > 0:
@@ -79,6 +166,16 @@ def wait_past_turnstile(session, monitor=None, timeout=90):
         if not notified:
             _step(monitor, session, '等待 Cloudflare 验证页放行')
             notified = True
+
+        # 交互式挑战：自动勾选。限流是必要的——Turnstile 点完要几秒才出结果，
+        # 连点既没用，又是明显的机器人特征。
+        if time.time() - last_click >= _TURNSTILE_CLICK_GAP_SEC:
+            try:
+                if click_turnstile_checkbox(session, monitor):
+                    last_click = time.time()
+            except Exception:
+                pass      # 点不到就继续等被动放行，不能让它把整个登录搞挂
+
         time.sleep(3)
     return None
 

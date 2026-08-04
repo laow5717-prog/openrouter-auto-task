@@ -455,3 +455,126 @@ def test_threeds_failure_modal_returns_a_tuple_not_a_frame():
     # 这才是正确的判空方式
     fr, _msg = got
     assert fr is None
+
+
+# ---------- Turnstile 交互式挑战 ----------
+
+class _Frame:
+    def __init__(self, url, text='', boxes=None):
+        self.url = url
+        self._text = text
+        self._boxes = boxes or {}
+        self.clicked = []
+
+    def inner_text(self, _sel, timeout=None):
+        return self._text
+
+    def locator(self, sel):
+        frame = self
+
+        class _Loc:
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return frame._boxes.get(sel, 0)
+
+            def click(self, timeout=None):
+                if not frame._boxes.get(sel):
+                    raise RuntimeError('元素不存在')
+                frame.clicked.append(sel)
+
+        return _Loc()
+
+
+class _TSSession:
+    """带 Turnstile frame 的假会话。"""
+
+    def __init__(self, frames, box=None):
+        self._frames = frames
+        self._box = box
+        self.mouse_clicks = []
+        outer = self
+
+        class _Mouse:
+            def click(self, x, y):
+                outer.mouse_clicks.append((x, y))
+
+        class _Page:
+            frames = self._frames
+            mouse = _Mouse()
+
+            def locator(self, _sel):
+                class _L:
+                    @property
+                    def first(self_inner):
+                        return self_inner
+
+                    def bounding_box(self_inner, timeout=None):
+                        return outer._box
+                return _L()
+
+        self.page = _Page()
+
+    def capture_frame(self):
+        pass
+
+
+TS_URL = 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2'
+
+
+def test_interactive_turnstile_gets_clicked():
+    """「Verify you are human」是交互式挑战，不点就永远不会过。"""
+    fr = _Frame(TS_URL, 'Verify you are human',
+                boxes={"input[type='checkbox']": 1})
+    assert il.click_turnstile_checkbox(_TSSession([fr])) is True
+    assert fr.clicked == ["input[type='checkbox']"]
+
+
+def test_passive_turnstile_is_left_alone():
+    """被动形态自己转几秒就过，**不该去点**——多点一下可能反而重置挑战。
+
+    这是本组测试里最重要的一条：加了自动点击之后，最容易犯的错就是
+    见到 Turnstile frame 就点。
+    """
+    fr = _Frame(TS_URL, 'Verifying...', boxes={"input[type='checkbox']": 1})
+    assert il.click_turnstile_checkbox(_TSSession([fr])) is False
+    assert fr.clicked == [], '被动挑战被误点了'
+
+
+def test_no_turnstile_frame_is_a_noop():
+    fr = _Frame('https://infron.ai/login', 'Verify you are human')
+    assert il.click_turnstile_checkbox(_TSSession([fr])) is False
+
+
+def test_falls_back_to_clicking_by_coordinates():
+    """Turnstile 有时把复选框放进 **closed** shadow DOM，选择器穿不透
+    （Playwright 只能穿 open shadow DOM）。这时只能按 iframe 包围盒的坐标点。
+
+    坐标兜底看着糙，但没有它交互式挑战就完全无解。
+    """
+    fr = _Frame(TS_URL, 'Verify you are human', boxes={})   # 所有选择器都找不到
+    sess = _TSSession([fr], box={'x': 100, 'y': 200, 'width': 300, 'height': 65})
+
+    assert il.click_turnstile_checkbox(sess) is True
+    assert len(sess.mouse_clicks) == 1
+    x, y = sess.mouse_clicks[0]
+    assert x == 130, '复选框固定在挂件左端约 30px 处'
+    assert y == 232.5, '应点在垂直中线上'
+
+
+def test_wait_loop_throttles_clicking():
+    """点击必须限流：Turnstile 点完要几秒才出结果，连点既没用又像机器人。"""
+    import inspect
+    src = inspect.getsource(il.wait_past_turnstile)
+    assert '_TURNSTILE_CLICK_GAP_SEC' in src, '等待循环里没有点击间隔限制'
+    assert 'click_turnstile_checkbox' in src, '等待循环没有接入自动勾选'
+
+
+def test_click_failure_does_not_break_the_wait():
+    """点不到就继续等被动放行，不能让它把整个登录搞挂。"""
+    import inspect
+    src = inspect.getsource(il.wait_past_turnstile)
+    i = src.index('click_turnstile_checkbox')
+    assert 'except Exception' in src[i:i + 300], '点击异常没有被兜住'
