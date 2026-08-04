@@ -3,12 +3,19 @@
     <div class="panel-header">
       <div class="panel-title"><span>&#128101;</span> 账号列表</div>
       <div style="display:flex;gap:8px;align-items:center">
+        <input type="file" ref="importInput" accept=".xlsx,.xls"
+               style="font-size:12px;max-width:180px" title="邮箱 / 邮箱密码 / 邮箱认证链接">
+        <button class="action-btn" @click="handleImport">导入账号</button>
+        <a href="/api/accounts/template" class="action-btn" style="text-decoration:none">下载模版</a>
+        <div class="filter-sep"></div>
         <button class="action-btn danger" @click="handleDelete" :disabled="selected.size === 0">删除选中</button>
         <button class="action-btn" @click="handleExport('selected')">导出选中</button>
         <button class="action-btn" @click="handleExport('filtered')">导出搜索结果</button>
         <button class="action-btn" @click="loadData">刷新</button>
       </div>
     </div>
+
+    <div v-if="importMsg" style="padding:8px 12px;font-size:12px;line-height:1.7" v-html="importMsg"></div>
 
     <FilterBar>
       <input v-model="filters.keyword" class="filter-input" placeholder="搜索邮箱..." style="width:200px">
@@ -218,7 +225,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, rechargeAccount, openAccountBrowser, getOpenBrowsers, getRechargeLogsByEmail, getCardGroups } from '../api'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, importAccounts, rechargeAccount, openAccountBrowser, getOpenBrowsers, getRechargeLogsByEmail, getCardGroups } from '../api'
 import { useAppStore } from '../stores/app'
 const store = useAppStore()
 
@@ -252,6 +259,8 @@ const pageSize = ref(20)
 const loading = ref(false)
 const filters = reactive({ keyword: '', identity_status: '', platform_status: '', date_from: '', date_to: '' })
 const selected = reactive(new Set())
+const importInput = ref(null)
+const importMsg = ref('')
 
 // 充值状态
 const rechargingEmail = ref('')
@@ -346,6 +355,30 @@ function toggleAll(checked) {
     if (checked) selected.add(a.email)
     else selected.delete(a.email)
   })
+}
+
+async function handleImport() {
+  const file = importInput.value?.files?.[0]
+  if (!file) { alert('请先选择 Excel 文件'); return }
+  importMsg.value = '<span style="color:#666">导入解析中...</span>'
+  try {
+    const d = await importAccounts(file)
+    let html = `<span style="color:green">已导入 ${d.imported} 个账号（状态「仅导入」，下次任务会自动注册）</span>`
+    // 缺认证链接的必须单独提示：这些账号入了库却领不走（注册流程拿不到验证码），
+    // 只报「导入成功」的话，用户会困惑于补号流程为什么一个都不碰。
+    if (d.no_link_count > 0) {
+      html += `<br><span style="color:#dc2626">其中 ${d.no_link_count} 个没有邮箱认证链接，`
+        + `无法自动注册（注册要靠它收验证码），请补齐后重新导入</span>`
+    }
+    if (d.errors?.length) {
+      html += `<br><span style="color:orange">${d.errors.length} 行有问题被跳过：`
+        + `${d.errors.slice(0, 3).join('；')}${d.errors.length > 3 ? ' …' : ''}</span>`
+    }
+    importMsg.value = html
+    await loadData()
+  } catch (e) {
+    importMsg.value = `<span style="color:red">导入失败: ${e.message}</span>`
+  }
 }
 
 async function handleDelete() {

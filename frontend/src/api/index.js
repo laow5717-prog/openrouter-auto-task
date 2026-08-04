@@ -69,6 +69,11 @@ export const getAccounts = (params) => get('/api/accounts', params)
 export const getAccountCards = (email) => get(`/api/accounts/${encodeURIComponent(email)}/cards`)
 export const exportAccounts = (body) => postBlob('/api/accounts/export', body)
 export const deleteAccounts = (emails) => post('/api/accounts/delete', { emails })
+export const importAccounts = (file) => {
+  const fd = new FormData()
+  fd.append('file', file)
+  return postFile('/api/accounts/import', fd)
+}
 export const rechargeAccount = (email, paymentGroupId) => {
   const body = { email }
   if (paymentGroupId) body.payment_group_id = paymentGroupId

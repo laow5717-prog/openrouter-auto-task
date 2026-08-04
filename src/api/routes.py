@@ -417,6 +417,52 @@ def get_accounts():
                     "platform": platform})
 
 
+@api.route('/api/accounts/template')
+def download_accounts_template():
+    """下载账号导入模版（邮箱 / 邮箱密码 / 邮箱认证链接）。"""
+    from src.services import account_import
+    path = account_import.generate_template()
+    return send_file(path, as_attachment=True, download_name='accounts_template.xlsx')
+
+
+@api.route('/api/accounts/import', methods=['POST'])
+def import_accounts():
+    """导入账号 Excel，全部落 identity_status='imported'（待注册）。
+
+    与卡池上传同构（存 uploads/ 再解析），但**不因解析有问题就整批拒绝**：
+    能导多少导多少，把问题一起回传。一张几百行的表里有两行格式不对就全批退回，
+    只会逼用户来回试。
+    """
+    from src.services import account_import
+    models = get_models()
+
+    if 'file' not in request.files:
+        return jsonify({"error": "未上传文件"}), 400
+    file = request.files['file']
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        return jsonify({"error": "仅支持 .xlsx/.xls 文件"}), 400
+
+    upload_dir = str(get_data_dir() / "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    save_path = os.path.join(upload_dir, "accounts_upload.xlsx")
+    file.save(save_path)
+
+    rows, errors = account_import.parse_excel(save_path)
+    if not rows:
+        return jsonify({"error": "没有解析出任何账号", "details": errors}), 400
+
+    stat = account_import.import_rows(models['account'], rows)
+    return jsonify({
+        "imported": stat['imported'],
+        # 没有收码链接的账号入了库却领不走（_hotmail_for_account 会把它们过滤掉），
+        # 必须单独回传让前端提示，否则用户会困惑「导入成功了怎么不注册」。
+        "no_link": stat['no_link'],
+        "no_link_count": len(stat['no_link']),
+        "total_parsed": len(rows),
+        "errors": errors,
+    })
+
+
 @api.route('/api/accounts/delete', methods=['POST'])
 def delete_accounts():
     models = get_models()
