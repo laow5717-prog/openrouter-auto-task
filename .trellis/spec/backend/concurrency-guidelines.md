@@ -136,10 +136,33 @@ an account.
 | `_in_flight` | `card_number` | **Global.** Not a concurrency question — submitting the same card at two merchants at once stacks issuer velocity risk. The issuer sees the card, not which platform we happen to be running |
 | `_used` | `(platform, card_number)` | **Per platform.** Pure round-dedup heuristic; "tried on opencode" says nothing about another site, where the card is still untouched |
 
-`release_all()` therefore has two modes: pass a platform at a round boundary
-(clears only that platform's ownership, leaves `_in_flight` alone), pass nothing
-at task teardown (clears everything). Clearing `_in_flight` at a round boundary
-would drop the issuer-velocity protection mid-run.
+`release_all()` therefore has **three** modes：
+
+| 调用 | 场景 | 效果 |
+|---|---|---|
+| `release_all()` | 进程退出 | 全清 |
+| `release_all(平台)` | **轮边界** | 只清该平台本轮归属，`_in_flight` 不动 |
+| `release_all(平台, include_in_flight=True)` | **该平台任务收尾** | 连它的 in-flight 一起放开 |
+
+轮边界清 `_in_flight` 会在跑动中丢掉发卡行 velocity 防护。
+
+⚠️ **多平台并发时，任务收尾绝不能用无参形式**——那会连另一个平台正在刷的卡一起
+从 `_in_flight` 抹掉，于是同一张卡可能被两个平台同时提交给发卡行。
+
+### owner：所有共享注册表都要能区分「谁占的」
+
+三个注册表都跨平台共享，语义分两类，**不能一刀切**：
+
+- **排他判定不带 owner**（`is_claimed` / `try_acquire` 的准入）——排他本来就是全局的
+- **「本轮还有谁在飞」与「收尾释放」必须带 owner**（`snapshot(owner)` /
+  `release_all(owner)`）
+
+`ProxyRegistry` 的持有者身份是 `(worker_id, owner)` 而不是裸 `worker_id`：
+每个平台各有一套同名的 `W1..W4`，只比 worker_id 的话两个平台的 W1 会互认成自己，
+**同一出口 IP 被同时发给两边**，反关联白做且不留任何日志。
+
+三种漏带 owner 的后果全都不报错，详见
+`.trellis/spec/backend/multi-platform-guidelines.md` 的「owner」一节。
 
 Counting call sites (`len(_eligible_cards(...))` for "how many cards remain" and
 "is there work left") must pass `exclude_used=False`, or the number shrinks as the
