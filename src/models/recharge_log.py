@@ -76,6 +76,30 @@ class RechargeLogModel:
         )
         return [dict(r) for r in rows]
 
+    def success_amount_by_email(self, platform, since):
+        """自 since 起，该平台每个账号成功充值的累计金额 {email: float}。
+
+        供 run_daily_pipeline._reusable_recharged 判断「这个账号本次运行已经充进去多少」。
+        它是复用闸能收敛的关键：DB 里的 credits_balance 可能是 NULL（balance_after 读不到
+        时 update_balance 直接 return），也可能停在旧值不再更新，只靠它判断「未达上限」
+        会让账号被一轮轮反复领走、任务永不收敛。本次运行实际充进去的钱每成功一笔就增长，
+        与 DB 余额相加即可保证有限步内越过 balance_cap。
+
+        一次聚合而不是逐账号查询——调用方要遍历全部账号，N+1 会让每次领取都打几十条 SQL。
+
+        since 为空返回空 dict：那意味着调用方没拿到运行起始时刻，此时把全时段的历史
+        充值算进「本次运行」会让所有账号瞬间看起来都到顶，静默地退化成「一个都不复用」。
+        """
+        if not since:
+            return {}
+        rows = self.db.fetchall(
+            "SELECT email, SUM(amount) AS total FROM recharge_logs "
+            "WHERE platform=? AND status='success' AND created_at >= ? "
+            "GROUP BY email",
+            (platform, since),
+        )
+        return {r['email']: float(r['total'] or 0) for r in rows if r['email']}
+
     def get_success_card_numbers(self, platform, email):
         """返回该账号在此平台所有『成功支付』记录里出现过的不同卡号集合。
         用于统计一个账号已处于支付成功状态的卡数量（上限 20）。"""

@@ -987,6 +987,12 @@ class AppState:
         self.platform = platform
         account_model = self.models['account']
         platform_account_model = self.models['platform_account']
+        recharge_log_model = self.models['recharge_log']
+
+        # 本次运行的起始时刻，_reusable_recharged 用它界定「本次运行已充金额」。
+        # 格式必须与 recharge_logs.created_at 的 datetime('now','localtime') 一致
+        # （都是本地时间的 YYYY-MM-DD HH:MM:SS），才能直接做字符串比较。
+        run_started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         # 结果计数（收尾摘要用）。self.success_count/fail_count 另供前端进度条。
         stats = {'paid': 0, 'fail': 0, 'archived': 0, 'flagged': 0, 'registered': 0}
@@ -1038,9 +1044,11 @@ class AppState:
                     and self._hotmail_for_account(a)
                 ]
 
-            # ── 回退池：余额未满的已充值账号 ──
-            # 只在「新账号 + 待注册账号都领不到」时才动它（见 _try_claim 的顺序），
-            # 所以钱优先铺开到新账号上，风险不集中在少数几个号里。
+            # ── 余额未满的已充值账号 ──
+            # 与可充值账号**同一档**一起领（见 _try_claim），只有两类都领不到才去注册。
+            # 曾经它排在待注册 imported 之后，于是几十个 imported 会把老账号饿死——
+            # worker 一直忙着注册，余额只有 $20 的号几乎永远轮不到。而注册耗时且容易被
+            # GitHub flag，现成账号优先反而更稳。
             #
             # 它同时是 AdsPower 环境紧张时的泄压阀：这些账号**已经有环境了**，复用
             # 一个新环境都不用建。而环境上限只有 12、几十个新账号在排队抢，抢不到就
@@ -1049,21 +1057,51 @@ class AppState:
             # 判据是「余额还没到 balance_cap」而不是「状态非 recharged」：recharged 现在
             # 的含义是「有一些余额」，不再是「这个账号做完了」。真正做完的是 archived
             # （余额已达上限），它仍然是终态。
-            # 本次运行已经复用过的账号。**每个账号每次运行只复用一次**，理由有两条：
             #
-            # 1. 够用。recharge_account 那一次会话内部本来就会连充到 balance_cap（或
-            #    max_card_attempts）才收手，再给第二次会话没有增量——会话提前结束的两个
-            #    原因（hCaptcha、试卡上限）都是「该躲开这个账号」的信号，不是「再来一次」。
+            # ⚠️ 有效余额 = DB 余额 + **本次运行已充金额**，两项缺一不可。
+            # 只看 DB 余额会死循环：credits_balance 可能是 NULL（balance_after 读不到时
+            # update_balance 直接 return，infron 常态、opencode 偶发），也可能停在旧值
+            # 不再更新。那样的账号永远满足「未达上限」，被一轮轮反复领走反复充，钱全堆
+            # 到一个号上且任务不收敛。
+            # 这里曾用「每次运行只复用一次」挡它，代价是余额 $20、上限 $200 的账号一轮
+            # 只能充一笔，钱铺不开。现在换成金额累加：每成功一笔就推进至少 amount_min，
+            # 最多 ceil(cap / amount_min) 次必然越过 cap 而出局——收敛由金额自己保证，
+            # 不再需要次数闸。
+            # 失败路径（充不成 → 金额不增长）不归这里管：failed_this_round 让它本轮出局，
+            # 跨轮由轮边界的「连续零进展」兜底，与可充值账号一视同仁。
+            # ── 本次运行给每个账号充值的**内存估算**（email -> 累计金额）──
+            # 领取即按 amount_min（每笔下界）计入，充值失败再回退。它是 recharge_logs
+            # 之外的第二本账，两件事都靠它：
             #
-            # 2. 不这样会死循环。判据里的 DB 余额 credits_balance 可能是 NULL：
-            #    balance_after 读不到时 update_balance 会跳过（infron 常态，opencode 偶发）。
-            #    余额永远是 NULL 的账号会永远满足「未达上限」，被一轮轮反复领走反复充，
-            #    钱全堆到一个号上，而且任务不收敛——tests/test_daily_pipeline.py 一改就挂死，
-            #    正是这条路径。
-            reused_this_run = set()
+            # 1. 补时间差窗口。判据全部从 DB 实时派生，而账号在 _do 里跑完、日志写下
+            #    之前就可能被下一次 _try_claim 判成「未达上限」而再领一次，越过
+            #    balance_cap。实测 3 worker 下约 4/10 的运行会撞上（cap $60 的账号充了
+            #    4 笔 $20）。同构于 PaymentCardRegistry 的 in-flight 登记，双闸门。
+            #
+            # 2. **收敛不依赖记账可靠**。只看 recharge_logs 的话，一旦日志没写成、
+            #    金额记成 0、或平台/时间过滤没命中，累计额恒为 0，账号永远「未达上限」，
+            #    被无限重领——不是断言失败，是整个进程转到死。这条内存账单调递增，
+            #    哪怕 DB 一笔都没记下，它也会把账号推到 cap 然后放手。
+            #
+            # 与 DB 金额取 max 而不是相加：两者记的是同一批钱，相加会双重计算让账号
+            # 提前出局；DB 更准（会话内连充多笔时 amount_min 只是下界），内存账更可靠。
+            run_topup = {}
+
+            def _refund_topup(email):
+                """退回领取时记的那一笔。**调用方须持有 state_lock**（锁不可重入）。"""
+                left = run_topup.get(email, 0) - (recharge_cfg or cfg.recharge).amount_min
+                if left > 0:
+                    run_topup[email] = left
+                else:
+                    run_topup.pop(email, None)
 
             def _reusable_recharged():
                 cap = (recharge_cfg or cfg.recharge).balance_cap
+                # 内存账先读、DB 账后读。内存账在领取那一刻就记上（早于任何 DB 写入），
+                # 先读它就不会漏掉正在飞的那笔；DB 账后读则取到最新一份。
+                with state_lock:
+                    estimated = dict(run_topup)
+                topped = recharge_log_model.success_amount_by_email(platform, run_started_at)
                 accounts = account_model.get_all(order_desc=False)
                 platform_status = platform_account_model.map_by_email(platform)
                 out = []
@@ -1072,16 +1110,14 @@ class AppState:
                         continue
                     if is_identity_terminal(a.get('identity_status')):
                         continue
-                    if a['email'] in done or a['email'] in reused_this_run:
+                    if a['email'] in done:
                         continue
                     row = platform_status.get(a['email']) or {}
                     if (row.get('status') or '') != 'recharged':
                         continue
-                    bal = row.get('credits_balance')
-                    # 余额未知（None）时放行一次：DB 余额本来就会随 credits 消耗而过时，
-                    # 因为没数就永不复用未免太保守。放行是安全的——reused_this_run 保证
-                    # 只此一次，而那一次会话内部有 balance_cap 兜着。
-                    if bal is not None and bal >= cap:
+                    effective = (row.get('credits_balance') or 0) + max(
+                        topped.get(a['email'], 0), estimated.get(a['email'], 0))
+                    if effective >= cap:
                         continue
                     out.append(a)
                 return out
@@ -1166,34 +1202,37 @@ class AppState:
                 ('done', 收敛原因)。"""
                 if not self._eligible_cards(group_id, exclude_used=False):
                     return 'done', "分组可选卡已耗尽（全部无效/过期或冷却中）"
-                for a in _payable_now():
+                # ── 第一档：现成账号，新的和余额未满的老的**一起领** ──
+                # 曾经老账号排在待注册 imported 之后，理由是「优先把钱铺开到更多账号上」。
+                # 实践中这条让老账号饿死：库里几十个 imported 时，worker 一直在注册，
+                # 余额 $20 的老号几乎永远轮不到。而注册耗时、还容易被 GitHub flag，
+                # 现成账号优先反而更稳。
+                # 两个列表不会有交集：_payable_now 排除平台终态，而 recharged 正是终态之一。
+                reusable = _reusable_recharged()
+                if reusable and not reuse_logged[0]:
+                    reuse_logged[0] = True
+                    self._hooked_print(
+                        f"余额未满的已充值账号 {len(reusable)} 个一并进入轮转"
+                        f"（上限 ${(recharge_cfg or cfg.recharge).balance_cap:.0f}）")
+                for a in _payable_now() + reusable:
                     if a['email'] in failed_this_round:
                         continue
                     if self.account_registry.claim(a['email'], owner=platform):
                         proxy, pkey = _acquire_proxy_for(a.get('id', 0))
+                        # 记一笔内存账。**两条路径都要记**，不止复用池：新账号充完
+                        # 第一笔就变 recharged，若此时日志尚未落库，它会以累计额 0 被
+                        # 当成「余额几乎为零」再领一次——同样超充。
+                        # 领到就记、不等结果：等成功再记的话，正在飞的那笔挡不住任何人。
+                        # 失败由 _do 回退（那次没花钱，不该占额度）。
+                        with state_lock:
+                            run_topup[a['email']] = (run_topup.get(a['email'], 0)
+                                                     + (recharge_cfg or cfg.recharge).amount_min)
                         return 'item', ('recharge', a, proxy, pkey)
+                # ── 第二档：现成账号都领不到了，才去注册 ──
                 for a in _registerable_imported():
                     if self.account_registry.claim(a['email'], owner=platform):
                         proxy, pkey = _acquire_proxy_for(a.get('id', 0))
                         return 'item', ('register', a, proxy, pkey)
-                # ── 回退：新账号和待注册账号都领不到了，改充余额未满的已充值账号 ──
-                # 排在前两档**之后**是刻意的：优先把钱铺开到更多账号上，只有实在没有
-                # 新号可用时才回头加码老号，免得余额集中在少数几个号里——一个被封就
-                # 全赔进去。这些账号已有 AdsPower 环境，复用不占新配额。
-                for a in _reusable_recharged():
-                    if a['email'] in failed_this_round:
-                        continue
-                    if self.account_registry.claim(a['email'], owner=platform):
-                        proxy, pkey = _acquire_proxy_for(a.get('id', 0))
-                        # 领到就登记，**不等结果**。等成功了再记的话，失败的那次不算数，
-                        # 账号会被一轮轮重领——正是要避免的循环。
-                        reused_this_run.add(a['email'])
-                        if not reuse_logged[0]:
-                            reuse_logged[0] = True
-                            self._hooked_print(
-                                "无新账号可领，开始复用余额未满的已充值账号"
-                                f"（上限 ${(recharge_cfg or cfg.recharge).balance_cap:.0f}）")
-                        return 'item', ('recharge', a, proxy, pkey)
                 # 「本轮还有账号在飞吗」——**必须只看本平台**。registry 是跨平台共享的，
                 # 不过滤的话本平台会把另一个平台正在跑的账号当成自己这轮在飞，于是永远
                 # 走 'wait'、轮边界永不触发、失败账号永不重试、zero_rounds 永不递增——
@@ -1206,15 +1245,21 @@ class AppState:
                 with state_lock:
                     paid_now = stats['paid']
                 cards_now = _card_keys_now()
-                progressed = (paid_now > round_state['paid_at_start']
-                              or cards_now != round_state['cards_at_start'])
+                # 「可选卡有变化」这一条**只认新增**。它的原意是「卡集合变了，下一轮
+                # 可能有不同结果，值得再试」——针对的是冷却到期、新卡导入这类**增加**。
+                # 原先用 != 判断，把「卡被逐张标 invalid」这种**减少**也算成了进展：
+                # 每烧掉一张卡就清零一次 zero_rounds，任务永不收敛。2026-08-05 现场
+                # 跑到第 113 轮仍在打转，2 个账号反复失败、可选卡从 3426 被烧到 2796，
+                # 最后靠人工停掉。取差集则保留了原意，又不会把倒退当成进展。
+                gained = cards_now - round_state['cards_at_start']
+                progressed = paid_now > round_state['paid_at_start'] or bool(gained)
                 if progressed:
                     round_state['zero_rounds'] = 0
                 else:
                     round_state['zero_rounds'] += 1
                     if round_state['zero_rounds'] >= 2:
                         return 'done', (f"连续 {round_state['zero_rounds']} 轮零进展"
-                                        "（未付成一张卡且可选卡集合未变化），账号已全部试尽")
+                                        "（未付成一张卡且无新的可选卡），账号已全部试尽")
                 retrying = len(failed_this_round)
                 round_state['no'] += 1
                 round_state['paid_at_start'] = paid_now
@@ -1256,6 +1301,10 @@ class AppState:
             def _do(worker, item):
                 kind, acct, proxy, pkey = item
                 email = acct['email']
+                # 这次是否真的花了钱。失败/异常/配额拿不到都算没花，finally 统一退回
+                # 领取时记的那笔内存账——否则反复失败的账号会被自己的估算额推到 cap
+                # 而永久退出轮转，而它其实一分钱都没充上。
+                charged = False
                 if self.adspower_enabled:
                     proxy_note = "（AdsPower 环境，代理随环境）"
                 else:
@@ -1288,6 +1337,7 @@ class AppState:
                             if result == "success":
                                 stats['paid'] += 1
                                 self.success_count += 1
+                                charged = True
                             elif result == "archived":
                                 stats['archived'] += 1
                                 done.add(email)
@@ -1334,6 +1384,9 @@ class AppState:
                         failed_this_round.add(email)
                     self._hooked_print(f"处理 {email} 出错: {e}")
                 finally:
+                    if kind != 'register' and not charged:
+                        with state_lock:
+                            _refund_topup(email)
                     self.account_registry.release(email)
                     if pkey:
                         self.proxy_registry.release(pkey)   # 排他领取的代理释放回池

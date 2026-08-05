@@ -38,6 +38,13 @@ def _full_cards(n):
 class _Tracker:
     """记录并发峰值与「同一 email 是否被并发处理」，并模拟注册/充值对 DB 的状态推进。"""
 
+    # 每次成功充值记账的金额。**必须落进 recharge_logs**：_reusable_recharged 用
+    # 「DB 余额 + 本次运行已充金额」判断账号有没有到 balance_cap，而这个桩不写
+    # credits_balance（模拟 balance_after 读不到），于是累计金额是唯一推进项。
+    # 桩若不记账，账号的有效余额恒为 0、永远满足「未达上限」，被无限重领——
+    # 表现是整个测试文件挂死，不是断言失败。踩过一次，别改回去。
+    AMOUNT = 20
+
     def __init__(self, db, delay=0.02):
         self.db = db
         self.delay = delay
@@ -90,10 +97,24 @@ class _Tracker:
             self._exit(email)
 
     def _mark_recharged(self, email):
-        """充值成功是**平台层**状态，写 platform_accounts 而非 accounts。"""
+        """充值成功是**平台层**状态，写 platform_accounts 而非 accounts。
+
+        刻意**不写 credits_balance**：真实环境里 balance_after 常读不到
+        （infron 常态、opencode 偶发），update_balance 遇 None 直接 return。
+        余额留空正是复用闸最难的那个输入，测试要盯的就是它。
+        """
         self.db.execute(
             "INSERT OR REPLACE INTO platform_accounts (platform, email, status) "
             "VALUES ('opencode', ?, 'recharged')", (email,))
+        self._log_success(email)
+
+    def _log_success(self, email):
+        """记一笔成功充值。生产里由 registration.recharge_account 写，桩必须同样写——
+        它是 _reusable_recharged 判断「本次运行已充多少」的唯一账本。"""
+        self.db.execute(
+            "INSERT INTO recharge_logs (platform, email, card_display, amount, status) "
+            "VALUES ('opencode', ?, '4111000000000000', ?, 'success')",
+            (email, self.AMOUNT))
 
 
 class _FlakyOnceTracker(_Tracker):
@@ -140,6 +161,35 @@ class _AlwaysFailTracker(_Tracker):
             self._exit(email)
 
 
+class _AlwaysFailBurningCardsTracker(_Tracker):
+    """每次充值都失败，且每次都烧掉一张卡——2026-08-05 那个不收敛现场的最小复现。
+
+    现场：2 个账号反复失败，卡被逐张标 invalid，任务跑到第 113 轮仍在打转，
+    可选卡从 3426 被烧到 2796，最后靠人工停掉。
+
+    成因是轮边界的进展判定曾用 `cards_now != cards_at_start`——卡**变少**也算"变化"，
+    于是每烧一张就把 zero_rounds 清零，收敛条件永远够不着。改成只认新增后，
+    烧卡不再算进展，两轮后收敛。
+    """
+
+    def recharge(self, email, login_password, **kw):
+        self._enter(email)
+        try:
+            with self.lock:
+                self.recharged_calls.append(email)
+            threading.Event().wait(self.delay)
+            self.db.execute(
+                "INSERT OR REPLACE INTO card_platform_state (card_number, platform, status) "
+                "SELECT cp.card_number, 'opencode', 'invalid' FROM card_pool cp "
+                "LEFT JOIN card_platform_state cps "
+                "  ON cps.card_number = cp.card_number AND cps.platform = 'opencode' "
+                "WHERE COALESCE(cp.status,'') != 'expired' "
+                "  AND COALESCE(cps.status,'') NOT IN ('invalid','bound') LIMIT 1")
+            return "failed", "declined"
+        finally:
+            self._exit(email)
+
+
 @pytest.fixture
 def no_browser(monkeypatch):
     def _explode(*a, **kw):
@@ -148,7 +198,8 @@ def no_browser(monkeypatch):
     monkeypatch.setattr(driver_module, 'create_driver_vanilla', _explode)
 
 
-def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls=_Tracker):
+def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls=_Tracker,
+                  balance_cap=60):
     path = tempfile.mktemp(suffix='.db')
     db = Database(path)
     # 用生产同一份构造，而不是在这里手抄一份：抄的那份漏掉新加的模型时，
@@ -176,13 +227,18 @@ def _run_pipeline(workers, n_registered=0, n_imported=4, n_cards=16, tracker_cls
     # 会盖过它，测试想要的串行/并行就控制不住了。
     orig_max = cfg.concurrency.max_workers
     orig_per = dict(cfg.concurrency.platform_workers)
+    orig_cap = cfg.recharge.balance_cap
     cfg.concurrency.max_workers = workers
     cfg.concurrency.platform_workers = {}
+    # 余额上限决定一个账号能被复用几次（cap / _Tracker.AMOUNT）。默认 200 意味着
+    # 每账号 10 笔，测试要跑很久；这里压到 60 = 3 笔，行为一致但快得多。
+    cfg.recharge.balance_cap = balance_cap
     try:
         state.run_daily_pipeline('opencode', gid, login_password=None, captcha_api_key=None)
     finally:
         cfg.concurrency.max_workers = orig_max
         cfg.concurrency.platform_workers = orig_per
+        cfg.recharge.balance_cap = orig_cap
 
     # 账号最终状态 = 平台状态优先（recharged 等），没有平台行则看身份状态。
     # 两层拆分后「一个账号处于什么状态」不再是单列，这里合成出旧口径供断言复用。
@@ -218,45 +274,66 @@ def test_refill_registers_then_recharges_serially(no_browser):
     emails = [f'imp{i}@example.com' for i in range(4)]
     assert r['status_counts'].get('recharged') == 4
     assert sorted(r['registered_calls']) == emails
-    # 每个账号被充两次：注册转正后作为新账号充一次，四个都跑完后作为回退池再复用一次
-    # （回退池的语义见 test_recharged_accounts_are_reused_at_most_once）。
-    assert sorted(r['recharged_calls']) == sorted(emails * 2)
+    # 每个账号被充到 balance_cap 为止：cap 60 / 每笔 20 = 3 笔
+    # （复用语义见 test_recharged_accounts_reused_until_balance_cap）。
+    assert sorted(r['recharged_calls']) == sorted(emails * 3)
     assert r['is_running'] is False
     assert r['peak'] == 1, "串行模式出现并发"
 
 
-def test_recharged_accounts_are_reused_at_most_once(no_browser):
-    """已充值账号可被复用，但每次运行至多一次。
+def test_recharged_accounts_reused_until_balance_cap(no_browser):
+    """已充值账号持续参与轮转，直到累计充值达到 balance_cap 才出局。
 
-    旧行为是 recharged 永久退出轮转（「一个账号只充一笔」）。现在它的含义变成
-    「有一些余额」，没到 balance_cap 就还能加码——但**每次运行只给一次**：
+    旧行为是「每次运行至多复用一次」——余额 $20、上限 $200 的账号一轮只能充一笔，
+    钱铺不开。那道次数闸存在的真正理由是**防死循环**：判据里的 DB 余额可能是 NULL
+    （balance_after 读不到时 update_balance 直接 return），只看它的话账号永远满足
+    「未达上限」，被一轮轮反复领走、任务不收敛。
 
-      - 够用：recharge_account 那一次会话内部就会连充到上限才收手，再给第二次
-        会话没有增量；
-      - 必须：判据里的 DB 余额可能是 NULL（balance_after 读不到时不落库），
-        不设这道闸的话该账号永远满足「未达上限」，被一轮轮反复领走、任务不收敛。
+    现在改由金额自己挡：有效余额 = DB 余额 + **本次运行已充金额**（recharge_logs 聚合）。
+    每成功一笔就推进 AMOUNT，最多 ceil(cap / AMOUNT) 次必然越过 cap。次数闸遂可撤掉。
+
+    本用例的桩刻意不写 credits_balance（模拟余额读不到），所以推进全靠累计金额——
+    这正是最难的那条路径。它同时覆盖「DB 余额停在旧值不更新」，两者是同一条路径。
     """
-    r = _run_pipeline(2, n_registered=3, n_imported=0)
+    r = _run_pipeline(2, n_registered=3, n_imported=0, balance_cap=60)
     assert r['status_counts'].get('recharged') == 3
 
     calls = r['recharged_calls']
     per_email = {e: calls.count(e) for e in set(calls)}
     assert set(per_email) == {f'reg{i}@example.com' for i in range(3)}
-    assert all(n == 2 for n in per_email.values()), \
-        f"每个账号应为「新账号一次 + 复用一次」，实际 {per_email}"
+    expected = 60 // _Tracker.AMOUNT
+    assert all(n == expected for n in per_email.values()), \
+        f"每个账号应充到 cap（{expected} 笔）才出局，实际 {per_email}"
 
 
-def test_reuse_only_kicks_in_after_new_accounts_are_exhausted(no_browser):
-    """回退池排在最后：只要还有没跑过的账号，就不回头加码老账号。
+def test_reuse_scales_with_balance_cap(no_browser):
+    """复用次数由 balance_cap 决定，而不是某个写死的次数。
 
-    顺序是有意的——先把钱铺开到更多账号上。余额集中在少数号里，一个被封就全赔进去。
+    与上一个用例配对：cap 翻倍，笔数就翻倍。若哪天有人偷偷加回次数闸，
+    这条会立刻红——上一条不会（它可能恰好等于那个次数）。
     """
-    r = _run_pipeline(1, n_registered=2, n_imported=0)
-    calls = r['recharged_calls']
+    r = _run_pipeline(1, n_registered=1, n_imported=0, balance_cap=100)
+    assert r['recharged_calls'].count('reg0@example.com') == 100 // _Tracker.AMOUNT
 
-    assert sorted(calls[:2]) == ['reg0@example.com', 'reg1@example.com'], \
-        f"前两次应把两个新账号各跑一遍，实际 {calls[:2]}"
-    assert len(calls) == 4, f"随后才轮到复用，共 4 次，实际 {calls}"
+
+def test_reusable_and_payable_are_claimed_in_one_tier(no_browser):
+    """余额未满的老账号与可充值新账号**同档**领取，待注册 imported 排其后。
+
+    曾经老账号排在 imported 之后，于是库里几十个待注册账号会把它饿死——worker
+    一直在注册，余额 $20 的号几乎永远轮不到。而注册耗时、还容易被 GitHub flag，
+    现成账号优先反而更稳。
+
+    断言方式：给 1 个 registered + 2 个 imported。若老账号仍排在 imported 之后，
+    reg0 的第二笔必然要等两个 imported 都注册完；同档则不必。
+    """
+    r = _run_pipeline(1, n_registered=1, n_imported=2, balance_cap=60)
+    calls = r['recharged_calls']
+    # reg0 充满 cap 需要 3 笔，且这 3 笔应在 imp1 被注册之前就跑完
+    # （现成账号优先，注册排最后）。
+    first_reg0_run = [c for c in calls[:3]]
+    assert first_reg0_run == ['reg0@example.com'] * 3, \
+        f"现成账号应连续充到 cap 再去注册，实际前三次 {first_reg0_run}"
+    assert len(r['registered_calls']) == 2, "两个 imported 最终都要被注册"
 
 
 def test_parallel_true_concurrency_no_overlap(no_browser):
@@ -292,13 +369,36 @@ def test_failed_accounts_retried_next_round(no_browser):
     r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=8,
                       tracker_cls=_FlakyOnceTracker)
     assert r['status_counts'].get('recharged') == 2, "失败账号未被下一轮重试充成"
-    # 每个账号被试三次：第一轮失败 → 第二轮成功 → 转 recharged 后作为回退池复用一次。
-    # 前两次是本用例的主题（跨轮重试），第三次来自「新账号领完才复用老账号」。
+    # 每个账号：第一轮失败 → 第二轮成功（+20）→ 作为余额未满的账号继续充到 cap 60，
+    # 即再来 2 笔。共 1 次失败 + 3 次成功 = 4 次。
+    # 前两次是本用例的主题（跨轮重试），后两次来自余额未达上限的持续复用。
     calls = sorted(r['recharged_calls'])
-    assert calls == ['reg0@example.com'] * 3 + ['reg1@example.com'] * 3
+    assert calls == ['reg0@example.com'] * 4 + ['reg1@example.com'] * 4
     # 只有每个账号的**第一次**失败烧卡（_FlakyOnceTracker 的语义），故仍是 2 张
     assert r['usable_cards_left'] == 8 - 2
     assert r['is_running'] is False
+
+
+def test_burning_cards_is_not_progress_so_it_still_converges(no_browser):
+    """充值全失败、卡被逐张烧掉时，任务必须在**有限轮内**收敛。
+
+    这是 2026-08-05 那个现场的回归护栏：进展判定曾用 `cards_now != cards_at_start`，
+    于是「卡变少」也被当成进展，zero_rounds 每轮清零，任务跑到第 113 轮仍在打转，
+    烧掉 630 张卡才被人工停掉。
+
+    有界性是本用例的全部意义——它同时是「去掉复用次数闸」之后失败路径唯一的收敛保障。
+    断言取宽松上界：只要远小于卡数（16）即可，不锁死具体轮数。
+    """
+    r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=16,
+                      tracker_cls=_AlwaysFailBurningCardsTracker)
+    calls = r['recharged_calls']
+    # 2 个账号 × 2 轮（首轮 + 容忍一轮抖动的第二轮）= 4 次，随后判零进展收敛。
+    # 旧逻辑下这里会一直跑到把 16 张卡全烧完（≥16 次）。
+    assert len(calls) <= 6, f"未在有限轮内收敛，实际充值尝试 {len(calls)} 次: {calls}"
+    assert r['status_counts'].get('recharged') is None, "全失败不该有账号变 recharged"
+    assert r['usable_cards_left'] > 0, "收敛原因应是账号试尽，而不是把卡烧光"
+    assert r['is_running'] is False
+    assert r['claims_left'] == 0 and r['in_flight_cards'] == 0
 
 
 def test_zero_progress_two_rounds_then_stop(no_browser):

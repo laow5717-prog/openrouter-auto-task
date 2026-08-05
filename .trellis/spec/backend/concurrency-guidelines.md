@@ -189,6 +189,58 @@ setting `None` — otherwise the binding leaks into later phases.
 
 ---
 
+## Budget gates: exclusion is not enough
+
+A gate that asks "has this account had enough yet?" cannot be built from DB
+state alone, even with `AccountRegistry` guaranteeing one worker per email.
+The account-reuse cap (`_reusable_recharged`, `balance_cap`) learned this twice
+on 2026-08-05; both failures were silent overspend, not crashes.
+
+### 1. The window opens *after* the claim is released
+
+`claim` only covers "while A is running". A writes its ledger row, `_do`'s
+`finally` releases the claim, and B claims the same account legitimately — but
+if B's view of the ledger predates A's write, B sees an account that is still
+"under cap" and charges it again. Measured: ~4 runs in 10 at 3 workers,
+`balance_cap` $60 charged 4×$20.
+
+The fix is the `PaymentCardRegistry` pattern — an **in-memory ledger written at
+claim time**, consulted alongside the DB one. Charge it on claim, refund it in
+`finally` when nothing was actually spent.
+
+### 2. Read the in-memory ledger *before* the DB one
+
+Adding the in-memory ledger cut failures to ~1 in 10, not zero. Reading it
+second reopens the hole:
+
+```
+read topped = 40  →  [A finishes, DB becomes 60, A's finally clears its entry]
+                  →  read in-flight = 0
+→ effective = 40  →  under cap  → both gates miss the same $20
+```
+
+The money hands off between the two ledgers: the in-memory entry disappears
+*after* the DB row appears. Read the in-memory one first and the handoff is
+always covered by at least one side. `_payable_now`'s "platform status must be
+read last, it is the exclusion criterion" is the same constraint seen from the
+other end.
+
+### 3. Do not let convergence depend on the DB ledger being written
+
+If the only thing pushing an account toward its cap is a `recharge_logs` row,
+then a run where those rows are missing, zero-valued, or filtered out by
+platform/timestamp never terminates — the account stays forever "under cap" and
+is re-claimed indefinitely. This is not an assertion failure; the process spins
+until killed. It reproduced immediately in the test suite, where stub trackers
+did not write the log table.
+
+The in-memory ledger must therefore be **monotonic per run** and combined as
+`max(db_amount, in_memory_amount)` — not a sum, since both record the same
+money and adding them retires accounts early. The DB figure is more accurate
+(a session may charge several times), the in-memory figure is more reliable.
+
+---
+
 ## Writing new parallel phases
 
 - `pool.map(items, fn)` — barrier; use when the phase must finish before the
@@ -212,10 +264,22 @@ autonomously pulls one account and either recharges it or, if none are payable,
 registers one `imported` account — so registration and recharge run concurrently
 across workers, not in separate phases.
 
-**`_produce` (guarded by `produce_lock`)** finds-and-claims atomically: it scans
-`_payable_now()` first, else `_registerable_imported()`, and returns the first
-account it can `account_registry.claim()`. The lock spanning find+claim is what
-stops two workers taking the same account (mirrors `_register_bind_loop._produce`).
+**`_produce` (guarded by `produce_lock`)** finds-and-claims atomically. Two tiers,
+in order:
+
+1. **Ready accounts** — `_payable_now() + _reusable_recharged()`, scanned as one
+   list. New accounts and already-recharged-but-under-cap ones compete equally;
+   the two lists never intersect because `recharged` is a platform-terminal
+   status, which `_payable_now` excludes.
+2. **Accounts still needing signup** — `_registerable_imported()`.
+
+Registration is last on purpose. It is slow and the resulting account is the one
+most likely to get flagged by GitHub; when dozens of `imported` rows sat ahead of
+the reuse pool, a handful of $20 accounts starved indefinitely while every worker
+ground through signups.
+
+The lock spanning find+claim is what stops two workers taking the same account
+(mirrors `_register_bind_loop._produce`).
 
 **`_do` (per worker)** releases the account in `finally` and updates a `done` set
 + `stats` under `state_lock`. Three de-dup / termination invariants live here:
@@ -226,12 +290,22 @@ stops two workers taking the same account (mirrors `_register_bind_loop._produce
   `done`; after release, the next `_produce` sees it as `registered`+password and
   hands it to whichever worker is free — the login→recharge step, possibly on a
   different worker than registered it.
-- **Termination**: recharge *failure* adds the email to `done` (was the old
-  `done_emails`+`progressed` backstop) so a card-declining account is never
-  re-pulled forever; archived/flagged/failed-registration also land in `done`.
-  Every account thus reaches recharged or `done`, and `imported`/payable are
-  finite, so `_produce` eventually returns None and all workers exit. There is no
-  round counter and no `MAX_ROUNDS` — `run_until_empty` converges by draining.
+- **Termination**: recharge *failure* only adds the email to `failed_this_round`,
+  so the account is retried on the next round (cards are the scarce resource;
+  burning through the pool is the goal). Permanent exits — archived, flagged,
+  failed registration — land in `done`. Convergence therefore rests on the
+  round boundary, not on accounts draining.
+
+**The round boundary's "zero progress" test decides whether the run ever ends**,
+and it is easy to get wrong. Progress means *either* a card was paid *or* the
+selectable-card set **gained** members (a cooldown expired, new cards imported).
+
+Comparing the sets with `!=` instead of taking the difference counts *shrinkage*
+as progress — and the set shrinks every time a card is declined and marked
+invalid. On 2026-08-05 that kept `zero_rounds` pinned at 0 through **113 rounds**:
+two accounts failing in a loop, the card pool ground from 3426 down to 2796,
+no error logged, stopped only by hand. Regression guard:
+`test_burning_cards_is_not_progress_so_it_still_converges`.
 
 Because both stubbed methods (`_recharge_one_account`, `_register_one_account`)
 only touch the passed `worker` and never write `self` counters unlocked, the only
