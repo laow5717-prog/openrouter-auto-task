@@ -567,6 +567,14 @@ def delete_accounts():
     if not emails:
         return jsonify({"error": "没有指定要删除的账号"}), 400
 
+    # 先释放 AdsPower 环境，再删 DB 行。
+    #
+    # 顺序是刻意的：环境配额只有 12 格，而删账号是「我不要它了」的终局操作——不在这里
+    # 释放，那一格就一直被占着，直到下一次撞配额触发 reclaim 才会被当孤儿收掉。
+    # 反过来说，AdsPower 挂了/没开也绝不能挡住删账号，所以整段是 best-effort：
+    # 任何异常都吞掉，账号照删（残留映射仍会被 reclaim 的第 0 档兜底回收）。
+    ads = _release_adspower_for(emails)
+
     # 删除关联的卡片绑定记录
     placeholders = ','.join(['?'] * len(emails))
     models['card_binding'].db.execute(
@@ -576,7 +584,38 @@ def delete_accounts():
     # 身份没了，它在各平台的账号行也就没有意义了——不清会留下引用不存在邮箱的孤儿行
     models['platform_account'].delete_all_for_emails(emails)
     count = models['account'].delete_by_emails(emails)
-    return jsonify({"deleted": count})
+    return jsonify({"deleted": count, "adspower": ads})
+
+
+def _release_adspower_for(emails):
+    """删账号时同步删掉它们的 AdsPower 环境，返回给前端看的结果摘要。
+
+    绝不抛异常：调用方是删除接口，环境释放失败不该让账号删不掉。
+    """
+    result = {"released": [], "skipped_busy": [], "failed": [], "reason": ""}
+    state = get_app_state()
+    try:
+        if not state.adspower_enabled:
+            result["reason"] = "AdsPower 未启用，跳过环境释放"
+            return result
+        # 复用共享的池而不是新建：它的 _lock 串行化着「挑代理→建环境→撞配额→回收」，
+        # 新建一个等于绕开那把锁，可能与正在建环境的 worker 撞在一起。
+        _client, pool = state._ensure_adspower()
+        if pool is None:
+            result["reason"] = "AdsPower 环境池不可用，跳过环境释放"
+            return result
+        out = pool.release_many(emails)
+        result.update({k: out.get(k, []) for k in
+                       ("released", "skipped_busy", "failed")})
+        if result["skipped_busy"]:
+            result["reason"] = "部分账号正在运行，其环境保留至跑完后自动回收"
+        elif result["failed"]:
+            result["reason"] = "AdsPower 删除环境失败，环境仍占用配额"
+    except Exception as e:      # noqa: BLE001 —— 见 docstring：绝不阻断删除
+        result["failed"] = list(emails)
+        result["reason"] = f"释放 AdsPower 环境时出错: {str(e)[:150]}"
+        state.add_log(f"[AdsPower] 删账号时释放环境失败: {str(e)[:150]}")
+    return result
 
 
 @api.route('/api/accounts/<email>/cards')

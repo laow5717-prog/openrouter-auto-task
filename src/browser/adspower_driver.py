@@ -253,6 +253,57 @@ class AdsPowerProfilePool:
             self.profiles.delete_by_email(email)
             return True
 
+    def release_many(self, emails):
+        """批量删除这些账号的环境，返回 {released, skipped_busy, failed, no_profile}。
+
+        不是 `for e in emails: self.release(e)`：release 每次都走一遍 _stop_all，
+        而它在停过环境后要 sleep(1.5) 等 AdsPower 的异步状态翻转。删 20 个账号就是
+        30 秒的纯等待，删除接口会直接卡到前端超时。整批一次 stop、一次 delete，
+        那 1.5 秒只付一次。
+
+        正被 worker 占用的账号（_is_busy）跳过远端删除并保留映射——删掉正在用的环境
+        会让那个 worker 的浏览器凭空消失。调用方通常紧接着就把账号行删了，于是映射
+        变成孤儿，由 reclaim_candidates 的第 0 档在跑完后回收，配额不会永久丢。
+
+        删除失败时**不清本地映射**（与 reclaim 同一条红线）：先清本地再删远端，一旦
+        失败就留下查不到映射、也没人再删的孤儿环境，那一格配额被永久吃掉。
+        """
+        out = {"released": [], "skipped_busy": [], "failed": [], "no_profile": []}
+        if not emails:
+            return out
+        with self._lock:
+            targets = []      # [(email, profile_id)]
+            for email in emails:
+                row = self.profiles.get_by_email(email)
+                if not row:
+                    out["no_profile"].append(email)
+                    continue
+                if self._is_busy(email):
+                    out["skipped_busy"].append(email)
+                    continue
+                targets.append((email, row["profile_id"]))
+
+            if out["skipped_busy"]:
+                self._log("[AdsPower] 以下账号正在运行，其环境未删除（待跑完后回收）: "
+                          + "、".join(out["skipped_busy"]))
+            if not targets:
+                return out
+
+            self._stop_all([pid for _, pid in targets])
+            try:
+                self.client.delete_profiles([pid for _, pid in targets])
+            except AdsPowerError as e:
+                self._log(f"[AdsPower] 批量删除环境失败: {str(e)[:150]}")
+                out["failed"] = [email for email, _ in targets]
+                return out
+
+            emails_done = [email for email, _ in targets]
+            self.profiles.delete_by_emails(emails_done)
+            out["released"] = emails_done
+            self._log(f"[AdsPower] 已随账号删除释放 {len(emails_done)} 个环境: "
+                      + "、".join(emails_done))
+            return out
+
 
 def _pick_page(context):
     """从接管到的 context 里选一个可用页面。

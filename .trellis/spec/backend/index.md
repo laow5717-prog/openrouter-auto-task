@@ -29,7 +29,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Database Guidelines](./database-guidelines.md) | SQLite, identity/platform split, migrations, row-name pitfalls | Active |
 | [Concurrency Guidelines](./concurrency-guidelines.md) | Worker pool, the three exclusions, thread-binding constraints | Active |
 | [Browser Profile](./browser-profile-guidelines.md) | Profile hygiene, the white-screen failure, what is safe to delete | Active |
-| [AdsPower](./adspower-guidelines.md) | Fingerprint-browser mode: 12-profile quota, reclaim, proxy binding, CDP takeover | Active |
+| [AdsPower](./adspower-guidelines.md) | Fingerprint-browser mode: 12-profile quota, reclaim, eager release on delete, proxy binding, CDP takeover | Active |
 | [Captcha](./captcha-guidelines.md) | Token delivery to React, Turnstile vs hCaptcha APIs, anti-detection constraints | Active |
 | [Email Verification](./email-verification-guidelines.md) | mail.tm 收码、验证码长度、旧码时间闸门、2FA 登录 | Active |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |

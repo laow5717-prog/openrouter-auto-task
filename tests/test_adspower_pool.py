@@ -367,6 +367,95 @@ def test_reclaim_keeps_mapping_when_delete_fails(db):
     assert AdsPowerProfileModel(db).get_by_email("done@x.com") is not None
 
 
+# ---------- release_many：删账号时同步释放环境 ----------
+
+def test_release_many_deletes_remote_and_mapping(db):
+    """删账号必须把远端环境和本地映射一起清掉，否则那格配额白占着。"""
+    client = FakeClient(quota=5)
+    pool = _pool(db, client)
+    _account(db, "a@x.com", "registered")
+    _account(db, "b@x.com", "registered")
+    pid_a, _, _ = pool.ensure_profile("a@x.com")
+    pid_b, _, _ = pool.ensure_profile("b@x.com")
+
+    out = pool.release_many(["a@x.com", "b@x.com"])
+
+    assert set(out["released"]) == {"a@x.com", "b@x.com"}
+    assert set(client.deleted) == {pid_a, pid_b}
+    m = AdsPowerProfileModel(db)
+    assert m.get_by_email("a@x.com") is None
+    assert m.get_by_email("b@x.com") is None
+
+
+def test_release_many_batches_stop_and_delete(db):
+    """整批只发一次 delete。逐个调 release 会为每个账号各等 1.5 秒，删多了直接卡死接口。"""
+    calls = []
+
+    class CountingDelete(FakeClient):
+        def delete_profiles(self, ids):
+            calls.append(list(ids))
+            return super().delete_profiles(ids)
+
+    client = CountingDelete(quota=5)
+    pool = _pool(db, client)
+    for e in ("a@x.com", "b@x.com", "c@x.com"):
+        _account(db, e, "registered")
+        pool.ensure_profile(e)
+
+    pool.release_many(["a@x.com", "b@x.com", "c@x.com"])
+
+    assert len(calls) == 1 and len(calls[0]) == 3
+    # 删除前必须先停：AdsPower 拒绝删除运行中的环境
+    assert len(client.stopped) == 3
+
+
+def test_release_many_skips_busy(db):
+    """正在跑的账号：环境保留（删了 worker 的浏览器会凭空消失），但要回报出来。"""
+    client = FakeClient(quota=5)
+    busy = {"busy@x.com"}
+    pool = _pool(db, client, is_busy=lambda e: e in busy)
+    _account(db, "busy@x.com", "registered")
+    _account(db, "idle@x.com", "registered")
+    pool.ensure_profile("busy@x.com")
+    idle_pid, _, _ = pool.ensure_profile("idle@x.com")
+
+    out = pool.release_many(["busy@x.com", "idle@x.com"])
+
+    assert out["skipped_busy"] == ["busy@x.com"]
+    assert out["released"] == ["idle@x.com"]
+    assert client.deleted == [idle_pid]
+    # 映射保留 —— 账号行随后被删掉，它变成孤儿，由 reclaim 第 0 档在跑完后回收
+    assert AdsPowerProfileModel(db).get_by_email("busy@x.com") is not None
+
+
+def test_release_many_keeps_mapping_when_delete_fails(db):
+    """删除失败不清映射：先清本地再删远端，一旦失败就留下没人再管的孤儿环境。"""
+    class FailingDelete(FakeClient):
+        def delete_profiles(self, ids):
+            raise AdsPowerError("删除失败")
+
+    client = FailingDelete(quota=5)
+    pool = _pool(db, client)
+    _account(db, "a@x.com", "registered")
+    pool.ensure_profile("a@x.com")
+
+    out = pool.release_many(["a@x.com"])
+
+    assert out["failed"] == ["a@x.com"] and out["released"] == []
+    assert AdsPowerProfileModel(db).get_by_email("a@x.com") is not None
+
+
+def test_release_many_ignores_accounts_without_profile(db):
+    """从未跑过的账号没有映射，不该因此报错或误删别人的环境。"""
+    client = FakeClient(quota=5)
+    pool = _pool(db, client)
+
+    out = pool.release_many(["never@x.com"])
+
+    assert out["no_profile"] == ["never@x.com"]
+    assert client.deleted == [] and client.stopped == []
+
+
 # ---------- BrowserSession remote 分支 ----------
 
 def _remote_session(remote_stop, browser, playwright):

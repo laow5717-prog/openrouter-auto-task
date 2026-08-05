@@ -381,25 +381,42 @@ async function handleImport() {
   }
 }
 
+// 环境没释放干净必须弹出来说：静默的话用户会以为配额已经腾出来了，
+// 直到下一次跑任务报「配额已满」才发现，那时根本联想不到是删除操作没做完。
+function reportAdsPower(ads) {
+  if (!ads) return
+  const parts = []
+  if (ads.skipped_busy?.length) {
+    parts.push(`以下账号正在运行，其 AdsPower 环境暂未删除（跑完后会自动回收）：\n${ads.skipped_busy.join('、')}`)
+  }
+  if (ads.failed?.length) {
+    parts.push(`以下账号的 AdsPower 环境删除失败，仍占用配额：\n${ads.failed.join('、')}`)
+  }
+  if (!parts.length) return
+  alert(parts.join('\n\n') + (ads.reason ? `\n\n原因：${ads.reason}` : ''))
+}
+
 async function handleDelete() {
   if (selected.size === 0) return
   const count = selected.size
-  if (!confirm(`确定要删除选中的 ${count} 个账号吗？\n\n此操作将永久删除账号及其关联的卡片绑定记录，不可恢复！`)) return
+  if (!confirm(`确定要删除选中的 ${count} 个账号吗？\n\n此操作将永久删除账号及其关联的卡片绑定记录，并删除其对应的 AdsPower 浏览器环境以释放配额，不可恢复！`)) return
   try {
-    await deleteAccounts(Array.from(selected))
+    const res = await deleteAccounts(Array.from(selected))
     selected.clear()
     await loadData()
+    reportAdsPower(res?.adspower)
   } catch (e) {
     alert('删除失败: ' + e.message)
   }
 }
 
 async function handleDeleteOne(email) {
-  if (!confirm(`确定要删除账号 ${email} 吗？\n\n此操作将永久删除该账号及其关联的卡片绑定记录，不可恢复！`)) return
+  if (!confirm(`确定要删除账号 ${email} 吗？\n\n此操作将永久删除该账号及其关联的卡片绑定记录，并删除其对应的 AdsPower 浏览器环境以释放配额，不可恢复！`)) return
   try {
-    await deleteAccounts([email])
+    const res = await deleteAccounts([email])
     selected.delete(email)
     await loadData()
+    reportAdsPower(res?.adspower)
   } catch (e) {
     alert('删除失败: ' + e.message)
   }

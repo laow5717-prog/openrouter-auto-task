@@ -176,6 +176,40 @@ pipeline marks that one account failed and moves on. It must not retry forever.
 
 ---
 
+## Eager release when an account is deleted
+
+Reclaim being lazy is right for accounts that *finished*; it is wrong for accounts
+the user *deleted*. Deleting an account is terminal — the profile holds a session
+nobody will ever want again — so `POST /api/accounts/delete` calls
+`AdsPowerProfilePool.release_many(emails)` **before** removing the DB rows, and the
+slot comes back immediately instead of waiting for the next quota collision.
+
+`release_many` is not `for e in emails: release(e)`. `release` runs `_stop_all`,
+which sleeps 1.5s waiting for AdsPower's async state flip; per-account that is
+30 seconds for a 20-account delete and the request times out in the browser. One
+stop batch plus one delete batch pays that 1.5s once.
+
+Two invariants carry over from reclaim, and one is new:
+
+- Local mappings are cleared **only after** the remote delete succeeds. On
+  `AdsPowerError` the mapping stays and the emails come back in `failed`.
+- `is_busy(email)` accounts keep their profile — same reason as reclaim. They are
+  returned in `skipped_busy`, **and the account row is still deleted**: the user's
+  intent to delete is not vetoed by a running job. The mapping becomes an orphan,
+  which tier 0 reclaims once the worker finishes. This is the one place that
+  creates orphans on purpose.
+- Release is **best-effort and never blocks deletion**. AdsPower disabled, client
+  unreachable, delete failing — all are swallowed by `_release_adspower_for` in
+  `src/api/routes.py`, which returns `{released, skipped_busy, failed, reason}`
+  for the UI. An external dependency being down must not make account cleanup
+  impossible.
+
+The response's `adspower` block has to be surfaced in the UI. Silently swallowing
+`skipped_busy`/`failed` tells the user quota was freed when it wasn't; they only
+find out at the next `配额已满`, with nothing linking it back to the delete.
+
+---
+
 ## Client-side rate limiting is not optional
 
 0–200 profiles allows 2 req/sec; `user/list`, `proxy-list/*` and a few others are
