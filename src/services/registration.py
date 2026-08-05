@@ -295,6 +295,19 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
             if payment_registry is not None and not payment_registry.try_acquire(platform, num, email):
                 continue
             try:
+                # 冷却实时复查。上面那份 cards 是**会话开始时**的快照，而一次会话要连充
+                # 多笔、可能跑很久；期间别的 worker 完全可能把这张卡刷失败并设上冷却，
+                # 快照里它还在，照刷就违反了「当日失败不再用」。
+                # in_flight 挡不住（对方早已释放），_used 只覆盖同一轮，所以按 DB 再问一次。
+                # 必须写在 try 之内：写在 try_acquire 与 try 之间的话，continue 会跳过
+                # finally 里的 release，这张卡的 in-flight 占用就永久泄漏了。
+                # 异常一律放行——安全网不该比它保护的流程更脆弱。
+                if card_state_model is not None:
+                    try:
+                        if card_state_model.in_cooldown(platform, num):
+                            continue          # 不计入 attempts：跳过不算一次尝试
+                    except Exception:
+                        pass
                 attempts += 1
                 card_last4 = str(num)[-4:]
                 last4 = card_last4
@@ -443,10 +456,13 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                                 session,
                                 f"卡{card_last4} 已连续失败 {streak} 次，判为无效")
                     elif monitor_callback and streak:
+                        # 不报小时数：实际到期是 max(次日 00:00, now + N 小时)，
+                        # 只说「冷却 12h」会与卡在列表页显示的到期时刻对不上。
                         monitor_callback(
                             session,
                             f"卡{card_last4} 连续失败 {streak}/{recharge_cfg.fail_threshold()} 次，"
-                            f"冷却 {recharge_cfg.fail_cooldown_hours}h 后再试")
+                            f"当日不再使用，冷却至 "
+                            f"{card_state_model.get_tds_until(platform, num) or '次日'}")
                     _log_card_attempt(card, False, reason, result, charged)
 
                 if monitor_callback:

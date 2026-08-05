@@ -335,3 +335,105 @@ def test_failed_acquire_does_not_release_someone_elses_card(stub, models):
     assert registry.in_flight_owner(num) == STUB
     assert [e for _n, e in stub.usage if e == 'intruder@x.com'] == [], \
         '抢不到卡却仍然提交了支付'
+
+
+# ---------- 冷却的实时复查：快照之后被别人设上冷却的卡不能再刷 ----------
+
+
+class _CooldownRaceStub(_ContentionStub):
+    """刷完一张卡后，模拟「另一个 worker 把 cooled_number 刷失败并设了冷却」。
+
+    真实场景：recharge_account 在**会话开始时**过滤一次冷却卡，之后整个会话都用那份
+    快照。一次会话要连充多笔、可能跑很久，期间别的 worker 完全可能把某张卡刷废并冷却
+    ——快照里它还在。in_flight 挡不住（对方早已释放），_used 只覆盖同一轮。
+
+    继承压测桩以复用整套适配器接口，只换 top_up 的行为。
+    """
+
+    def __init__(self, card_state, cooled_number, hours=12):
+        super().__init__(hold=0)
+        self.card_state = card_state
+        self.cooled_number = cooled_number
+        self.hours = hours
+        self.charged = []          # 实际被提交给「发卡行」的卡号
+
+    def top_up(self, session, tenant_id, card, amount=None, monitor=None, should_stop=None):
+        num = card['number']
+        self.charged.append(num)
+        self.card_state.set_cooldown(STUB, self.cooled_number, hours=self.hours,
+                                     reason='别的 worker 刷失败了')
+        return PaymentResult(ok=True, outcome='success', last4=str(num)[-4:],
+                             balance_after=None)
+
+
+def _run_one(stub, models, cards, cfg, email='a@x.com', registry=None):
+    platforms.register(stub)
+    try:
+        return registration.recharge_account(
+            email, 'pw',
+            payment_cards=list(cards),
+            recharge_log_model=models['recharge_log'],
+            valid_card_model=models['valid_card'],
+            card_pool_model=models['card_pool'],
+            account_model=models['account'],
+            card_state_model=models['card_state'],
+            payment_registry=registry,
+            platform=STUB,
+            platform_account_model=models['platform_account'],
+            adapter=stub,
+            browser_factory=lambda e: _Session(e),
+            recharge_cfg=cfg,
+        )
+    finally:
+        platforms.unregister(STUB)
+
+
+def test_card_cooled_after_the_snapshot_is_not_charged(models):
+    """会话快照之后被设上冷却的卡，本会话必须跳过它。
+
+    没有这道实时复查，同一张卡当日会被刷第二次——「当日失败不再使用」当场破功。
+    """
+    cards = [_card(1), _card(2)]
+    stub = _CooldownRaceStub(models['card_state'], cooled_number=cards[1]['number'])
+
+    _run_one(stub, models, cards, _LOOSE)
+
+    assert cards[0]['number'] in stub.charged
+    assert cards[1]['number'] not in stub.charged, \
+        f'快照后被冷却的卡仍被提交给发卡行: {stub.charged}'
+
+
+def test_cooldown_recheck_failure_does_not_break_the_session(models, monkeypatch):
+    """复查本身出错时按「不在冷却」放行——安全网不该比它保护的流程更脆弱。"""
+    cards = [_card(1), _card(2)]
+    stub = _CooldownRaceStub(models['card_state'], cooled_number=cards[1]['number'])
+
+    calls = {'n': 0}
+    real = models['card_state'].in_cooldown
+
+    def boom(platform, num):
+        calls['n'] += 1
+        if calls['n'] > 1:            # 入口的预过滤放过，循环内的复查炸
+            raise RuntimeError('DB 抖了一下')
+        return real(platform, num)
+
+    monkeypatch.setattr(models['card_state'], 'in_cooldown', boom)
+
+    _run_one(stub, models, cards, _LOOSE)
+
+    assert cards[0]['number'] in stub.charged, '复查抛异常把整个会话带崩了'
+
+
+def test_skipped_card_does_not_leak_its_in_flight_slot(models):
+    """跳过冷却卡时 finally 仍要 release，否则那张卡永久锁死在 in-flight 里。
+
+    这是 continue 写错位置（放到 try 之外）时的典型后果：不报错，卡池悄悄变小。
+    """
+    cards = [_card(1), _card(2)]
+    stub = _CooldownRaceStub(models['card_state'], cooled_number=cards[1]['number'])
+    registry = PaymentCardRegistry()
+
+    _run_one(stub, models, cards, _LOOSE, registry=registry)
+
+    assert registry.in_flight_numbers() == set(), \
+        f'跳过的卡没有释放 in-flight 占用: {registry.in_flight_numbers()}'

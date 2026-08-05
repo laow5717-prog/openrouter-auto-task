@@ -28,17 +28,34 @@ class CardPaymentStateModel:
     def __init__(self, db):
         self.db = db
 
-    def set_cooldown(self, platform, card_number, hours=24, reason=''):
-        """标记该卡在此平台进入临时冷却，到期时间 = now + hours。幂等（同卡再标覆盖到期）。
+    def set_cooldown(self, platform, card_number, hours=12, reason=''):
+        """标记该卡在此平台进入临时冷却。幂等（同卡再标覆盖到期）。
 
-        触发面有两类：遇 3DS，以及**任何一次充值被拒**（不再区分这张卡此前成功过没有
-        ——「同一张卡两次使用至少隔 fail_cooldown_hours」是对所有卡一视同仁的规则，
-        为的是不在发卡行那里连着撞 velocity 风控）。判废与否另由 fail_streak 决定。"""
+        到期时刻 = **max(次日 00:00, now + hours)**，规则是「一张卡当日付款失败，
+        当日就不再被选用」。发卡行的 velocity 风控按自然日算，跟着自然日走口径才对得上；
+        纯滑动窗口下恢复时刻会随失败时刻漂移（15:00 失败就得等到次日 15:00），不可预期。
+
+        `hours` 是**下限**而非时长。只用次日零点的话，23:59 失败的卡一分钟后就能再刷，
+        「当日不再用」形同虚设，所以取两者较大值。两个分支各自生效的区间由 hours 决定：
+        默认 12 时，中午前失败的卡次日零点回来，中午后失败的按 12h 滑动。
+
+        触发面有两类：遇 3DS，以及**任何一次充值被拒**（不区分这张卡此前成功过没有
+        ——冷却对所有失败一视同仁）。判废与否另由 fail_streak 决定。
+
+        字符串比较即可正确取 max：datetime() 返回定长零填充的 'YYYY-MM-DD HH:MM:SS'，
+        字典序与时间序一致，不必绕到 Python 侧算。
+        """
         if not card_number:
+            return
+        # hours <= 0 是「禁用冷却」的显式配置，不是「冷却 0 小时」。若不在这里短路，
+        # 自然日分支会把它变成「冷却到次日零点」——想关掉冷却的人反而得到了最长的一档。
+        # 已有的冷却保持不变：本方法的语义是「设一道冷却」，不是「重置冷却状态」。
+        if int(hours) <= 0:
             return
         self.db.execute(
             "INSERT INTO card_payment_state (card_number, platform, tds_until, tds_reason, updated_at) "
-            "VALUES (?, ?, datetime('now','localtime',?), ?, datetime('now','localtime')) "
+            "VALUES (?, ?, MAX(datetime('now','localtime','start of day','+1 day'), "
+            "                  datetime('now','localtime',?)), ?, datetime('now','localtime')) "
             "ON CONFLICT(card_number, platform) DO UPDATE SET "
             "  tds_until=excluded.tds_until, tds_reason=excluded.tds_reason, updated_at=excluded.updated_at",
             (card_number, platform, f'+{int(hours)} hours', (reason or '')[:200]),

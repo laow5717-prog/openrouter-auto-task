@@ -19,7 +19,9 @@ def test_defaults_match_the_documented_policy():
     assert (c.amount_min, c.amount_max) == (20, 100)
     assert c.balance_cap == 200.0
     assert c.max_fail_streak == 3
-    assert c.fail_cooldown_hours == 24
+    # 12 而非 24：冷却到期是 max(次日 00:00, now + 本值)，本值只是**下限**。
+    # 配 24 的话小时分支永远晚于次日零点，max 恒取它，自然日规则等于没生效。
+    assert c.fail_cooldown_hours == 12
 
 
 def test_pick_amount_stays_inside_the_range():

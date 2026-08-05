@@ -150,16 +150,18 @@ class RechargeConfig:
     max_fail_streak: 一张卡在某平台**连续**失败多少次才判废。中间成功一次即清零。
              此前的口径是首次被拒即永久 invalid，一次发卡行瞬时抖动就能烧掉一张好卡。
 
-    fail_cooldown_hours: 一张卡失败后多久内不再被选中。与 max_fail_streak 叠加的
-             效果是：判废一张坏卡最快需要 max_fail_streak × fail_cooldown_hours
-             （默认 3 天）。这是有意的——宁可慢，不可误杀。
+    fail_cooldown_hours: 失败卡冷却时长的**下限**，不是时长本身。实际到期时刻是
+             max(次日 00:00, now + 本值)——规则是「一张卡当日付款失败，当日就不再
+             被选用」，跟着自然日走才对得上发卡行按自然日算的 velocity 风控。
+             取 max 是因为只用次日零点的话，23:59 失败的卡一分钟后就能再刷。
+             默认 12：中午前失败的卡次日零点回来，中午后失败的按 12h 滑动。
              注意**只有失败才冷却**，成功的卡可立即复用，否则「成功后继续充」无从谈起。
     """
     amount_min: int = 20
     amount_max: int = 100
     balance_cap: float = 200.0
     max_fail_streak: int = 3
-    fail_cooldown_hours: int = 24
+    fail_cooldown_hours: int = 12
 
     # 金额的绝对边界。夹紧而非报错：一个越界的配置值不该让整条充值流水线停摆。
     AMOUNT_FLOOR = 1
@@ -409,7 +411,7 @@ class ConfigLoader:
                 amount_max=int(rc.get('amount_max', 100)),
                 balance_cap=float(rc.get('balance_cap', 200)),
                 max_fail_streak=int(rc.get('max_fail_streak', 3)),
-                fail_cooldown_hours=int(rc.get('fail_cooldown_hours', 24)),
+                fail_cooldown_hours=int(rc.get('fail_cooldown_hours', 12)),
             )
 
         if 'captcha' in self.raw_config:
