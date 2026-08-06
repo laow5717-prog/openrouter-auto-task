@@ -296,16 +296,35 @@ The lock spanning find+claim is what stops two workers taking the same account
   failed registration — land in `done`. Convergence therefore rests on the
   round boundary, not on accounts draining.
 
-**The round boundary's "zero progress" test decides whether the run ever ends**,
-and it is easy to get wrong. Progress means *either* a card was paid *or* the
-selectable-card set **gained** members (a cooldown expired, new cards imported).
+**The round boundary decides whether the run ever ends**, and the product
+requirement is blunt: *run until the card pool is exhausted*. Progress means
+*either* a card was paid *or* the selectable-card set **changed at all** —
+gaining members (cooldown expired, cards imported) **or losing them** (a card was
+declined and went to cooldown / invalid). Burning cards is progress.
 
-Comparing the sets with `!=` instead of taking the difference counts *shrinkage*
-as progress — and the set shrinks every time a card is declined and marked
-invalid. On 2026-08-05 that kept `zero_rounds` pinned at 0 through **113 rounds**:
-two accounts failing in a loop, the card pool ground from 3426 down to 2796,
-no error logged, stopped only by hand. Regression guard:
-`test_burning_cards_is_not_progress_so_it_still_converges`.
+Termination does not come from a round cap. It comes from the card set being
+finite and monotonically consumed: every failed attempt removes a card, so
+`分组可选卡已耗尽` is always reachable and is the **primary** convergence path for
+a fully-failing run.
+
+The one early stop that remains is a **fully idle round**: nothing paid *and* not
+a single card moved. That means the flow never reached the card-trying step at all
+(login broke, profile would not start, hCaptcha timed out), so another round can
+only repeat itself and the card-exhaustion path is unreachable.
+`IDLE_ROUNDS_LIMIT = 2` tolerates one round of transient noise.
+
+> **Both directions of this have burned us — read before "fixing" it again.**
+> Originally the sets were compared with `!=`, so shrinkage counted as progress
+> and the counter never advanced: on 2026-08-05 a run went **113 rounds**, two
+> accounts failing in a loop, pool ground from 3426 to 2796, no error logged,
+> stopped by hand. The fix — count only *gained* cards — then failed the opposite
+> way on 2026-08-06: 0 payments succeeded, so two rounds after start the run
+> converged with **2596 selectable cards never tried**. The current rule (any
+> change counts, idle-only stop) is the deliberate third position: the 113-round
+> scenario is now *expected behaviour*, bounded by the pool rather than by rounds.
+> Guards: `test_burning_cards_keeps_running_until_pool_is_exhausted`,
+> `test_idle_two_rounds_then_stop`,
+> `test_idle_counter_resets_after_a_round_that_burned_cards`.
 
 Because both stubbed methods (`_recharge_one_account`, `_register_one_account`)
 only touch the passed `worker` and never write `self` counters unlocked, the only

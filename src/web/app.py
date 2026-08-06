@@ -43,6 +43,11 @@ from src.web.worker import (
 # Stripe 结账风控看卡/账单/设备指纹，不强依赖 IP 与 opencode 会话同源，可接受本机 IP。
 _PROXY_BYPASS = "*.stripe.com, stripe.com, *.stripecdn.com, b.stripecdn.com, js.stripe.com, m.stripe.com, m.stripe.network, *.stripe.network"
 
+# 充值任务连续多少轮「完全空转」才收敛。空转 = 既没付成一张卡、可选卡集合也一张没动。
+# 取 2 而不是 1 是为了吸收一轮瞬时抖动（登录/网络类故障常常只坏一轮）。
+# 注意这**不是**「失败多少轮就停」——只要还在消耗卡就一直跑，见 _try_claim 的轮边界。
+IDLE_ROUNDS_LIMIT = 2
+
 
 # ---------- 日志归属 ----------
 #
@@ -950,10 +955,12 @@ class AppState:
         **以刷完卡池为第一标准**：只要分组还有可选卡且还有账号可用就继续跑；
         充值失败的账号只跳过**本轮**，一轮轮完（所有账号都试过一遍）后清空失败名单、
         回到头部开下一轮重试（A 失败→换 B→…→下一轮再试 A）。停止条件（满足其一）：
-          1. 分组可选卡耗尽（全部无效/过期或冷却中）；
-          2. 无账号可用：payable + imported 都领不到，且连续两整轮零进展
-             （没付成一张卡、可选卡集合也没变化——再轮转只会原样重复，防死循环兜底；
-             容忍一轮零进展是为了吸收登录/网络类瞬时抖动）；
+          1. 分组可选卡耗尽（全部无效/过期或冷却中）——**主收敛路径**，失败卡逐张进
+             冷却/判无效，可选集有限且单调消耗，全失败也终会走到这里；
+          2. 无账号可用：payable + imported 都领不到；或连续 IDLE_ROUNDS_LIMIT 整轮
+             **完全空转**（没付成一张卡、可选卡也一张没动——流程根本没走到试卡环节，
+             再轮转只会原样重复且永远到不了条件 1；容忍一轮是为了吸收瞬时抖动）。
+             注意「失败但烧了卡」不算空转：那是进展，会继续开新一轮；
           3. 用户手动停止。
 
         选卡资格（见 _eligible_cards）：新卡优先，付款成功过的好卡可反复复用；卡退出可选集
@@ -1068,7 +1075,7 @@ class AppState:
             # 最多 ceil(cap / amount_min) 次必然越过 cap 而出局——收敛由金额自己保证，
             # 不再需要次数闸。
             # 失败路径（充不成 → 金额不增长）不归这里管：failed_this_round 让它本轮出局，
-            # 跨轮由轮边界的「连续零进展」兜底，与可充值账号一视同仁。
+            # 跨轮由轮边界的「连续完全空转」兜底，与可充值账号一视同仁。
             # ── 本次运行给每个账号充值的**内存估算**（email -> 累计金额）──
             # 领取即按 amount_min（每笔下界）计入，充值失败再回退。它是 recharge_logs
             # 之外的第二本账，两件事都靠它：
@@ -1177,14 +1184,15 @@ class AppState:
             #              退出：在飞账号失败后会回到轮转池，退出会白白减员）；
             #      开新一轮 —— 无人在飞且本轮有失败账号、且上一轮有进展（付成过或可选卡
             #              集合变过），清空失败名单从头重试，并清掉「本轮已试过的卡」标记；
-            #      done —— 卡池耗尽 / 无账号可用 / 整轮零进展（再轮只会原样重复），收敛。
+            #      done —— 卡池耗尽（主路径）/ 无账号可用 / 整轮完全空转（一张卡都没动，
+            #              再轮只会原样重复），收敛。
             #    produce_lock 让「找账号 + claim + 轮转判定」原子，两 worker 绝不领同一个。
             #    领到即用 account_registry 占坑，消费者 finally 释放。返回 None 表示任务收敛。
             round_state = {
                 'no': 1,
                 'paid_at_start': 0,
-                'cards_at_start': None,   # 本轮开始时的可选卡键集合，判「零进展」用
-                'zero_rounds': 0,         # 连续零进展轮数；≥2 才停（容忍一轮瞬时抖动）
+                'cards_at_start': None,   # 本轮开始时的可选卡键集合，判「有没有动卡」用
+                'idle_rounds': 0,         # 连续完全空转轮数；≥2 才停（容忍一轮瞬时抖动）
             }
             end_logged = [False]          # 收敛原因只打一次（多 worker 会各拿到一次 done）
             reuse_logged = [False]        # 「开始复用老账号」也只打一次
@@ -1235,7 +1243,7 @@ class AppState:
                         return 'item', ('register', a, proxy, pkey)
                 # 「本轮还有账号在飞吗」——**必须只看本平台**。registry 是跨平台共享的，
                 # 不过滤的话本平台会把另一个平台正在跑的账号当成自己这轮在飞，于是永远
-                # 走 'wait'、轮边界永不触发、失败账号永不重试、zero_rounds 永不递增——
+                # 走 'wait'、轮边界永不触发、失败账号永不重试、idle_rounds 永不递增——
                 # 任务就这么静默地不收敛了，没有任何报错。
                 if self.account_registry.snapshot(owner=platform):
                     return 'wait', None
@@ -1245,21 +1253,29 @@ class AppState:
                 with state_lock:
                     paid_now = stats['paid']
                 cards_now = _card_keys_now()
-                # 「可选卡有变化」这一条**只认新增**。它的原意是「卡集合变了，下一轮
-                # 可能有不同结果，值得再试」——针对的是冷却到期、新卡导入这类**增加**。
-                # 原先用 != 判断，把「卡被逐张标 invalid」这种**减少**也算成了进展：
-                # 每烧掉一张卡就清零一次 zero_rounds，任务永不收敛。2026-08-05 现场
-                # 跑到第 113 轮仍在打转，2 个账号反复失败、可选卡从 3426 被烧到 2796，
-                # 最后靠人工停掉。取差集则保留了原意，又不会把倒退当成进展。
-                gained = cards_now - round_state['cards_at_start']
-                progressed = paid_now > round_state['paid_at_start'] or bool(gained)
+                # 「卡集合变了」= 有进展，**增减都算**。烧卡算进展是刻意的：任务的
+                # 第一标准是刷完卡池，只要每轮还在消耗卡，就该继续轮转下去，剩多少张
+                # 不该由轮数来裁决。终止性由卡集合「有限且单调消耗」保证——烧到耗尽时
+                # 由上面的「分组可选卡已耗尽」分支收敛。
+                #
+                # 这一条 2026-08-05 曾被改成只认新增（`gained = cards_now - 起始集合`），
+                # 为的是压掉「2 个账号反复失败、卡被逐张烧掉、跑到第 113 轮还在打转」
+                # 的现场。代价是另一头翻车：08-06 那次运行成功付款 0 次，两轮后即收敛，
+                # **卡池里还剩 2596 张没试**。用户要的是刷完卡池，故改回增减都算。
+                # 113 轮那种场景现在是预期行为，不再是 bug。
+                changed = cards_now != round_state['cards_at_start']
+                progressed = paid_now > round_state['paid_at_start'] or changed
                 if progressed:
-                    round_state['zero_rounds'] = 0
+                    round_state['idle_rounds'] = 0
                 else:
-                    round_state['zero_rounds'] += 1
-                    if round_state['zero_rounds'] >= 2:
-                        return 'done', (f"连续 {round_state['zero_rounds']} 轮零进展"
-                                        "（未付成一张卡且无新的可选卡），账号已全部试尽")
+                    # 完全空转：既没付成、卡也一张没动。说明流程根本没走到试卡环节
+                    # （登录挂了 / 环境起不来 / hCaptcha 超时），再轮转只是原样重复，
+                    # 而且永远到不了「卡耗尽」那个收敛点——这是唯一还会提前停的情况。
+                    round_state['idle_rounds'] += 1
+                    if round_state['idle_rounds'] >= IDLE_ROUNDS_LIMIT:
+                        return 'done', (f"连续 {round_state['idle_rounds']} 轮完全空转"
+                                        "（未付成一张卡，可选卡也一张没动），"
+                                        "流程未走到试卡环节，再轮只会原样重复")
                 retrying = len(failed_this_round)
                 round_state['no'] += 1
                 round_state['paid_at_start'] = paid_now
@@ -1269,8 +1285,8 @@ class AppState:
                 # 「本轮已被试过的卡」标记随轮清零。只清本平台的归属，in-flight 不动
                 # ——那是全局的发卡行 velocity 防护，不该被轮边界打断。
                 self.payment_registry.release_all(platform)
-                zero_note = ("，上轮零进展（容忍一轮，可能是瞬时抖动）"
-                             if round_state['zero_rounds'] else "")
+                zero_note = ("，上轮完全空转（容忍一轮，可能是瞬时抖动）"
+                             if round_state['idle_rounds'] else "")
                 self._hooked_print(
                     f"\n一轮轮转完毕仍有可选卡 {len(cards_now)} 张，"
                     f"开始第 {round_state['no']} 轮（重试 {retrying} 个上轮失败账号{zero_note}）")
@@ -1297,7 +1313,7 @@ class AppState:
             #    worker）当作 payable 领来充值，实现「注册→登录→充值」闭环且可跨 worker 并行；
             #    充值成功记 success；归档/flagged/注册未成入 done（终态，永久退出）；
             #    充值失败只入 failed_this_round（本轮跳过，下一轮重试）——防无限重领的职责
-            #    移交给 _try_claim 的「整轮零进展」判定，卡池刷完前失败账号可循环使用。
+            #    移交给 _try_claim 的轮边界判定，卡池刷完前失败账号可循环使用。
             def _do(worker, item):
                 kind, acct, proxy, pkey = item
                 email = acct['email']
@@ -1363,7 +1379,7 @@ class AppState:
                     # ——结果是 A 平台饿死在等待、B 平台反复抛错自杀。
                     #
                     # 改为：只跳过本账号，并向借用方发一个归还请求。下一个账号还会重试，
-                    # 真的持续不可用时由「整轮零进展」兜底收敛。
+                    # 真的持续不可用时由「整轮完全空转」兜底收敛。
                     #
                     # 进 failed_this_round 而**不是** done。注释一直写着「本轮不再重领」，
                     # 代码用的却是 done——那是**整次运行**的永久集合，从不清空。于是每一次
@@ -1391,9 +1407,9 @@ class AppState:
                     if pkey:
                         self.proxy_registry.release(pkey)   # 排他领取的代理释放回池
 
-            # 收敛：每轮要么有进展（付成 / 可选卡集合缩小——卡被标 invalid/冷却，集合有限
-            # 单调消耗），要么零进展被 _try_claim 判停。账号可跨轮循环使用但轮数有界，
-            # _produce 终会返回 None → 所有 worker 退出。
+            # 收敛：卡被标 invalid/冷却后退出可选集，集合有限且单调消耗，所以「卡耗尽」
+            # 一定会到达——这是失败路径的主收敛点，账号可无限跨轮循环。只有一张卡都没动
+            # 的完全空转才由 _try_claim 提前判停。两条路都让 _produce 终返回 None。
             pool.run_until_empty(_produce, _do)
 
         except Exception as e:

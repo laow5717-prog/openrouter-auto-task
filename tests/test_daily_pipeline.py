@@ -148,7 +148,7 @@ class _FlakyOnceTracker(_Tracker):
 
 
 class _AlwaysFailTracker(_Tracker):
-    """充值永远失败且不动卡池（模拟登录类故障）——验证连续两轮零进展后收敛，不死循环。"""
+    """充值永远失败且不动卡池（模拟登录类故障）——验证连续两轮完全空转后收敛，不死循环。"""
 
     def recharge(self, email, login_password, **kw):
         self._enter(email)
@@ -162,14 +162,14 @@ class _AlwaysFailTracker(_Tracker):
 
 
 class _AlwaysFailBurningCardsTracker(_Tracker):
-    """每次充值都失败，且每次都烧掉一张卡——2026-08-05 那个不收敛现场的最小复现。
+    """每次充值都失败，且每次都烧掉一张卡——「刷完卡池才停」的最小复现。
 
-    现场：2 个账号反复失败，卡被逐张标 invalid，任务跑到第 113 轮仍在打转，
-    可选卡从 3426 被烧到 2796，最后靠人工停掉。
-
-    成因是轮边界的进展判定曾用 `cards_now != cards_at_start`——卡**变少**也算"变化"，
-    于是每烧一张就把 zero_rounds 清零，收敛条件永远够不着。改成只认新增后，
-    烧卡不再算进展，两轮后收敛。
+    这个 tracker 的历史值得留着：2026-08-05 它是「不收敛 bug」的复现（2 个账号反复
+    失败、跑到第 113 轮仍在打转），当天的修法是让烧卡不算进展、两轮零进展即收敛。
+    那个修法在 08-06 翻到另一头——成功付款 0 次时两轮就停，卡池里还剩 2596 张没试。
+    用户要的是刷完卡池，判据遂改回「卡集合有增减都算进展」，本 tracker 的期望行为
+    随之从「有限轮内收敛」变成「一直跑到卡耗尽」。同一段代码两次相反的期望，
+    都由现场证据定，不是反复无常。
     """
 
     def recharge(self, email, login_password, **kw):
@@ -379,37 +379,71 @@ def test_failed_accounts_retried_next_round(no_browser):
     assert r['is_running'] is False
 
 
-def test_burning_cards_is_not_progress_so_it_still_converges(no_browser):
-    """充值全失败、卡被逐张烧掉时，任务必须在**有限轮内**收敛。
+def test_burning_cards_keeps_running_until_pool_is_exhausted(no_browser):
+    """充值全失败但每轮都在烧卡时，任务必须**一直跑到卡耗尽**才停。
 
-    这是 2026-08-05 那个现场的回归护栏：进展判定曾用 `cards_now != cards_at_start`，
-    于是「卡变少」也被当成进展，zero_rounds 每轮清零，任务跑到第 113 轮仍在打转，
-    烧掉 630 张卡才被人工停掉。
+    任务的第一标准是刷完卡池，剩多少张不该由轮数来裁决。08-06 的现场正是反例：
+    成功付款 0 次，两轮零进展即收敛，卡池里还剩 2596 张从没被试过。
 
-    有界性是本用例的全部意义——它同时是「去掉复用次数闸」之后失败路径唯一的收敛保障。
-    断言取宽松上界：只要远小于卡数（16）即可，不锁死具体轮数。
+    终止性不靠轮数上界，靠卡集合有限且单调消耗——每次失败烧掉一张，16 张必然见底，
+    届时由「分组可选卡已耗尽」收敛。所以这里断言的是「卡被烧光」而非「轮数很小」。
     """
     r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=16,
                       tracker_cls=_AlwaysFailBurningCardsTracker)
     calls = r['recharged_calls']
-    # 2 个账号 × 2 轮（首轮 + 容忍一轮抖动的第二轮）= 4 次，随后判零进展收敛。
-    # 旧逻辑下这里会一直跑到把 16 张卡全烧完（≥16 次）。
-    assert len(calls) <= 6, f"未在有限轮内收敛，实际充值尝试 {len(calls)} 次: {calls}"
+    assert r['usable_cards_left'] == 0, \
+        f"应一直刷到卡耗尽才收敛，实际还剩 {r['usable_cards_left']} 张"
+    # 每次充值恰好烧一张，故尝试次数不少于卡数。旧逻辑（烧卡不算进展）下这里会在
+    # 4~6 次后就停，留下十来张没试的卡。
+    assert len(calls) >= 16, f"卡没被刷完，实际充值尝试 {len(calls)} 次: {calls}"
     assert r['status_counts'].get('recharged') is None, "全失败不该有账号变 recharged"
-    assert r['usable_cards_left'] > 0, "收敛原因应是账号试尽，而不是把卡烧光"
     assert r['is_running'] is False
     assert r['claims_left'] == 0 and r['in_flight_cards'] == 0
 
 
-def test_zero_progress_two_rounds_then_stop(no_browser):
-    """连续两轮零进展（不付成、不动卡）才收敛——既不死循环，也不因一轮抖动早退。"""
+def test_idle_two_rounds_then_stop(no_browser):
+    """连续两轮**完全空转**（不付成、一张卡也没动）才收敛。
+
+    这是唯一还会提前停的情况，也是必须保留的：一张卡都没消耗意味着流程根本没走到
+    试卡环节（登录挂了/环境起不来），继续轮转既不会有不同结果，也永远到不了
+    「卡耗尽」那个收敛点。容忍一轮是为了不被瞬时抖动误停。
+    """
     r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=8,
                       tracker_cls=_AlwaysFailTracker)
-    # 每个账号恰好被试了两轮，之后判「账号已全部试尽」收敛
+    # 每个账号恰好被试了两轮，之后判「完全空转」收敛
     calls = sorted(r['recharged_calls'])
     assert calls == ['reg0@example.com'] * 2 + ['reg1@example.com'] * 2
     assert r['status_counts'].get('recharged') is None
-    # 卡池原样未动——证明收敛原因是账号试尽，而非卡耗尽
+    # 卡池原样未动——证明收敛原因是空转，而非卡耗尽
     assert r['usable_cards_left'] == 8
+    assert r['is_running'] is False
+    assert r['claims_left'] == 0 and r['in_flight_cards'] == 0
+
+
+def test_idle_counter_resets_after_a_round_that_burned_cards(no_browser):
+    """空转计数只看「最近连续」，烧过卡的那一轮必须把它清零。
+
+    没有这条，一次早期抖动加上后来的一轮空转就会凑够 2 轮把任务停掉，而中间那些
+    正在烧卡的轮次全被无视——恰恰是本次改动要根除的「卡还剩一堆就收工」。
+    """
+    burned = 4
+
+    class _BurnThenIdle(_AlwaysFailBurningCardsTracker):
+        """前 burned 次失败各烧一张卡，之后转为纯失败不动卡池。"""
+
+        def recharge(self, email, login_password, **kw):
+            with self.lock:
+                n = len(self.recharged_calls)
+            if n < burned:
+                return super().recharge(email, login_password, **kw)
+            return _AlwaysFailTracker.recharge(self, email, login_password, **kw)
+
+    r = _run_pipeline(1, n_registered=2, n_imported=0, n_cards=16,
+                      tracker_cls=_BurnThenIdle)
+    calls = r['recharged_calls']
+    # 烧卡阶段每轮都算进展，计数持续清零；停下来只能是后面那两轮空转所致。
+    assert len(calls) >= burned + 4, \
+        f"烧卡阶段被提前打断，实际充值尝试 {len(calls)} 次: {calls}"
+    assert r['usable_cards_left'] == 16 - burned, "只该少掉烧掉的那几张"
     assert r['is_running'] is False
     assert r['claims_left'] == 0 and r['in_flight_cards'] == 0

@@ -24,7 +24,7 @@ def test_snapshot_only_sees_its_own_owner(accounts):
     """流水线用 snapshot() 判断「本轮还有账号在飞」。
 
     不过滤 owner 的话，A 平台会把 B 平台正在跑的账号看成自己这轮在飞，
-    于是永远走 'wait' 分支、轮边界永不触发、失败账号永不重试、zero_rounds
+    于是永远走 'wait' 分支、轮边界永不触发、失败账号永不重试、idle_rounds
     永不递增 —— 任务静默不收敛，没有任何报错。这是整个改造里最隐蔽的一个。
     """
     accounts.claim('a@x.com', owner=A)
