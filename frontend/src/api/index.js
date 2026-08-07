@@ -62,7 +62,9 @@ export const getWorkerLogs = (workerId, index = 0) =>
 
 // Task control
 export const startTask = (data) => post('/api/start', data)
-export const stopTask = () => post('/api/stop')
+// platform 可选：不传就停「当前在看的平台」（post 会自动注入 currentPlatform），
+// 传了则停指定平台。顶栏的全局停止要能停掉**没在看的那个平台**，靠的就是这个参数。
+export const stopTask = (platform) => post('/api/stop', platform ? { platform } : {})
 
 // Accounts
 export const getAccounts = (params) => get('/api/accounts', params)

@@ -69,6 +69,19 @@
           <span>{{ store.isRunning ? '运行中' : '系统空闲' }}</span>
           <span v-if="quotaText" class="quota-chip">{{ quotaText }}</span>
         </div>
+        <!-- 全局停止。任务跑起来之后用户会在各页面之间来回切，而停止按钮只存在于
+             每日任务页和侧边栏里——真要中断时得先找回那一页。这里挂一个常驻入口，
+             并且停的是**所有在跑的平台**，不只当前在看的那个。 -->
+        <button
+          v-if="runningPlatforms.length"
+          class="global-stop"
+          :disabled="stopping"
+          :title="stopTitle"
+          @click="handleGlobalStop"
+        >
+          <Icon name="stop" size="13" />
+          {{ stopping ? '停止中…' : stopLabel }}
+        </button>
       </div>
     </header>
 
@@ -77,9 +90,10 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAppStore } from './stores/app'
+import { stopTask } from './api'
 import Icon from './components/Icon.vue'
 const store = useAppStore()
 const route = useRoute()
@@ -99,6 +113,51 @@ const otherRunning = computed(() =>
     .filter(([slug, st]) => st.is_running && slug !== store.platform)
     .map(([slug]) => slug)
 )
+
+// 正在跑的**全部**平台。全局停止针对的是它们，而不是 store.platform——
+// 用户切到卡片管理页看了半天之后，脑子里的「当前平台」和 store 里的未必是同一个，
+// 让一个常驻的红色按钮去停一个看不见的目标，比没有这个按钮更糟。
+const runningPlatforms = computed(() =>
+  Object.entries(store.platformStates || {})
+    .filter(([, st]) => st.is_running)
+    .map(([slug]) => slug)
+)
+
+const stopLabel = computed(() =>
+  runningPlatforms.value.length > 1 ? `停止全部 (${runningPlatforms.value.length})` : '停止'
+)
+
+const stopTitle = computed(() =>
+  `停止 ${runningPlatforms.value.map(displayName).join('、')} 的任务`
+)
+
+const stopping = ref(false)
+
+async function handleGlobalStop() {
+  const slugs = runningPlatforms.value.slice()
+  if (!slugs.length) return
+
+  const names = slugs.map(displayName)
+  const msg = slugs.length > 1
+    ? `确定要停止全部 ${slugs.length} 个平台的任务吗？\n\n${names.map((n) => `· ${n}`).join('\n')}\n\n将在下一个安全检查点退出。`
+    : `确定要停止「${names[0]}」的任务吗？将在下一个安全检查点退出。`
+  if (!confirm(msg)) return
+
+  stopping.value = true
+  // /api/stop 一次只停一个 ctx，多平台就逐个发。用 allSettled 而不是 all：
+  // 某个平台可能刚好自己跑完了（后端对没在跑的平台返回 400），那一个 reject
+  // 不该让另一个平台的停止请求一起丢掉。
+  const results = await Promise.allSettled(slugs.map((slug) => stopTask(slug)))
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') console.error('停止失败:', slugs[i], r.reason)
+  })
+  store.poll()
+}
+
+// 全都停下来之后复位。不复位的话，下一次任务启动时按钮一冒出来就是禁用态。
+watch(runningPlatforms, (list) => {
+  if (!list.length) stopping.value = false
+})
 
 // AdsPower 环境配额。两个平台抢同一批环境，占用情况值得一直挂在眼前。
 const quotaText = computed(() => {
@@ -257,4 +316,22 @@ onUnmounted(() => store.stopPolling())
   box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
   animation: pulse 2s infinite;
 }
+
+/* 实心红而不是页面里那个浅底的 .btn-danger：顶栏这一排全是胶囊状的
+   状态展示件，停止是这里唯一一个有破坏性的动作，得让它一眼区分于旁边的信息。 */
+.global-stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--danger);
+  border-radius: 20px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.global-stop:hover:not(:disabled) { filter: brightness(0.92); }
+.global-stop:disabled { opacity: 0.6; cursor: not-allowed; }
 </style>
