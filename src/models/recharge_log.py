@@ -225,3 +225,223 @@ class RechargeLogModel:
             params + [page_size, offset],
         )
         return [dict(r) for r in rows], total
+
+    # ------------------------------------------------------------------
+    # 报表聚合（只读）
+    #
+    # 以下方法共用一套口径，任何一处偏离都会让后台的数字对不上账：
+    #   1. **金额只算 status='success'**。失败/pending 只进「笔数 / 成功率」，不进金额。
+    #   2. **一律按 platform 过滤**（与本文件其余统计方法同规则）。
+    #   3. 日期用 `DATE(created_at)` 两侧比较，参数是 'YYYY-MM-DD'。created_at 由
+    #      datetime('now','localtime') 写入，与 SQLite 的 DATE('now','localtime') 同时区。
+    #   4. **去重卡片数/账号数只在「有卡号的成功记录」子集里算**——见 _distinct_counts
+    #      的注释，那里解释了为什么账号数也被 card_display 非空条件裁掉。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _range_clause(date_from='', date_to=''):
+        """把日期区间编译成 (sql_fragment, params)，两端都是闭区间且可单独缺省。
+
+        抽出来是因为下面四个方法都要拼同一段条件，写四遍必然走样——最常见的走样是
+        某一处漏了 DATE() 包裹，于是 '2026-08-09' 去和 '2026-08-09 13:20:00' 做字符串
+        比较，当天的记录被整段排除，而报表看上去只是「今天没充值」，不会报错。
+        """
+        sql, params = '', []
+        if date_from:
+            sql += " AND DATE(created_at) >= ?"
+            params.append(date_from)
+        if date_to:
+            sql += " AND DATE(created_at) <= ?"
+            params.append(date_to)
+        return sql, params
+
+    def _amount_counts(self, platform, range_sql, range_params):
+        """区间内的金额与成功/失败笔数（一条 SQL，用 CASE 分岔）。"""
+        row = self.db.fetchone(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN status='success' THEN amount ELSE 0 END), 0) AS amount, "
+            "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count, "
+            "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count "
+            f"FROM recharge_logs WHERE platform=?{range_sql}",
+            [platform] + list(range_params),
+        )
+        return {
+            'amount': round(float(row['amount'] or 0), 2) if row else 0.0,
+            'success_count': int(row['success_count'] or 0) if row else 0,
+            'failed_count': int(row['failed_count'] or 0) if row else 0,
+        }
+
+    def _distinct_counts(self, platform, range_sql, range_params):
+        """区间内用掉的**不同卡片数**与涉及的**不同账号数**。
+
+        必须与 _amount_counts 分成两条 SQL：COUNT(DISTINCT x) 里塞不进 CASE WHEN
+        的成功/失败分岔，硬写成 COUNT(DISTINCT CASE WHEN ... END) 会把 NULL 也算进
+        分组、结果偏大且难察觉。这里直接把 status='success' 提到 WHERE 里。
+
+        卡号按**去空格后的完整串**去重，而不是像 count_success_by_last4 那样取末 4 位——
+        那个妥协是为兼容历史脱敏串做的，用在「今天用掉几张卡」上会把不同卡号的同末 4 位
+        合并成一张，数字偏小。代价是历史脱敏串（'•••• 1234'）会被当成独立一张卡，
+        早期日期的卡片数可能偏大；页面上对该列有 title 说明。
+
+        注意 card_display 非空过滤同时裁掉了 account_count：一条没有卡号的 success
+        记录属于异常数据（写入路径 _log_card_attempt 总会带卡号），与其为账号数再打一条
+        SQL，不如让两个数字口径完全一致——对账时能确定它们看的是同一批行。
+        """
+        row = self.db.fetchone(
+            "SELECT COUNT(DISTINCT replace(card_display,' ','')) AS card_count, "
+            "COUNT(DISTINCT email) AS account_count "
+            "FROM recharge_logs WHERE platform=? AND status='success' "
+            "AND card_display IS NOT NULL AND card_display != ''"
+            f"{range_sql}",
+            [platform] + list(range_params),
+        )
+        return {
+            'card_count': int(row['card_count'] or 0) if row else 0,
+            'account_count': int(row['account_count'] or 0) if row else 0,
+        }
+
+    def report_summary(self, platform, date_from='', date_to=''):
+        """区间汇总：{'total_amount','success_count','failed_count','card_count','account_count'}。
+
+        区间两端可缺省，缺省即不限该侧（全时段）。
+        """
+        range_sql, range_params = self._range_clause(date_from, date_to)
+        amounts = self._amount_counts(platform, range_sql, range_params)
+        distinct = self._distinct_counts(platform, range_sql, range_params)
+        return {
+            'total_amount': amounts['amount'],
+            'success_count': amounts['success_count'],
+            'failed_count': amounts['failed_count'],
+            **distinct,
+        }
+
+    def report_today(self, platform):
+        """今日汇总：{'amount','success_count','card_count','account_count'}。
+
+        独立于 report_summary 的区间参数——KPI 卡显示的是「今天」，
+        不能因为用户把报表区间拉到上个月就变成 0。
+        """
+        range_sql = " AND DATE(created_at)=DATE('now','localtime')"
+        amounts = self._amount_counts(platform, range_sql, [])
+        distinct = self._distinct_counts(platform, range_sql, [])
+        return {
+            'amount': amounts['amount'],
+            'success_count': amounts['success_count'],
+            **distinct,
+        }
+
+    def report_daily(self, platform, date_from='', date_to=''):
+        """逐日明细，日期倒序：
+        [{'date','amount','success_count','failed_count','card_count','account_count'}, ...]
+
+        **只返回有记录的日期**，中间没有充值的日子不补零行——补零是画图时的展示决策，
+        接口不该凭空造出数据行。
+
+        同样是两条 GROUP BY：金额/笔数一条（含失败行），去重卡数/账号数一条（只看成功行），
+        在 Python 里按日期 key 合并。以第一条的日期集合为准，第二条缺失的日期补 0——
+        某天全部失败时它确实没有成功卡片，那天该显示 0 张卡而不是从表里消失。
+        """
+        range_sql, range_params = self._range_clause(date_from, date_to)
+        params = [platform] + list(range_params)
+
+        rows = self.db.fetchall(
+            "SELECT DATE(created_at) AS date, "
+            "COALESCE(SUM(CASE WHEN status='success' THEN amount ELSE 0 END), 0) AS amount, "
+            "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count, "
+            "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count "
+            f"FROM recharge_logs WHERE platform=?{range_sql} "
+            "GROUP BY DATE(created_at) ORDER BY date DESC",
+            params,
+        )
+        distinct_rows = self.db.fetchall(
+            "SELECT DATE(created_at) AS date, "
+            "COUNT(DISTINCT replace(card_display,' ','')) AS card_count, "
+            "COUNT(DISTINCT email) AS account_count "
+            "FROM recharge_logs WHERE platform=? AND status='success' "
+            "AND card_display IS NOT NULL AND card_display != ''"
+            f"{range_sql} "
+            "GROUP BY DATE(created_at)",
+            params,
+        )
+        distinct_map = {
+            r['date']: {'card_count': int(r['card_count'] or 0),
+                        'account_count': int(r['account_count'] or 0)}
+            for r in distinct_rows
+        }
+
+        result = []
+        for r in rows:
+            d = r['date']
+            counts = distinct_map.get(d) or {'card_count': 0, 'account_count': 0}
+            result.append({
+                'date': d,
+                'amount': round(float(r['amount'] or 0), 2),
+                'success_count': int(r['success_count'] or 0),
+                'failed_count': int(r['failed_count'] or 0),
+                **counts,
+            })
+        return result
+
+    def report_by_account(self, platform, date_from='', date_to='', limit=0):
+        """账号维度榜单，金额倒序：
+        [{'email','amount','success_count','card_count','last_at'}, ...]
+
+        只统计成功记录——榜单回答的是「谁充进去了多少」，失败次数在这里没有决策价值。
+        card_count 与其余报表方法同口径（去空格后的完整卡号去重）。
+
+        limit=0（默认）不加 LIMIT，返回全部账号。调用方要做「已核销 vs 在用」的拆分，
+        必须在**全量**上拆——只对截断后的前 N 行求和，得到的两段金额加起来会小于
+        summary.total_amount，而页面上看不出被截断了，是那种会让人对着两个数字
+        怀疑人生的错。展示层的截断由调用方自己 slice。
+        """
+        range_sql, range_params = self._range_clause(date_from, date_to)
+        limit_sql = " LIMIT ?" if limit else ""
+        rows = self.db.fetchall(
+            "SELECT email, "
+            "COALESCE(SUM(amount), 0) AS amount, "
+            "COUNT(*) AS success_count, "
+            "COUNT(DISTINCT replace(card_display,' ','')) AS card_count, "
+            "MAX(created_at) AS last_at "
+            "FROM recharge_logs WHERE platform=? AND status='success'"
+            f"{range_sql} "
+            f"GROUP BY email ORDER BY amount DESC{limit_sql}",
+            [platform] + list(range_params) + ([int(limit)] if limit else []),
+        )
+        return [{
+            'email': r['email'],
+            'amount': round(float(r['amount'] or 0), 2),
+            'success_count': int(r['success_count'] or 0),
+            'card_count': int(r['card_count'] or 0),
+            'last_at': r['last_at'] or '',
+        } for r in rows]
+
+    def amount_by_emails(self, platform, emails):
+        """这批账号在该平台的成功充值金额 {email: {'today': float, 'total': float}}。
+
+        供账号列表逐行显示「今日充值 / 累计充值」。一次聚合而不是逐账号查询——
+        列表页 page_size 可调到 100，N+1 会让每次翻页打上百条 SQL
+        （同 card_binding.count_by_emails 的做法）。
+
+        与 success_amount_by_email 的区别：那个按「运行起始时刻」切时段、只出 total，
+        服务于复用闸的收敛判断；这个按自然日切、同时出 today 与 total，服务于展示。
+        两者口径不同，不要合并。
+
+        emails 为空返回 {}——否则 IN () 是语法错误。
+        """
+        if not emails:
+            return {}
+        marks = ','.join('?' * len(emails))
+        rows = self.db.fetchall(
+            "SELECT email, "
+            "COALESCE(SUM(amount), 0) AS total, "
+            "COALESCE(SUM(CASE WHEN DATE(created_at)=DATE('now','localtime') "
+            "THEN amount ELSE 0 END), 0) AS today "
+            f"FROM recharge_logs WHERE platform=? AND status='success' AND email IN ({marks}) "
+            "GROUP BY email",
+            [platform] + list(emails),
+        )
+        return {
+            r['email']: {'today': round(float(r['today'] or 0), 2),
+                         'total': round(float(r['total'] or 0), 2)}
+            for r in rows if r['email']
+        }

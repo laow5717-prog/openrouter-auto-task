@@ -31,7 +31,7 @@
         <option value="rejected">已拒绝</option>
         <option value="flagged">GitHub受限</option>
         <option value="banned">已封禁</option>
-        <option value="retired">已归档（停用）</option>
+        <option value="retired">已核销（已归档）</option>
       </select>
       <select v-model="filters.platform_status" class="filter-select" title="该账号在当前平台的状态">
         <option value="">全部平台状态</option>
@@ -50,6 +50,24 @@
       </span>
     </FilterBar>
 
+    <!-- 只统计当前页：跨页合计需要另一次全量聚合，而 platform_status 是在后端分页之后
+         做的前端过滤（见 /api/accounts 注释），两者凑一起会给出自相矛盾的数字 -->
+    <div class="page-sum-bar">
+      <span class="page-sum-title">当前页合计（{{ accounts.length }} 个账号 · {{ store.platform }}）</span>
+      <span class="page-sum-item">
+        今日 <b class="green">${{ money(pageSum.today) }}</b> · 累计 <b>${{ money(pageSum.total) }}</b>
+      </span>
+      <span class="page-sum-sep"></span>
+      <span class="page-sum-item">
+        已核销 {{ pageSum.retiredCount }} 个：今日 <b>${{ money(pageSum.retiredToday) }}</b> ·
+        累计 <b>${{ money(pageSum.retiredTotal) }}</b>
+      </span>
+      <span class="page-sum-item">
+        在用 {{ accounts.length - pageSum.retiredCount }} 个：今日 <b>${{ money(pageSum.activeToday) }}</b> ·
+        累计 <b>${{ money(pageSum.activeTotal) }}</b>
+      </span>
+    </div>
+
     <div style="overflow-x:auto">
       <table class="acc-table">
         <thead>
@@ -61,6 +79,8 @@
             <th style="white-space:nowrap">身份状态</th>
             <th style="white-space:nowrap">平台状态</th>
             <th style="white-space:nowrap">绑定卡片</th>
+            <th style="white-space:nowrap" title="该账号今日在当前平台成功充值的金额">今日充值</th>
+            <th style="white-space:nowrap" title="该账号在当前平台的累计成功充值金额">累计充值</th>
             <th style="white-space:nowrap">Credits 余额</th>
             <th style="white-space:nowrap">API Key</th>
             <th style="white-space:nowrap">邮箱认证链接</th>
@@ -70,10 +90,10 @@
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="12" class="table-loading">加载中...</td>
+            <td colspan="14" class="table-loading">加载中...</td>
           </tr>
           <tr v-else-if="accounts.length === 0">
-            <td colspan="12" class="table-empty">暂无数据</td>
+            <td colspan="14" class="table-empty">暂无数据</td>
           </tr>
           <tr v-for="acc in accounts" :key="acc.email">
             <td><input type="checkbox" :checked="selected.has(acc.email)" @change="toggleSelect(acc.email, $event.target.checked)"></td>
@@ -96,6 +116,15 @@
                 {{ acc.card_count }} 张卡
               </span>
               <span v-else class="card-count-badge empty">无</span>
+            </td>
+            <!-- 0 显示为灰 '-'：绝大多数行今日都是 0，满屏 $0.00 会把真正有金额的行淹掉 -->
+            <td style="font-family:monospace">
+              <span v-if="acc.recharge_today > 0" class="amount-today">${{ money(acc.recharge_today) }}</span>
+              <span v-else style="color:var(--text-sub)">-</span>
+            </td>
+            <td style="font-family:monospace">
+              <span v-if="acc.recharge_total > 0">${{ money(acc.recharge_total) }}</span>
+              <span v-else style="color:var(--text-sub)">-</span>
             </td>
             <td>
               <span v-if="acc.credits_balance !== null && acc.credits_balance !== undefined"
@@ -306,7 +335,8 @@ const statusMap = {
   banned: '已封禁',
   // 用户在后台主动归档：账号本身没坏，是人决定不再用它。底层值刻意不叫 archived——
   // 那个已经是平台层的「余额充满」，而这张表两层共用，同名就没法区分了。
-  retired: '已归档（停用）',
+  // 文案带上「已核销」与充值报表的术语对齐，也顺带把它和下面平台层的「已归档」区分开。
+  retired: '已核销（已归档）',
   // 平台层
   archived: '已归档',          // 余额≥阈值，该平台的充值跳过
   subscribed: '已订阅',
@@ -315,6 +345,35 @@ const statusMap = {
 function accStatusLabel(s) {
   return statusMap[s] || s || '-'
 }
+
+function money(v) {
+  return Number(v || 0).toFixed(2)
+}
+
+// 当前页的充值金额合计，按「已核销 / 在用」拆两组。
+// 只覆盖 accounts 数组里的行——它就是页面上看得见的那些，合计与表格永远对得上。
+const pageSum = computed(() => {
+  const s = {
+    today: 0, total: 0,
+    retiredToday: 0, retiredTotal: 0, retiredCount: 0,
+    activeToday: 0, activeTotal: 0,
+  }
+  for (const a of accounts.value) {
+    const t = Number(a.recharge_today || 0)
+    const all = Number(a.recharge_total || 0)
+    s.today += t
+    s.total += all
+    if (a.identity_status === 'retired') {
+      s.retiredCount++
+      s.retiredToday += t
+      s.retiredTotal += all
+    } else {
+      s.activeToday += t
+      s.activeTotal += all
+    }
+  }
+  return s
+})
 function accStatusClass(s) {
   if (s === 'banned' || s === 'flagged' || s === 'suspended' || s === 'rejected') return 'fail'
   if (s === 'registered') return 'success'
@@ -609,6 +668,27 @@ onUnmounted(stopBrowserPoll)
 </script>
 
 <style scoped>
+.page-sum-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 20px;
+  padding: 10px 20px;
+  background: #fcfcfd;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-sub);
+}
+.page-sum-title { font-weight: 600; color: var(--text-main); }
+.page-sum-item b { color: var(--text-main); font-family: monospace; }
+.page-sum-item b.green { color: var(--success); }
+.page-sum-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--border);
+}
+.amount-today { color: var(--success); font-weight: 600; }
+
 .acc-table th,
 .acc-table td {
   padding: 12px 14px;

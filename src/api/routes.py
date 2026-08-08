@@ -477,6 +477,9 @@ def get_accounts():
     emails = [acc['email'] for acc in accounts]
     card_counts = models['card_binding'].count_by_emails(emails)
     pa_map = models['platform_account'].map_by_email(platform, emails)
+    # 今日/累计成功充值金额，一次聚合出本页全部账号。逐账号查询在 page_size=100 时
+    # 会打上百条 SQL——与 card_counts 同一个理由，做法也照抄它。
+    recharge_amounts = models['recharge_log'].amount_by_emails(platform, emails)
 
     # 平台状态过滤只能在这里做：它来自另一张表，塞不进 accounts 的分页 SQL。
     # 代价是分页会与 total 对不齐（本页过滤掉几条，总数仍是身份层的计数）。
@@ -501,6 +504,10 @@ def get_accounts():
             "email_password": acc.get('email_password') or '',
             # card_count：库内 card_bindings 成功关联的卡数（可点开看明细）
             "card_count": card_counts.get(acc['email'], 0),
+            # 成功充值金额，只算本平台。缺省给 0 而不是 null——列表要直接求和/排序，
+            # null 会让前端每个用到的地方都得判空。
+            "recharge_today": (recharge_amounts.get(acc['email']) or {}).get('today', 0),
+            "recharge_total": (recharge_amounts.get(acc['email']) or {}).get('total', 0),
             "credits_balance": pa.get('credits_balance'),
             "balance_updated_at": pa.get('balance_updated_at') or '',
             "apikey": pa.get('apikey') or '',
@@ -995,6 +1002,88 @@ def get_recharge_logs_by_email(email):
     models = get_models()
     logs = models['recharge_log'].get_by_email(email)
     return jsonify(logs)
+
+
+# 报表区间的默认跨度（含今天），与前端「重置」回落到的区间保持一致
+REPORT_DEFAULT_DAYS = 30
+# 账号榜单展示上限。只截断**展示**，汇总与核销拆分一律在全量上算
+REPORT_ACCOUNT_LIMIT = 100
+
+
+def _report_range(args):
+    """取报表区间 (date_from, date_to)，均为 'YYYY-MM-DD'。
+
+    任一端缺省就补成「最近 30 天」——不是「全时段」。全时段作为默认会让首次打开
+    报表页就扫全表，且日趋势表拉出几百行没人看；用户要看更早的数据，把日期往前拨即可。
+
+    日期用 datetime.date.today()：它取的是本机本地日期，与 recharge_logs 里
+    datetime('now','localtime') 写入的时间戳同一时区，不会差出一天。
+    """
+    from datetime import date, timedelta
+    date_from = (args.get('date_from') or '').strip()
+    date_to = (args.get('date_to') or '').strip()
+    if not date_to:
+        date_to = date.today().isoformat()
+    if not date_from:
+        date_from = (date.today() - timedelta(days=REPORT_DEFAULT_DAYS - 1)).isoformat()
+    return date_from, date_to
+
+
+@api.route('/api/reports/recharge')
+def get_recharge_report():
+    """充值报表：今日 KPI + 区间汇总 + 逐日趋势 + 账号榜单。
+
+    口径见 RechargeLogModel 报表区的注释——只算 status='success'，一律按 platform 过滤。
+    `today` 段不受区间参数影响：KPI 卡显示的是「今天」，用户把区间拉到上个月时它不该归零。
+    """
+    models = get_models()
+    platform = _req_platform()
+    date_from, date_to = _report_range(request.args)
+
+    rlog = models['recharge_log']
+    summary = rlog.report_summary(platform, date_from, date_to)
+    today = rlog.report_today(platform)
+    daily = rlog.report_daily(platform, date_from, date_to)
+    # 取全量：verified/active 的拆分必须在全量上做，否则两段金额之和小于 summary.total_amount
+    accounts = rlog.report_by_account(platform, date_from, date_to)
+
+    # 成功率在后端算：前端有三处要显示它（KPI、汇总条、逐日表），
+    # 分母为 0 的处理散在三个模板里迟早会漏一处除零。
+    attempts = summary['success_count'] + summary['failed_count']
+    summary['success_rate'] = round(summary['success_count'] / attempts * 100, 1) if attempts else 0.0
+
+    # 「已核销」判据来自 accounts 表的身份状态，跨表拼在 Python 里而不是 SQL JOIN：
+    # 榜单最多 100 行，一次 get_by_emails 的成本可忽略，而 JOIN 会把「账号身份」
+    # 这个概念泄进充值模型，那里本不该知道 retired 是什么。
+    status_map = {
+        a['email']: (a.get('identity_status') or '')
+        for a in models['account'].get_by_emails([r['email'] for r in accounts])
+    }
+    verified = {'amount': 0.0, 'account_count': 0}
+    active = {'amount': 0.0, 'account_count': 0}
+    for row in accounts:
+        row['identity_status'] = status_map.get(row['email'], '')
+        # 前端只读 is_verified，不自己比对字符串——核销判据将来若扩到多个状态，只改这一处
+        row['is_verified'] = row['identity_status'] == 'retired'
+        bucket = verified if row['is_verified'] else active
+        bucket['amount'] += row['amount']
+        bucket['account_count'] += 1
+    verified['amount'] = round(verified['amount'], 2)
+    active['amount'] = round(active['amount'], 2)
+
+    return jsonify({
+        "platform": platform,
+        "date_from": date_from,
+        "date_to": date_to,
+        "today": today,
+        "summary": summary,
+        "verified": verified,
+        "active": active,
+        "daily": daily,
+        # 榜单只展示前 100 名；上面的拆分与汇总都已在全量上算完，截断不影响任何数字
+        "accounts": accounts[:REPORT_ACCOUNT_LIMIT],
+        "accounts_total": len(accounts),
+    })
 
 
 @api.route('/api/accounts/export', methods=['POST'])

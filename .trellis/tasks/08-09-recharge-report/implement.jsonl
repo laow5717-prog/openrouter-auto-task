@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "新增的全部是 SQLite 只读聚合查询，须遵守本项目的 row-name 取值与身份/平台分表约定"}
+{"file": ".trellis/spec/backend/multi-platform-guidelines.md", "reason": "所有统计一律按 platform 隔离，这是本任务口径的前提"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "新增页面须按「Adding a New Page」五步走：view + route + 侧栏 + titleMap + api/index.js"}
+{"file": ".trellis/spec/api/index.md", "reason": "新增 /api/reports/recharge 须与既有接口的命名与响应结构约定一致"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "报表页要复用 .stats-grid/.panel/FilterBar/Pagination 等既有样式与组件，不得另起一套"}

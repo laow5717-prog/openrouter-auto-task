@@ -91,6 +91,8 @@ export const getOpenBrowsers = () => get('/api/accounts/open-browsers')
 export const getRechargeLogs = (params) => get('/api/recharge-logs', params)
 export const getRechargeLogsByEmail = (email) => get(`/api/recharge-logs/${encodeURIComponent(email)}`)
 export const getRechargeLogsByCard = (cardNumber) => get('/api/card-recharge-logs', { card_number: cardNumber })
+// 充值报表聚合（today / summary / verified / active / daily / accounts），平台由 get() 注入
+export const getRechargeReport = (params) => get('/api/reports/recharge', params)
 
 // Card history
 export const getCardHistory = (params) => get('/api/card/history', params)

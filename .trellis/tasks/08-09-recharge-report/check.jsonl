@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "金额口径贯穿 model→API→前端三层，须逐层核对不走样（只算 success、按 platform）"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "复核聚合 SQL 的日期/平台条件与空值处理"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "复核是否引入被禁用的写法"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "复核新页面是否完成五步接线、是否误引入新依赖"}

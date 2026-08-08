@@ -24,6 +24,9 @@
       <router-link to="/recharge-logs" class="nav-item" active-class="active">
         <Icon name="wallet" /> 充值记录
       </router-link>
+      <router-link to="/reports" class="nav-item" active-class="active">
+        <Icon name="dashboard" /> 充值报表
+      </router-link>
       <router-link to="/proxies" class="nav-item" active-class="active">
         <Icon name="monitor" /> 代理管理
       </router-link>
@@ -176,7 +179,7 @@ const quotaTitle = computed(() => {
              : `AdsPower 环境占用 ${q.total_held}/${q.total}`
 })
 
-const titleMap = { workbench: '每日任务', monitor: '运行监控', cardPool: '卡片管理', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录' }
+const titleMap = { workbench: '每日任务', monitor: '运行监控', cardPool: '卡片管理', accounts: '账号管理', cardHistory: '绑卡记录', rechargeLogs: '充值记录', reports: '充值报表' }
 const pageTitle = computed(() => titleMap[route.name] || '系统概览')
 
 onMounted(() => {

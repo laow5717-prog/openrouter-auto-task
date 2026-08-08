@@ -47,6 +47,45 @@ All paginated endpoints follow the same pattern:
 | GET | `/api/accounts` | Account list (paginated) |
 | GET | `/api/accounts/<email>/cards` | Cards bound to account |
 | POST | `/api/accounts/export` | Export accounts to Excel |
+| GET | `/api/reports/recharge` | Recharge report: today KPI + range summary + daily trend + per-account ranking |
+
+## Recharge Statistics Contract (报表口径)
+
+Every aggregate that shows **money** — `/api/reports/recharge`, and the
+`recharge_today` / `recharge_total` fields on `/api/accounts` — obeys the same four
+rules. They are implemented once, in the report section of
+`src/models/recharge_log.py`; do not re-derive them at a call site.
+
+1. **Amounts count only `status='success'`.** Failed/pending rows appear in
+   counts and success-rate, never in a dollar figure.
+2. **Always filtered by `platform`.** Same rule as the rest of that model; the two
+   platforms have disjoint account and card pools, so a cross-platform total has
+   no operational meaning.
+3. **Dates compare via `DATE(created_at)`** against `'YYYY-MM-DD'` params.
+   `created_at` is written with `datetime('now','localtime')`, so "today" is
+   `DATE(created_at)=DATE('now','localtime')`. Comparing a bare date against a
+   full timestamp string silently drops the whole current day — the page just
+   looks like nobody recharged.
+4. **Distinct card/account counts are computed over the `card_display IS NOT NULL
+   AND != ''` success subset**, with cards deduped by the **whole** number
+   (spaces stripped), not the last 4. `count_success_by_last4` uses last-4 only to
+   tolerate legacy masked strings; reusing that here would merge distinct cards
+   sharing a suffix. The tradeoff is the reverse: legacy masked rows
+   (`'•••• 1234'`) count as their own card, so early dates can read high.
+
+Two structural consequences worth knowing before editing:
+
+- `COUNT(DISTINCT …)` cannot share a query with the `CASE WHEN status=…` amount
+  split — the distinct counts need `status='success'` in the `WHERE`. Hence the
+  deliberate two-query shape in `_amount_counts` / `_distinct_counts`.
+- The **已核销 vs 在用** split (`identity_status='retired'`) is done in Python in
+  the route, over the **full** account aggregate, then the ranking is truncated
+  for display. Splitting after truncation makes `verified.amount + active.amount`
+  come out under `summary.total_amount` with nothing on screen explaining why.
+
+`/api/recharge-logs` (the raw log list) is **not** covered by this contract — it
+still ignores `platform` and returns cross-platform rows. Changing it would
+silently alter a page users already read; treat it as a separate decision.
 
 ## Background Task Contract (long-running automation)
 
