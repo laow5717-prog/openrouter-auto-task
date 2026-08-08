@@ -811,7 +811,7 @@ class AppState:
         return cards
 
     def _eligible_cards(self, group_id, exclude_used=True, platform=None):
-        """返回该分组在指定平台当前「可选」的卡，有序：新卡优先，再复用好卡。
+        """返回该分组在指定平台当前「可选」的卡，有序：好卡优先，新卡垫后。
 
         platform 省略时用 self.platform（当前流水线/界面选中的平台）。整条判定链——
         可用状态、冷却、新卡还是好卡、本轮是否被试过——全部按这个平台算，所以同一张卡
@@ -819,8 +819,11 @@ class AppState:
 
         可选 = get_usable_cards_as_list（已排除 expired/invalid/bound）且不处于临时冷却
         （3DS / 充值失败冷却）中。排序：
-          - 新卡（从未成功付款过）优先，先把卡池的新卡消耗掉；
-          - 之后才复用已成功过的好卡（paid 卡可反复支付）。
+          - 已成功付款过的好卡优先（paid 卡可反复支付），能过款的卡就接着用；
+          - 之后才轮到新卡（从未成功付款过）。
+        这个次序是**反过来**的：早先是新卡优先，想的是先把卡池消化掉。实际跑下来那等于
+        每笔都拿一张没验证过的卡赌运气——拒付率高、还给账号叠 velocity 风控，而少数能过款的
+        好卡反倒被晾在队尾。好卡优先之后，新卡只在好卡全部进了冷却或判废时才被动用。
         成功卡不被永久消耗、也**不进冷却**（否则同一账号连充第二笔就无卡可用）。
         一张卡退出可选集只有三种方式：被拒后进冷却（默认 24h，到期自动回来）、
         连续被拒达阈值判无效（默认 3 次，永久）、或过期。
@@ -847,7 +850,7 @@ class AppState:
             # success_nums 已去空格（all_success_card_numbers 内 replace），此处比对键同样
             # 去空格，保证「新卡/好卡」分类与记账口径一致（卡号含内部空格时也不误判）。
             (good if num.replace(' ', '') in success_nums else fresh).append(c)
-        cards = fresh + good
+        cards = good + fresh
         return self._exclude_used_this_run(platform, cards) if exclude_used else cards
 
     def _recharge_one_account(self, email, login_password, payment_group_id=None,
@@ -865,8 +868,9 @@ class AppState:
 
         captcha_api_key/captcha_server 透传给 registration.recharge_account 用于自动解 hCaptcha。
 
-        用 payment_group_id 指定分组的可选卡（_eligible_cards：新卡优先，再复用好卡；已排除
-        无效/过期/冷却）逐张尝试，付成一张即 success。逐卡的卡状态标记（paid/invalid/冷却）
+        用 payment_group_id 指定分组的可选卡（_eligible_cards：好卡优先，新卡垫后；已排除
+        无效/过期/冷却）逐张尝试，付成一张即 success；付成之后会**继续用同一张卡**充下一笔
+        （见 recharge_account 的粘卡循环），只有它失败了才换下一张。逐卡的卡状态标记（paid/invalid/冷却）
         与 recharge_logs 记账都在 registration.recharge_account 内部完成，本方法只负责取卡、
         调度、把结果转成计数用的 (result, err)。
 
@@ -963,7 +967,7 @@ class AppState:
              注意「失败但烧了卡」不算空转：那是进展，会继续开新一轮；
           3. 用户手动停止。
 
-        选卡资格（见 _eligible_cards）：新卡优先，付款成功过的好卡可反复复用；卡退出可选集
+        选卡资格（见 _eligible_cards）：付款成功过的好卡优先（可反复复用），新卡垫后；卡退出可选集
         的方式有三种——被拒后进冷却（默认 24h，成功的卡不冷却）、连续被拒达阈值判无效、
         或过期。逐卡的卡状态标记与 recharge_logs 记账在 recharge_account 内部完成；
         本方法只负责取可选卡、轮转账号、计数与收尾。

@@ -2,7 +2,7 @@
 
 这四条规则全部落在 registration.recharge_account 的主循环里，彼此耦合得很紧：
 
-  - 成功后不返回、继续用同一账号充下一张卡  →  所以成功的卡**不能**进冷却
+  - 成功后不返回、继续用**同一张卡**充下一笔  →  所以成功的卡**不能**进冷却
   - 失败即冷却 24h + 计数 +1，连续 3 次才判废  →  所以判废一张坏卡最快要 3 天
   - 每笔金额独立随机                          →  所以记账必须记这一笔的实际值
 
@@ -131,17 +131,93 @@ def _topups(adapter):
     return [c for c in adapter.calls if c[0] == 'top_up']
 
 
+# 只关心「循环走了哪些卡」的用例用它：把 balance_cap 抬到不可能触及，免得随机金额
+# 恰好累计到默认的 $200 时循环提前收手，断言变成偶发红。
+_SHAPE_ONLY = RechargeConfig(fail_cooldown_hours=0, balance_cap=1e9)
+
+
 # ---------- R3：成功后继续用同一账号充值 ----------
 
 
 def test_success_does_not_stop_the_loop(models):
-    """AC7：第一张卡成功后继续试下一张，而不是立刻换账号。"""
+    """AC7：第一笔成功后继续充，而不是立刻换账号。"""
     stub = StubAdapter(outcomes=['success', 'success', 'failed'])
-    ok, _err, responses, _l4, outcome = _run(stub, models, _cards(3))
+    ok, _err, responses, _l4, outcome = _run(stub, models, _cards(3),
+                                             recharge_cfg=_SHAPE_ONLY)
 
     assert (ok, outcome) == (True, 'topup')
-    assert len(_topups(stub)) == 3, '三张卡都该被试过'
     assert sum(1 for r in responses if r['ok']) == 2
+
+
+# ---------- 粘卡：能过款的卡就一直用，不换 ----------
+
+
+def test_a_successful_card_keeps_being_used(models):
+    """成功过的卡继续用来充下一笔，不换下一张。
+
+    换卡的代价是拿一张没验证过的卡去赌：卡池里能过款的卡本就稀有，一笔一换等于
+    把好卡晾在一边、笔笔都给账号叠一次拒付风险。
+    """
+    stub = StubAdapter(outcomes=['success'] * 3, max_card_attempts=3)
+    _ok, _err, responses, _l4, _outcome = _run(stub, models, _cards(5),
+                                               recharge_cfg=_SHAPE_ONLY)
+
+    charged = [num for _c, num, _oc in _topups(stub)]
+    assert len(charged) == 3
+    assert len(set(charged)) == 1, f'成功的卡该被粘住，实际换了卡: {charged}'
+    assert {r['card_last4'] for r in responses} == {charged[0][-4:]}
+
+
+def test_the_next_card_is_only_reached_after_a_failure(models):
+    """粘卡到这张卡自己失败为止，之后才轮到下一张。"""
+    stub = StubAdapter(outcomes=['success', 'failed', 'success', 'success'],
+                       max_card_attempts=4)
+    cards = _cards(2)
+    _run(stub, models, cards, recharge_cfg=_SHAPE_ONLY)
+
+    charged = [num for _c, num, _oc in _topups(stub)]
+    assert charged == [cards[0]['number'], cards[0]['number'],
+                       cards[1]['number'], cards[1]['number']], \
+        f'应是「第一张成功→失败→换第二张」，实际 {charged}'
+
+
+def test_sticking_to_a_card_does_not_bypass_the_attempt_cap(models):
+    """粘卡的每一笔照样计入 max_card_attempts——上限不能被粘卡架空。"""
+    stub = StubAdapter(outcomes=['success'] * 20, max_card_attempts=4)
+    _ok, err, _r, _l4, _outcome = _run(stub, models, _cards(6),
+                                       recharge_cfg=_SHAPE_ONLY)
+
+    assert len(_topups(stub)) == 4
+    assert '张卡上限' in err, f'停手原因应是试卡上限，实际: {err}'
+
+
+def test_a_stuck_card_is_released_exactly_once(models):
+    """粘卡期间一直持有这张卡的 in-flight 占用，离开时释放，且不重复释放。"""
+    from src.web.worker import PaymentCardRegistry
+
+    registry = PaymentCardRegistry()
+    stub = StubAdapter(outcomes=['success', 'success', 'failed'], max_card_attempts=3)
+    platforms.register(stub)
+    try:
+        registration.recharge_account(
+            'a@x.com', 'pw',
+            payment_cards=_cards(2),
+            recharge_log_model=models['recharge_log'],
+            valid_card_model=models['valid_card'],
+            card_pool_model=models['card_pool'],
+            account_model=models['account'],
+            card_state_model=models['card_state'],
+            payment_registry=registry,
+            platform=STUB,
+            platform_account_model=models['platform_account'],
+            adapter=stub,
+            browser_factory=lambda e: _FakeSession(),
+            recharge_cfg=_SHAPE_ONLY,
+        )
+    finally:
+        platforms.unregister(STUB)
+
+    assert registry.in_flight_numbers() == set(), '粘卡结束后仍有卡被占用'
 
 
 def test_attempt_cap_stops_the_loop(models):
@@ -216,12 +292,16 @@ def test_captcha_before_any_success_reports_failed(models):
 
 
 def test_running_out_of_cards_ends_the_loop(models):
-    """卡试完了自然收手，不报错。"""
-    stub = StubAdapter(outcomes=['success', 'success'])
-    ok, _err, _r, _l4, outcome = _run(stub, models, _cards(2))
+    """卡试完了自然收手，不报错。
+
+    粘卡下「卡用完」意味着每张卡都被刷到失败为止：两张卡各一次成功、一次失败。
+    """
+    stub = StubAdapter(outcomes=['success', 'failed', 'success', 'failed'])
+    ok, _err, _r, _l4, outcome = _run(stub, models, _cards(2),
+                                      recharge_cfg=_SHAPE_ONLY)
 
     assert (ok, outcome) == (True, 'topup')
-    assert len(_topups(stub)) == 2
+    assert len(_topups(stub)) == 4
 
 
 # ---------- R1：连续失败 3 次才判废 ----------
@@ -250,7 +330,10 @@ def test_a_success_resets_the_failure_streak(models):
         _run(StubAdapter(outcomes=['failed']), models, [_card(num)], recharge_cfg=cfg)
     assert models['card_state'].get_fail_streak(STUB, num) == 2
 
-    _run(StubAdapter(outcomes=['success']), models, [_card(num)], recharge_cfg=cfg)
+    # max_card_attempts=1：只要一笔成功。不设的话粘卡会接着刷第二笔，
+    # 而桩在 outcomes 用完后一律回 'failed'，刚清零的计数又被顶回 1。
+    _run(StubAdapter(outcomes=['success'], max_card_attempts=1), models, [_card(num)],
+         recharge_cfg=cfg)
     assert models['card_state'].get_fail_streak(STUB, num) == 0
 
     for i in (1, 2):
@@ -313,7 +396,7 @@ def test_failure_puts_the_card_into_cooldown(models):
 def test_success_does_not_put_the_card_into_cooldown(models):
     """AC5：成功的卡不进冷却——否则同一账号连充第二笔就无卡可用了。"""
     num = '4111111111111111'
-    _run(StubAdapter(outcomes=['success']), models, [_card(num)],
+    _run(StubAdapter(outcomes=['success'], max_card_attempts=1), models, [_card(num)],
          recharge_cfg=RechargeConfig(fail_cooldown_hours=24))
 
     assert models['card_state'].in_cooldown(STUB, num) is False
@@ -358,7 +441,9 @@ def test_amount_is_drawn_from_the_configured_range(models):
 
 def test_amount_is_recorded_in_the_log(models, db):
     """AC12：记账写这一笔的实际金额，不再恒为 20。"""
-    stub = StubAdapter(outcomes=['success'])
+    # max_card_attempts=1 把用例框在「恰好一笔」上：粘卡下同一张卡会一直刷下去，
+    # 而这里要断言的是单笔记账，不是循环行为。下同。
+    stub = StubAdapter(outcomes=['success'], max_card_attempts=1)
     cfg = RechargeConfig(amount_min=37, amount_max=37, balance_cap=1e9,
                          fail_cooldown_hours=0)
     _run(stub, models, [_card()], recharge_cfg=cfg)
@@ -379,7 +464,7 @@ def test_failed_attempts_also_record_their_amount(models, db):
 
 def test_amount_reaches_the_adapter(models):
     """金额必须真的传到适配器——此前编排层从不传 amount，适配器一直用自己的默认值。"""
-    stub = StubAdapter(outcomes=['success'])
+    stub = StubAdapter(outcomes=['success'], max_card_attempts=1)
     cfg = RechargeConfig(amount_min=64, amount_max=64, balance_cap=1e9,
                          fail_cooldown_hours=0)
     _run(stub, models, [_card()], recharge_cfg=cfg)
@@ -420,7 +505,8 @@ class _FixedFirstChargeStub(StubAdapter):
 
 def test_first_charge_is_logged_at_the_amount_actually_taken(models, db):
     """首充记 $20（站点实收），而不是我们请求的随机数。"""
-    stub = _FixedFirstChargeStub(outcomes=['success'], modes=['first'])
+    stub = _FixedFirstChargeStub(outcomes=['success'], modes=['first'],
+                                 max_card_attempts=1)
     cfg = RechargeConfig(amount_min=79, amount_max=79, balance_cap=1e9,
                          fail_cooldown_hours=0)
     _run(stub, models, [_card()], recharge_cfg=cfg)
@@ -432,7 +518,8 @@ def test_first_charge_is_logged_at_the_amount_actually_taken(models, db):
 
 def test_reload_charge_is_logged_at_the_requested_amount(models, db):
     """复充认我们传的金额，照常记随机值。"""
-    stub = _FixedFirstChargeStub(outcomes=['success'], modes=['reload'])
+    stub = _FixedFirstChargeStub(outcomes=['success'], modes=['reload'],
+                                 max_card_attempts=1)
     cfg = RechargeConfig(amount_min=57, amount_max=57, balance_cap=1e9,
                          fail_cooldown_hours=0)
     _run(stub, models, [_card()], recharge_cfg=cfg)
@@ -459,7 +546,7 @@ def test_balance_cap_counts_what_was_actually_charged(models):
 
 def test_adapter_that_reports_no_amount_falls_back_to_the_request(models, db):
     """适配器没回报 amount（None）时沿用请求额——老适配器不改也能跑。"""
-    stub = StubAdapter(outcomes=['success'])          # 不设 amount 字段
+    stub = StubAdapter(outcomes=['success'], max_card_attempts=1)   # 不设 amount 字段
     cfg = RechargeConfig(amount_min=33, amount_max=33, balance_cap=1e9,
                          fail_cooldown_hours=0)
     _run(stub, models, [_card()], recharge_cfg=cfg)

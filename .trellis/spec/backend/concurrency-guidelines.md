@@ -105,11 +105,19 @@ rule is already broken.
 The registry covers the window between "judged eligible" and "result written".
 It layers on top of the DB rules, it does not replace them.
 
-Cards are released **per charge**, not per account run. Holding them for a whole
+Cards are released **per card**, not per account run. Holding them for a whole
 account run starved other workers on a tight pool, and `registration` reads "no
 cards available" as *pool exhausted*, so the orchestrator permanently abandoned
 those accounts — temporary contention misread as permanent exhaustion. Guard:
 `test_release_lets_a_waiting_worker_proceed`.
+
+"Per card" is not "per charge": `recharge_account` **sticks to a card that
+works** and charges it repeatedly until it fails, holding the acquisition for
+that whole run of charges. The bound on how long is `max_card_attempts` and
+`balance_cap`, both re-checked on every charge inside the inner loop — with the
+sticky loop, "we ran out of cards" is no longer a natural brake, so those two are
+the only ones left. Other workers are not blocked by a held card: `try_acquire`
+failing makes them `continue` to the next candidate without counting an attempt.
 
 ### Round-scoped card ownership — a second, softer gate
 

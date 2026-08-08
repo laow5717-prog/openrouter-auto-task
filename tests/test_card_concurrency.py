@@ -50,6 +50,11 @@ class _ContentionStub:
     """在 top_up 里记录「此刻谁正在刷哪张卡」，任何重叠都留证。
 
     hold 是刻意的：付款是个耗时操作，瞬时完成的桩根本压不出竞态。
+
+    max_per_card 同样是刻意的：编排层现在**粘卡**（一张卡过款就一直用它，直到它失败）。
+    一个只会返回 success 的桩会让每个会话死守第一张卡刷满 max_card_attempts，整个文件的
+    争用就压不出来了——4 个账号各占一张卡，永远不会去抢别人手里的。刷够 N 笔就回一次
+    failed，会话才会往下一张卡走，卡与卡之间的争用才真的发生。
     """
 
     slug = STUB
@@ -59,14 +64,16 @@ class _ContentionStub:
     default_topup_amount = 7.0
     max_card_attempts = 50
 
-    def __init__(self, hold=0.02):
+    def __init__(self, hold=0.02, max_per_card=2):
         self.hold = hold
+        self.max_per_card = max_per_card
         self._lock = threading.Lock()
         self._active = {}          # card_number -> email，当前正在刷的
         self.violations = []       # [(card, 先到的 email, 后到的 email)]
         self.usage = []            # [(card, email)]，全部调用流水
         self.peak_per_email = {}   # email -> 同时持有的卡数峰值
         self._held = {}            # email -> 当前持有卡数
+        self._charges = {}         # (email, card) -> 本会话已在这张卡上刷了几笔
 
     def module_names(self):
         return []
@@ -98,6 +105,8 @@ class _ContentionStub:
             n = self._held.get(email, 0) + 1
             self._held[email] = n
             self.peak_per_email[email] = max(self.peak_per_email.get(email, 0), n)
+            charges = self._charges.get((email, num), 0) + 1
+            self._charges[(email, num)] = charges
 
         time.sleep(self.hold)          # 模拟真实付款耗时，把竞态窗口撑开
 
@@ -105,8 +114,10 @@ class _ContentionStub:
             if self._active.get(num) == email:
                 del self._active[num]
             self._held[email] = self._held.get(email, 1) - 1
-        return PaymentResult(ok=True, outcome='success', last4=str(num)[-4:],
-                             balance_after=None)
+        ok = charges <= self.max_per_card
+        return PaymentResult(ok=ok, outcome='success' if ok else 'failed',
+                             err='' if ok else '刷够了，换卡',
+                             last4=str(num)[-4:], balance_after=None)
 
 
 @pytest.fixture
@@ -212,15 +223,22 @@ def test_in_flight_is_empty_after_all_sessions_finish(stub, models):
         f'仍被占用的卡: {registry.in_flight_numbers()}'
 
 
-def test_no_card_is_charged_twice_by_the_same_session(stub, models):
-    """同一个会话不会把同一张卡刷两遍（连充循环按 idx 前进，不回头）。"""
+def test_a_session_never_goes_back_to_an_earlier_card(stub, models):
+    """连充循环不回头：离开一张卡之后不会再回来刷它。
+
+    这条用例原先断言的是「同一会话不会把同一张卡刷两遍」。粘卡改造推翻了那个不变量
+    ——一张能过款的卡本来就该被连着刷。真正还成立、也真正要守的是**不回头**：卡与卡
+    之间只前进，否则一张刚被判失败并冷却的卡会在同一会话里被重新捡起来刷。
+    """
     registry = PaymentCardRegistry()
     cards = [_card(i) for i in range(6)]
 
     _run_concurrently(stub, models, registry, ['solo@x.com'], cards, _LOOSE)
 
     used = [num for num, email in stub.usage if email == 'solo@x.com']
-    assert len(used) == len(set(used)), f'同一会话重复刷了同一张卡: {used}'
+    # 连着刷同一张卡折叠成一段，段与段之间不得出现重复卡号
+    segments = [n for i, n in enumerate(used) if i == 0 or n != used[i - 1]]
+    assert len(segments) == len(set(segments)), f'同一会话回头刷了旧卡: {used}'
 
 
 def test_exception_inside_the_loop_still_releases_the_card(models):
@@ -362,8 +380,12 @@ class _CooldownRaceStub(_ContentionStub):
         self.charged.append(num)
         self.card_state.set_cooldown(STUB, self.cooled_number, hours=self.hours,
                                      reason='别的 worker 刷失败了')
-        return PaymentResult(ok=True, outcome='success', last4=str(num)[-4:],
-                             balance_after=None)
+        # 一张卡只成一笔就回 failed：编排层粘卡，一直成功的话会话会死守第一张卡刷满
+        # max_card_attempts，压根走不到第二张，「快照后被冷却的卡不会被刷」就无从验证。
+        ok = self.charged.count(num) == 1
+        return PaymentResult(ok=ok, outcome='success' if ok else 'failed',
+                             err='' if ok else '刷够了，换卡',
+                             last4=str(num)[-4:], balance_after=None)
 
 
 def _run_one(stub, models, cards, cfg, email='a@x.com', registry=None):

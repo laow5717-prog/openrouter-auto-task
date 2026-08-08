@@ -168,9 +168,22 @@ Two consequences that surprise people reading the pipeline logs:
 - The "分组可选卡耗尽" stop condition now fires with most cards merely *cooling
   down*, not invalid. Card counts in the UI will not drop the way they used to.
 - A successful payment does **not** cool the card down. It must not — one
-  account now tops up repeatedly in a single session (see
-  `recharge_account`'s loop), and cooling successful cards would leave it with
-  nothing to charge on the second round.
+  account now tops up repeatedly in a single session **on the same card** (see
+  `recharge_account`'s sticky loop), and cooling successful cards would leave it
+  with nothing to charge on the second round.
+
+#### Card ordering: proven cards first
+
+`AppState._eligible_cards` orders candidates `good + fresh` — cards that have a
+`recharge_logs` success on this platform come first, never-charged cards last.
+This is the reverse of the original ordering, which fed new cards first to "work
+the pool down". In practice that gambled every single charge on an unverified
+card: high decline rate, velocity risk stacked on the account, while the few
+cards that actually clear sat at the tail of the queue. Fresh cards are now only
+reached once the proven ones are all cooling down or written off.
+
+The same ordering feeds the subscribe pipeline (`_subscribe_one_account`), which
+shares this method.
 
 `bump_fail_streak` does its upsert and read-back inside `Database.transaction()`.
 Splitting them into two `execute()` calls loses counts under concurrency: two

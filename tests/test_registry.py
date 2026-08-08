@@ -270,6 +270,38 @@ def test_exclude_used_normalises_spaces_in_card_numbers():
     assert [c['number'] for c in left] == ['4222']
 
 
+# ==================== 选卡层：好卡排在新卡前面 ====================
+
+
+def test_eligible_cards_puts_proven_cards_first(db):
+    """已成功付款过的卡排队首，没验证过的新卡垫后。
+
+    次序是反过来改的：早先新卡优先，想的是先把卡池消化掉。实际跑下来那等于笔笔都拿
+    一张没验证过的卡赌运气——拒付率高、还给账号叠 velocity 风控，而少数真能过款的卡
+    被晾在队尾。现在能过款的卡先用，新卡只在好卡全进冷却或判废后才被动用。
+    """
+    from src.models.card_group import CardGroupModel
+    from src.models.card_pool import CardPoolModel
+    from src.web.app import build_models
+
+    gid = CardGroupModel(db).create('g', 'payment')
+    raw = [{'number': f'411100000000000{i}', 'expiry_month': '12', 'expiry_year': '2030',
+            'cvc': '123', 'first_name': 'T', 'last_name': 'U', 'country': 'US',
+            'address': 'a', 'city': 'c', 'state': 's', 'zip': '1'} for i in range(4)]
+    CardPoolModel(db).add_cards(gid, raw)
+
+    models = build_models(db)
+    proven = raw[2]['number']                      # 队列中段的一张，排序真的动过才会跑到队首
+    log_id = models['recharge_log'].create(OC, 'a@example.com', proven, amount=20)
+    models['recharge_log'].mark_success(log_id)
+
+    state = AppState(db, models, platform=OC)
+    got = [c['number'] for c in state._eligible_cards(gid, exclude_used=False)]
+
+    assert got[0] == proven, f'成功过的卡该排队首，实际次序 {got}'
+    assert sorted(got) == sorted(c['number'] for c in raw), '不该漏卡或多卡'
+
+
 # ==================== 跨平台：两级排他的语义刻意相反（AC6） ====================
 
 
