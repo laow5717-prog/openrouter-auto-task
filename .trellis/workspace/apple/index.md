@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 43
-- **Last Active**: 2026-08-05
+- **Total Sessions**: 44
+- **Last Active**: 2026-08-08
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1505 | Active |
+| `journal-1.md` | ~1526 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 44 | 2026-08-08 | 修复 opencode OAuth「unknown state」错误页卡死 | `5d4a7e1` | `feat/global-stop-button` |
 | 43 | 2026-08-05 | 修复「开始充值」在 imported-only 场景启动被拒 | `db4dbc4`, `ab9e017`, `72044e1` | `main` |
 | 42 | 2026-08-05 | 账号 Excel 导入 + AdsPower 配置迁到 UI | `58996f1`, `f89005d` | `main` |
 | 41 | 2026-08-04 | 卡片复用策略与充值金额可配：判废口径放宽、单账号连充、金额随机、并发排他补漏 | `6142132`, `2a8285d`, `473953e` | `feat/card-reuse-and-random-amount` |

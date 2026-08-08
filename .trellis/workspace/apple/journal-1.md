@@ -1503,3 +1503,24 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Status
 
 [OK] **Completed**
+
+
+## Session 44: 修复 opencode OAuth「unknown state」错误页卡死
+
+**Date**: 2026-08-08
+**Task**: 修复 opencode OAuth「unknown state」错误页卡死
+**Branch**: `feat/global-stop-button`
+
+### Summary
+
+充值流水线里浏览器长时间挂在 auth.opencode.ai 的错误页「The browser was in an unknown state」。auth.opencode.ai 是 SST OpenAuth，state 存 cookie 且一次性使用，回调对不上就渲染这张 HTTP 200 的错误页，URL 还停在正常回调地址上——原先代码 _wait_until 只读 URL 不读正文，完全识别不了，一路空转到「未能取到 workspace id」，随后 15 轮 provision 重试全在同一个坏状态里打转。堵住两个成因：(1) _click_continue_github 的裸 goto 兜底直接打 auth.opencode.ai/github/authorize，绕过 opencode 侧 /authorize，OpenAuth 没机会种 state，回调 100% 撞错误页——改为重载 opencode.ai/auth 拿新鲜 authorize 页再找链接；(2) GitHub 登录+新设备邮箱验证要跑好几分钟，期间最初那张 authorize 页 state 放凉——新增 _auth_broken 检测 + _recover_auth 恢复，上限 2 次（第 1 次重开 authorize，第 2 次带清 cookie）。清 cookie 严格限定 opencode 域，无参 clear_cookies() 会连 github.com 登录态一起抹掉，逼出完整重登加一封设备验证码。顺带修掉一个原有缺陷：_oauth_leg 里等待离开 auth host 的 _wait_until 原本传 max(10, 剩余全部预算)，停在错误页时 URL 不变，这一次等待就吃光 240 秒总预算，后面恢复分支连跑的机会都没有——加 _budget() + _HOP_WAIT_CAP=45 给单跳封顶。这个缺陷是假时钟测试逼出来的（恢复次数恒为 0），不是预先看出来的。失败 detail 现在区分「认证 state 失效」与「未取到 workspace id」。新增 15 项测试（假 session + 假时钟，不起浏览器，2.2 秒），全量 558 项通过。知识写进 multi-platform-guidelines.md（OAuth state 三条规则 + 等待预算不要整块交给一次等待）和 browser-profile-guidelines.md（运行时清 cookie 的红线）。用户本次定调：以后所有浏览器自动化只走 AdsPower，不再为本地 Chrome 路径做适配验证。未验证部分：修复全靠日志和代码推断，没在真实浏览器上复现过错误页；下轮跑充值应留意日志里有无「命中 OpenAuth 错误页，第 N 次恢复」。GitHub 设备验证的 Enter 提交兜底列为 non-goals 未处理。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5d4a7e1` | (see git log) |
+
+### Status
+
+[OK] **Completed**
