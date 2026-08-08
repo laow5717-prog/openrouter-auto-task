@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端 spec 总入口"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "恢复重试与失败 detail 文案的既有约定"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "_step / print 留痕的既有约定"}
+{"file": ".trellis/spec/backend/browser-profile-guidelines.md", "reason": "清 cookie 会影响 profile 登录态，需先确认既有约束"}
+{"file": ".trellis/spec/backend/multi-platform-guidelines.md", "reason": "opencode 适配器在多平台结构中的边界"}

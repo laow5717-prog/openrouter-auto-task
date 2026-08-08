@@ -246,3 +246,57 @@ email 分配。所以「两平台并发」实际是「**两平台各跑不同账
 - Models: `platform` is a required positional parameter on every card/account
   state method. No defaults — a default is how a missed call site becomes silent
   cross-platform contamination.
+
+## OAuth 会话：state 是一次性的，坏页面必须被识别
+
+opencode 的 `auth.opencode.ai` 是 SST OpenAuth。它把 OAuth state 存在 cookie 里且**一次性
+使用**，回调时对不上就渲染一张错误页：
+
+> The browser was in an unknown state. This could be because certain cookies expired
+> or the browser was switched in the middle of an authentication flow.
+
+这一页的 HTTP 状态是 200，URL 也停在正常的回调地址上。**任何只读 URL 的等待都发现不了它。**
+
+### 三条必须遵守的规则
+
+**1. 不要手工拼 provider 的 authorize URL。**
+直接 `goto("https://auth.opencode.ai/github/authorize")` 会绕过 opencode 侧的 `/authorize`，
+OpenAuth 没机会种 state cookie，GitHub 回调回来 100% 撞上这一页。这是确定性的构造错误，不是
+概率问题。要进 OAuth 链，只能从产品入口（`https://opencode.ai/auth`）开始点。
+现场：2026-08-08，`_click_continue_github` 的裸 goto 兜底。
+
+**2. 长中断之后必须重开 authorize。**
+GitHub 登录 + 新设备邮箱验证要跑好几分钟（收码上限 180s + 回填 + 60s 等跳转）。这期间最初那张
+authorize 页的 state 早就放凉了。中断结束后回到 OAuth 链，要重新访问入口拿新鲜 state，
+不能接着用旧页面上的旧链接。
+
+**3. 恢复时清 cookie 只能按域清。**
+`context.clear_cookies(domain="opencode.ai")`，**绝不能调无参 `clear_cookies()`** ——
+那会连 `github.com` 的登录 cookie 一起抹掉，逼出一次完整重登 + 一次新设备邮箱验证。
+同见 [Browser Profile](./browser-profile-guidelines.md)「Cookies 不可删」。
+
+参考实现：`src/platforms/opencode/login.py` 的 `_auth_broken` / `_recover_auth` /
+`_clear_opencode_cookies`，恢复上限 2 次（第 1 次重开 authorize，第 2 次带清 cookie）。
+
+### 失败要分类上报
+
+停在 OpenAuth 错误页和 workspace provision 慢是**两种完全不同的故障**，排查路径不同。
+把前者混报成「未能取到 workspace id」会让下一次排查从头开始——这正是 2026-08-08 那次现场
+查了很久的原因。`detail` 要说清是哪一种。
+
+## 等待预算：不要把剩余额度整块交给一次等待
+
+```python
+# ❌ 这一次等待就能吃光整个 240 秒预算
+_wait_until(session, pred, timeout=max(10, int(deadline - time.time())))
+
+# ✅ 单跳封顶，给后续的重试/恢复留出额度
+_wait_until(session, pred, timeout=_budget(deadline, _HOP_WAIT_CAP))
+```
+
+页面卡在一个**谓词永远不成立**的状态时（比如停在错误页，URL 再也不变），`max(floor, 剩余全部)`
+的写法会让这一次等待独吞全部预算，后面所有的重试、恢复、兜底分支连跑的机会都没有——现象是
+「日志停在某一步之后再无输出」。
+
+单跳等待要按该跳的**正常耗时**封顶（OAuth 重定向是秒级的，封 45 秒已经给代理留足余量），
+而不是按剩余预算。这条对所有 `deadline - now` 形式的超时计算都成立。

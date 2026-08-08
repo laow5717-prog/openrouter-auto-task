@@ -57,6 +57,23 @@ Deleting anything in the bottom four logs every account out. `tests/
 test_profile_hygiene.py::test_prune_keeps_credentials` is the regression guard —
 keep it.
 
+### 运行时清 cookie：同一条红线
+
+上面那张表管的是磁盘上的 profile 目录，但**运行时的 `context.clear_cookies()` 踩的是同一条
+红线**——无参调用等于删 `Default/Cookies`，当场把 `github.com` 的登录态一起抹掉。代价不是
+「重登一次」那么轻：GitHub 会因为是新设备再要一次邮箱验证码，实测数分钟起。
+
+要清就按域清：
+
+```python
+ctx.clear_cookies(domain="opencode.ai")     # ✅ 只动目标站
+ctx.clear_cookies()                         # ❌ 连 github.com 登录态一起没
+```
+
+Playwright 1.43+ 的 `clear_cookies` 支持 `name` / `domain` / `path` 关键字过滤，本项目锁
+1.61，可以直接用。AdsPower 走 `connect_over_cdp` 拿到的 context 与本地栈同构，无需分支。
+参考 `src/platforms/opencode/login.py::_clear_opencode_cookies`。
+
 ---
 
 ## Process lifecycle

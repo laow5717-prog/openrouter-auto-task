@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量检查基线"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验失败路径是否如实上报"}
+{"file": ".trellis/spec/backend/browser-profile-guidelines.md", "reason": "校验清 cookie 的作用域未越界"}
