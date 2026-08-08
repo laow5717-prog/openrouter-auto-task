@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 44
-- **Last Active**: 2026-08-08
+- **Total Sessions**: 45
+- **Last Active**: 2026-08-09
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1526 | Active |
+| `journal-1.md` | ~1548 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 45 | 2026-08-09 | AdsPower 回收按余额区分终态 + 账号归档与失败重置 | `2ee51fd`, `e175ff4` | `main` |
 | 44 | 2026-08-08 | 修复 opencode OAuth「unknown state」错误页卡死 | `5d4a7e1` | `feat/global-stop-button` |
 | 43 | 2026-08-05 | 修复「开始充值」在 imported-only 场景启动被拒 | `db4dbc4`, `ab9e017`, `72044e1` | `main` |
 | 42 | 2026-08-05 | 账号 Excel 导入 + AdsPower 配置迁到 UI | `58996f1`, `f89005d` | `main` |

@@ -1524,3 +1524,25 @@ V10 迁移新增 apikey/apikey_updated_at/email_verify_link 三列；从 hotmail
 ### Status
 
 [OK] **Completed**
+
+
+## Session 45: AdsPower 回收按余额区分终态 + 账号归档与失败重置
+
+**Date**: 2026-08-09
+**Task**: AdsPower 回收按余额区分终态 + 账号归档与失败重置
+**Branch**: `main`
+
+### Summary
+
+两件事。(1) 用户问「账号对应的 AdsPower 浏览器为什么经常更换」，查出 08-05 reuse-by-balance-cap 只改了一半：app.py 已写明 recharged 不再是终态、archived 才是，但 adspower_profile.py 的 _PLATFORM_TERMINAL 仍把 recharged 当终态，回收流程把下一轮还要用的账号环境当垃圾删——现场 14 个 recharged 里 5 个映射已被删光，每个下次跑都要 GitHub 完整重登 + 一次新设备邮箱验证。不能简单删掉 recharged（当前 archived 为 0，第 2 档会清空，配额满就报无可回收，2026-08-03 就是这么瘫痪的），改为加第 3 档降级：archived/subscribed 批量回收，recharged 只在前面几档挑不出时才动且单次只牺牲 1 个，档内按 MAX(credits_balance) DESC 牺牲余额最高的（离 cap 最近损失最小），NULL 余额排最后。utils.PLATFORM_TERMINAL_STATUSES 不动——它回答「账号还能不能充值」，是另一套语义；原来那句「两处保持一致」的注释正是 bug 传播源，已改写为「不要同步」。(2) 后台加批量归档（identity_status='retired'）与「注册失败重置为 imported」。retired 只需在 IDENTITY_TERMINAL_STATUSES 加一项即全局生效，因为四处判据共用 is_identity_terminal。底层刻意不叫 archived——平台层已有该值，而前端用同一张 statusMap 渲染身份列和平台列，同名两列徽章就一模一样。归档同步释放 AdsPower 环境（best-effort，不阻断）。重置判定抽到 services/account_reset.py 与命令行脚本共用，两条保护原样搬：只动 failed/pending（suspended 刻意排除）、无收码数据必须跳过。两个测试教训：(a) 第一版排序测试全是假绿，把档位改回合并状态后 34 项仍全绿——ORDER BY 多层，档位失效时余额/LRU 层接管且构造数据恰好同向；且第一次变异也选错了（改常量值只让行为更保守，要改分类逻辑本身）。修正后加直接断言 rank 的测试并把行为测试构造成「其它层给出相反结果」，正确变异下 6 项失败。(b) 端点测试会真的连上本机常驻的 AdsPower 客户端并调删除接口，不报错、看着是绿的但已在动真实环境；改为复用 test_account_delete_adspower.py 的 monkeypatch 基建。两条都写进 quality-guidelines.md。全量 597 项通过，前端已 build，服务已重启（PID 65200）。未验证：UI 实际点击流程只在代码层确认，没跑过；AdsPower 回收的新档位也没在真实配额满的场景下跑过。回滚风险：retired 是新增枚举值，回滚代码前必须先把已归档账号改成别的状态，否则它们会静默重新进入轮转。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2ee51fd` | (see git log) |
+| `e175ff4` | (see git log) |
+
+### Status
+
+[OK] **Completed**
