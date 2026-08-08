@@ -76,18 +76,22 @@ def db():
 _PLATFORM_LAYER = ('archived', 'recharged', 'subscribed')
 
 
-def _account(db, email, status, platform='opencode'):
+def _account(db, email, status, platform='opencode', balance=None):
     """按状态所属的层建账号。
 
     status 传平台层的值（recharged/archived/subscribed）时，身份层记 'registered'
     并在 platform_accounts 建一行——这正是真实流水线写出来的形状：能充值成功的账号，
     GitHub 必然已注册好。传身份层的值则只写 accounts。
+
+    balance 写进 credits_balance，供「牺牲余额最高的」那组测试用。不传即 NULL，
+    也就是真实流水线里「余额读不到」的形状。
     """
     if status in _PLATFORM_LAYER:
         db.execute("INSERT INTO accounts (email, identity_status) VALUES (?, 'registered')",
                    (email,))
-        db.execute("INSERT INTO platform_accounts (platform, email, status) VALUES (?, ?, ?)",
-                   (platform, email, status))
+        db.execute("INSERT INTO platform_accounts "
+                   "(platform, email, status, credits_balance) VALUES (?, ?, ?, ?)",
+                   (platform, email, status, balance))
     else:
         db.execute("INSERT INTO accounts (email, identity_status) VALUES (?, ?)",
                    (email, status))
@@ -286,12 +290,17 @@ def test_reclaim_blocked_while_any_platform_unfinished(db):
 
 
 def test_reclaim_allowed_once_all_platforms_finished(db):
-    """上一条的对照组：所有开通过的平台都到终态后，环境即可回收。"""
+    """上一条的对照组：所有开通过的平台都**真跑完**后，环境即可回收。
+
+    2026-08-08 改语义前这里用的是 recharged + subscribed。那个组合现在落第 3 档
+    （recharged 意味着余额未满、下一轮还要跑），不再是「真跑完」的例子——它挪去了
+    test_recharged_sacrificed_only_as_last_resort。真终态是 archived / subscribed。
+    """
     client = FakeClient(quota=1)
     pool = _pool(db, client, reclaim_batch=1)
     db.execute("INSERT INTO accounts (email, identity_status) VALUES ('multi@x.com', 'registered')")
     db.execute("INSERT INTO platform_accounts (platform, email, status) "
-               "VALUES ('opencode', 'multi@x.com', 'recharged')")
+               "VALUES ('opencode', 'multi@x.com', 'archived')")
     db.execute("INSERT INTO platform_accounts (platform, email, status) "
                "VALUES ('other', 'multi@x.com', 'subscribed')")
     _account(db, "new@x.com", "registered")
@@ -299,6 +308,178 @@ def test_reclaim_allowed_once_all_platforms_finished(db):
     old_pid, _, _ = pool.ensure_profile("multi@x.com")
     pool.ensure_profile("new@x.com")
     assert old_pid in client.deleted
+
+
+# --- recharged 是最后手段（2026-08-08） -------------------------------------
+#
+# 背景：08-05 的 reuse-by-balance-cap 让「余额未满的 recharged 账号」重新进轮转，
+# 但环境回收判据没跟着改，继续把 recharged 当终态删。现场代价是 14 个 recharged
+# 账号里 5 个的环境映射被删光，每个下次跑都要 GitHub 完整重登 + 一次新设备邮箱验证。
+
+def test_recharged_ranks_after_truly_done(db):
+    """最直接的档位断言：recharged 的 rank 必须**严格大于**真终态的 rank。
+
+    这条不依赖余额、不依赖 last_used_at，是「两档没合并」的唯一无歧义证据。
+    行为层的测试（谁先被删）都会被 ORDER BY 的后续层次干扰——实测把 archived 余额
+    设成 200、recharged 设成 20 时，即使两档合并，按余额降序也照样先删 archived，
+    测试恒过。
+    """
+    _account(db, "done@x.com", "archived", balance=200.0)
+    _account(db, "reuse@x.com", "recharged", balance=20.0)
+    model = AdsPowerProfileModel(db)
+    model.upsert("done@x.com", "pid_done")
+    model.upsert("reuse@x.com", "pid_reuse")
+
+    ranks = {r["email"]: r["rank"] for r in model.reclaim_candidates()}
+    assert ranks["done@x.com"] < ranks["reuse@x.com"], (
+        f"recharged 必须排在真终态之后，实际 {ranks}")
+
+
+def test_archived_reclaimed_before_recharged(db):
+    """核心回归：有真终态环境可回收时，recharged 的环境一个都不许动。
+
+    ⚠️ recharged **必须先创建**，让它的 last_used_at 早于 archived。两档合并时
+    tie-break 会退化成 last_used_at ASC（LRU），于是先删 recharged —— 正是要抓的 bug。
+    反过来构造（archived 先建）的话，同档时 LRU 也会先删 archived，测试恒过、
+    抓不住任何东西。实测：这个顺序写反时，把 RECHARGED_RANK 改回与 PLATFORM_DONE_RANK
+    相等，34 项测试仍然全绿。
+    """
+    client = FakeClient(quota=2)
+    pool = _pool(db, client, reclaim_batch=1)
+    _account(db, "reuse@x.com", "recharged", balance=20.0)
+    _account(db, "done@x.com", "archived", balance=200.0)
+
+    reuse_pid, _, _ = pool.ensure_profile("reuse@x.com")     # 更早被用
+    done_pid, _, _ = pool.ensure_profile("done@x.com")
+    _account(db, "new@x.com", "registered")
+    pool.ensure_profile("new@x.com")            # 配额满 → 触发回收
+
+    assert done_pid in client.deleted, "真终态环境才该被回收"
+    assert reuse_pid not in client.deleted, "还要再跑的账号，环境不该被牺牲"
+
+
+def test_recharged_sacrificed_only_as_last_resort(db):
+    """没有真终态可回收时，才牺牲 recharged——否则配额满了整条流水线会瘫痪。
+
+    2026-08-03 踩过：一批环境永久占死配额，每个账号都报「配额已满且无可回收」。
+    """
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1)
+    _account(db, "reuse@x.com", "recharged", balance=20.0)
+    _account(db, "new@x.com", "registered")
+
+    reuse_pid, _, _ = pool.ensure_profile("reuse@x.com")
+    pool.ensure_profile("new@x.com")
+
+    assert reuse_pid in client.deleted
+
+
+def test_recharged_sacrifice_is_capped_at_one(db):
+    """哪怕 reclaim_batch=3，第 3 档单次也只牺牲一个。
+
+    每牺牲一个的代价是一次 GitHub 完整重登 + 一次新设备邮箱验证（数分钟 + 一封
+    验证码）。批量删三个等于一次赔三份，而配额只要腾出一格就能继续跑。
+    """
+    client = FakeClient(quota=3)
+    pool = _pool(db, client, reclaim_batch=3)
+    for i in range(3):
+        _account(db, f"reuse{i}@x.com", "recharged", balance=20.0 + i)
+        pool.ensure_profile(f"reuse{i}@x.com")
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("new@x.com")
+
+    assert len(client.deleted) == 1, f"只该牺牲 1 个，实际删了 {client.deleted}"
+
+
+def test_recharged_sacrifice_picks_highest_balance(db):
+    """牺牲余额最高的：离 balance_cap 最近，剩下要充的笔数最少，损失最小。"""
+    client = FakeClient(quota=3)
+    pool = _pool(db, client, reclaim_batch=1)
+    pids = {}
+    for email, bal in (("low@x.com", 20.0), ("high@x.com", 110.0), ("mid@x.com", 49.0)):
+        _account(db, email, "recharged", balance=bal)
+        pids[email], _, _ = pool.ensure_profile(email)
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("new@x.com")
+
+    assert client.deleted == [pids["high@x.com"]]
+
+
+def test_null_balance_sacrificed_last(db):
+    """余额为 NULL 的排在所有有余额的之后——不知道就保守保留。
+
+    update_balance 在 balance_after 读不到时直接 return（infron 常态、opencode 偶发），
+    所以 NULL 是「读不到」而不是「余额为 0」。
+    """
+    client = FakeClient(quota=2)
+    pool = _pool(db, client, reclaim_batch=1)
+    _account(db, "unknown@x.com", "recharged", balance=None)
+    _account(db, "known@x.com", "recharged", balance=20.0)
+    unknown_pid, _, _ = pool.ensure_profile("unknown@x.com")
+    known_pid, _, _ = pool.ensure_profile("known@x.com")
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("new@x.com")
+
+    assert client.deleted == [known_pid]
+    assert unknown_pid not in client.deleted
+
+
+def test_unfinished_platform_still_never_reclaimed(db):
+    """既有保护不能被新档破坏：任一平台还没跑完时，环境永不回收。
+
+    第 3 档放宽的只是 recharged，不是「所有还没跑完的」。
+    """
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1)
+    db.execute("INSERT INTO accounts (email, identity_status) VALUES ('busy@x.com', 'registered')")
+    db.execute("INSERT INTO platform_accounts (platform, email, status) "
+               "VALUES ('opencode', 'busy@x.com', 'recharged')")
+    db.execute("INSERT INTO platform_accounts (platform, email, status) "
+               "VALUES ('other', 'busy@x.com', 'registered')")   # 还没跑完
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("busy@x.com")
+    with pytest.raises(AdsPowerQuotaExceeded):
+        pool.ensure_profile("new@x.com")
+    assert client.deleted == []
+
+
+def test_busy_recharged_is_not_sacrificed(db):
+    """正被 worker 使用的 recharged 环境不能牺牲——删了那个 worker 的浏览器会凭空消失。"""
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1,
+                 is_busy=lambda e: e == "reuse@x.com")
+    _account(db, "reuse@x.com", "recharged", balance=20.0)
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("reuse@x.com")
+    with pytest.raises(AdsPowerQuotaExceeded):
+        pool.ensure_profile("new@x.com")
+    assert client.deleted == []
+
+
+def test_sacrifice_log_names_the_cost(db):
+    """牺牲活账号要单独记一条并带余额——这条日志的频率就是配额压力的直接指标。
+
+    原先只有一句「已回收 N 个环境释放配额」，看不出删的是垃圾还是活账号。
+    """
+    logs = []
+    client = FakeClient(quota=1)
+    pool = AdsPowerProfilePool(client, AdsPowerProfileModel(db),
+                              log=logs.append, reclaim_batch=1)
+    _account(db, "reuse@x.com", "recharged", balance=110.0)
+    _account(db, "new@x.com", "registered")
+
+    pool.ensure_profile("reuse@x.com")
+    pool.ensure_profile("new@x.com")
+
+    line = next((m for m in logs if "牺牲" in m), None)
+    assert line is not None, f"没有牺牲日志: {logs}"
+    assert "reuse@x.com" in line
+    assert "110" in line
 
 
 def test_registered_account_without_platform_row_is_never_reclaimed(db):

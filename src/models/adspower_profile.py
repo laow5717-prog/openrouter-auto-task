@@ -18,7 +18,7 @@
 # 于是要隔离的不是环境本身，而是**回收判据**：见 reclaim_candidates。
 
 # ---- 回收优先级 ----
-# 判据是「这个环境里还有没有值得留的登录态」。分两档：
+# 判据是「这个环境里还有没有值得留的登录态」。分三档：
 
 # 第一档，身份层已死：GitHub 侧就没注册成功或已被封，任何平台都用不上这个环境。
 # failed/pending/rejected 排最前——注册压根没成功，环境里空无一物，删了零损失。
@@ -28,16 +28,39 @@
 IDENTITY_DEAD_ORDER = ('failed', 'pending', 'rejected',
                        'flagged', 'banned', 'suspended')
 
-# 第二档，身份可用但**所有平台都已跑完**：环境里的 GitHub 授权态还有效，但没有平台
+# 第二档，身份可用但**所有平台都真的跑完了**：环境里的 GitHub 授权态还有效，但没有平台
 # 还需要它了。这一档排在第一档之后——它比"注册失败"更值得留。
 PLATFORM_DONE_RANK = len(IDENTITY_DEAD_ORDER)
+
+# 第三档，**最后手段**：还有平台是 recharged（有余额但没到 balance_cap，下一轮还会被
+# _reusable_recharged() 领走继续充）。删它的代价是那个账号下次跑时要 GitHub 完整重登，
+# 且因为是「新设备」还要再过一次邮箱验证码（数分钟）。所以只在前面几档一个都挑不出来
+# 时才动，而且**一次只牺牲一个**（见 adspower_driver.reclaim）。
+RECHARGED_RANK = PLATFORM_DONE_RANK + 1
 
 # 身份可用、且还有平台没跑完 → 绝不可回收。典型是 identity_status='registered' 且
 # opencode 平台行还不存在（等着登录充值）——环境里的 GitHub 登录态正是下一步要用的。
 
-# 平台层终态集合。与 utils.PLATFORM_TERMINAL_STATUSES 保持一致，在此重复列出是为了
-# 让 SQL 与常量定义在同一个文件里可读；改动时两处都要改。
-_PLATFORM_TERMINAL = ('archived', 'recharged', 'subscribed')
+# ---- 平台层状态集合 ----
+#
+# ⚠️ **不要与 utils.PLATFORM_TERMINAL_STATUSES 同步。** 这里曾经有一句「两处保持一致，
+# 改动时两处都要改」，那句话现在是错的，而且正是 2026-08-08 那个 bug 的传播源。
+# 两者回答的是不同问题：
+#   utils.PLATFORM_TERMINAL_STATUSES  → 「这个账号还能不能充值」（recharged 是终态）
+#   这里的 _PLATFORM_DONE             → 「这环境里还有没有值得留的登录态」
+# 2026-08-05 的 reuse-by-balance-cap 让余额未满的 recharged 账号重新进轮转之后，
+# recharged 对前者仍是终态、对后者**不再是**。当时只改了前者，回收流程继续把「下一轮
+# 还要用的账号」的环境当垃圾删——现场：14 个 recharged 账号里 5 个的映射已被删光，
+# 每个都要重登一次。
+
+# 真跑完了：余额已达 balance_cap 被归档，或订阅完成。
+_PLATFORM_DONE = ('archived', 'subscribed')
+
+# 还要再跑：recharged 现在的含义是「有一些余额」，不是「这个账号做完了」。
+_PLATFORM_REUSABLE = ('recharged',)
+
+# 能进候选集的全集。不在这里面的（如 registered 等着首充）一律不可回收。
+_PLATFORM_RECLAIMABLE = _PLATFORM_DONE + _PLATFORM_REUSABLE
 
 
 class AdsPowerProfileModel:
@@ -91,12 +114,16 @@ class AdsPowerProfileModel:
         return [dict(r) for r in rows]
 
     def reclaim_candidates(self, limit=50):
-        """按回收优先级返回可删除的 (email, profile_id, status)。
+        """按回收优先级返回可删除的 (email, profile_id, status, rank, bal)。
 
-        三档判据（详见文件头）：
+        四档判据（详见文件头）：
           0. 账号已从 accounts 删除（孤儿映射）→ 什么都不用留，优先回收；
           1. 身份层已死（identity_status ∈ IDENTITY_DEAD_ORDER）→ 任何平台都用不上；
-          2. 身份可用，且**至少开通过一个平台**、开通的平台**全部**已到终态。
+          2. 身份可用，且**至少开通过一个平台**、开通的平台**全部**真跑完了
+             （∈ _PLATFORM_DONE）；
+          3. 同上，但至少有一个平台是 `recharged`（还要再跑）→ **最后手段**。
+             调用方负责「只在挑不出前三档时才动，且一次只牺牲一个」，见
+             adspower_driver.reclaim。这里只负责把它排到最后。
 
         第 0 档要用 LEFT JOIN。此前这里是 INNER JOIN，孤儿映射直接被 JOIN 掉、永远
         进不了候选集，于是它对应的远端环境无人回收，在只有 12 格的配额里白占一格
@@ -114,6 +141,15 @@ class AdsPowerProfileModel:
         授权态正是下一步要用的东西，删了等于白注册。少了这个 EXISTS，NOT EXISTS 会
         对这类账号恒为真，把它们全判成可回收。
 
+        第 3 档内部按**余额降序**牺牲：余额越接近 balance_cap，剩下要充的笔数越少，
+        重建环境的期望损失越小。余额取 MAX(credits_balance)——环境按 email 分配、不按
+        平台拆（见文件头），所以余额也要按 email 汇总；任一平台余额已高即视为整体接近完成。
+
+        `credits_balance` 为 NULL 的排在本档**最后**：`update_balance` 在 balance_after
+        读不到时直接 return（infron 常态、opencode 偶发），NULL 意味着「不知道」，
+        不知道就保守保留。这一层显式写在 ORDER BY 里，不依赖 SQLite「DESC 时 NULL 排最后」
+        的默认行为——那是实现细节，换个引擎就变。
+
         只看状态，不看「是否正在被 worker 使用」——运行时占用是内存态，DB 不知道，
         由调用方用 AccountRegistry 过滤。这里少一层过滤是刻意的：把两种判据混在一条
         SQL 里，会让「为什么这个环境没被回收」变得无法从 DB 单独复现。
@@ -121,21 +157,28 @@ class AdsPowerProfileModel:
         dead_marks = ','.join('?' * len(IDENTITY_DEAD_ORDER))
         dead_order = ' '.join(
             f"WHEN ? THEN {i}" for i in range(len(IDENTITY_DEAD_ORDER)))
-        term_marks = ','.join('?' * len(_PLATFORM_TERMINAL))
+        reclaimable_marks = ','.join('?' * len(_PLATFORM_RECLAIMABLE))
+        reusable_marks = ','.join('?' * len(_PLATFORM_REUSABLE))
 
         rows = self.db.fetchall(
             f"""
-            SELECT p.email, p.profile_id,
+            SELECT p.email, p.profile_id, b.bal AS bal,
                    CASE WHEN a.email IS NULL THEN '(账号已删除)'
                         ELSE COALESCE(a.identity_status,'') END AS status,
                    CASE
                        WHEN a.email IS NULL THEN -1
                        WHEN COALESCE(a.identity_status,'') IN ({dead_marks})
                             THEN CASE COALESCE(a.identity_status,'') {dead_order} ELSE 99 END
+                       WHEN EXISTS (SELECT 1 FROM platform_accounts pa
+                                    WHERE pa.email = p.email
+                                      AND COALESCE(pa.status,'') IN ({reusable_marks}))
+                            THEN {RECHARGED_RANK}
                        ELSE {PLATFORM_DONE_RANK}
                    END AS rank
             FROM adspower_profiles p
             LEFT JOIN accounts a ON a.email = p.email
+            LEFT JOIN (SELECT email, MAX(credits_balance) AS bal
+                       FROM platform_accounts GROUP BY email) b ON b.email = p.email
             WHERE a.email IS NULL
                OR COALESCE(a.identity_status,'') IN ({dead_marks})
                OR (
@@ -144,16 +187,20 @@ class AdsPowerProfileModel:
                    AND NOT EXISTS (
                        SELECT 1 FROM platform_accounts pa
                        WHERE pa.email = p.email
-                         AND COALESCE(pa.status,'') NOT IN ({term_marks})
+                         AND COALESCE(pa.status,'') NOT IN ({reclaimable_marks})
                    )
                )
-            ORDER BY rank, p.last_used_at ASC
+            ORDER BY rank,
+                     CASE WHEN rank = {RECHARGED_RANK} AND b.bal IS NULL THEN 1 ELSE 0 END,
+                     CASE WHEN rank = {RECHARGED_RANK} THEN b.bal END DESC,
+                     p.last_used_at ASC
             LIMIT ?
             """,
-            tuple(IDENTITY_DEAD_ORDER)          # CASE ... IN
-            + tuple(IDENTITY_DEAD_ORDER)        # CASE WHEN ? THEN i
+            tuple(IDENTITY_DEAD_ORDER)          # SELECT CASE ... IN
+            + tuple(IDENTITY_DEAD_ORDER)        # SELECT CASE WHEN ? THEN i
+            + tuple(_PLATFORM_REUSABLE)         # SELECT CASE ... EXISTS ... IN
             + tuple(IDENTITY_DEAD_ORDER)        # WHERE ... IN
-            + tuple(_PLATFORM_TERMINAL)         # NOT EXISTS ... NOT IN
+            + tuple(_PLATFORM_RECLAIMABLE)      # WHERE NOT EXISTS ... NOT IN
             + (limit,),
         )
         return [dict(r) for r in rows]

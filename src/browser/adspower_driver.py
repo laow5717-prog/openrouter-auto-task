@@ -25,6 +25,7 @@ import time
 from src.browser.driver import (
     BrowserSession, DEFAULT_TIMEOUT_MS, NAV_TIMEOUT_MS, BROWSER_ACCEPT_LANG_HEADER,
 )
+from src.models.adspower_profile import RECHARGED_RANK
 from src.services.adspower import (
     AdsPowerQuotaExceeded, AdsPowerProfileMissing, AdsPowerError,
 )
@@ -177,15 +178,21 @@ class AdsPowerProfilePool:
     def reclaim(self, exclude=None, limit=None):
         """删掉已完成账号的环境以腾出配额，返回被回收的 [(email, profile_id)]。
 
-        候选由 DB 按账号状态排序给出（recharged 优先），这里再剔除两类：
-        调用方点名排除的，以及此刻正被 worker 占用的（is_busy）。后者是硬约束——
+        候选由 DB 按 rank 排序给出（孤儿 → 身份已死 → 真终态 → recharged），这里再剔除
+        两类：调用方点名排除的，以及此刻正被 worker 占用的（is_busy）。后者是硬约束——
         删掉正在用的环境会让那个 worker 的浏览器凭空消失。
+
+        **第 3 档（RECHARGED_RANK）是最后手段。** 那些账号余额还没到 balance_cap，
+        下一轮还会被领走继续充；删它的代价是一次 GitHub 完整重登 + 一次新设备邮箱验证
+        （数分钟 + 一封验证码）。所以只在前面几档一个都挑不出来时才动它，而且**一次
+        只牺牲一个**——批量删三个等于一次赔三份，而配额只要腾出一格就能继续跑。
         """
         exclude = set(exclude or ())
         limit = limit or self.reclaim_batch
         with self._lock:
             candidates = self.profiles.reclaim_candidates(limit=max(limit * 5, 20))
             picked = []
+            sacrificed = False
             for row in candidates:
                 if len(picked) >= limit:
                     break
@@ -194,6 +201,15 @@ class AdsPowerProfilePool:
                     continue
                 if self._is_busy(email):
                     continue
+                if row.get("rank") == RECHARGED_RANK:
+                    # 候选已按 rank 排序，走到这里说明前面几档要么没有、要么全被
+                    # exclude/is_busy 挡掉了。已经挑到更值得删的就不必牺牲活账号；
+                    # 真要牺牲也只牺牲这一个，后面全是同档或更低优先级，不必再看。
+                    if picked:
+                        break
+                    sacrificed = True
+                    picked.append(row)
+                    break
                 picked.append(row)
 
             if not picked:
@@ -211,8 +227,17 @@ class AdsPowerProfilePool:
             # 本地映射必须在删除成功后才清：先清本地再删远端，一旦删除失败就会留下
             # 一批查不到映射、也没人再删的孤儿环境，配额被永久吃掉。
             self.profiles.delete_by_emails(emails)
-            detail = "、".join(f"{r['email']}({r['status']})" for r in picked)
-            self._log(f"[AdsPower] 已回收 {len(picked)} 个环境释放配额: {detail}")
+            if sacrificed:
+                # 单独一条：删的是活账号的登录态，不是垃圾。这条日志的出现频率就是
+                # 「配额压力有多大」的直接指标——高频出现说明该调 balance_cap 或轮转账号数。
+                row = picked[0]
+                bal = row.get("bal")
+                bal_txt = f"余额 ${bal:.0f}" if bal is not None else "余额未知"
+                self._log(f"[AdsPower] 无真终态环境可回收，牺牲 1 个活账号环境腾配额: "
+                          f"{row['email']}(recharged, {bal_txt})")
+            else:
+                detail = "、".join(f"{r['email']}({r['status']})" for r in picked)
+                self._log(f"[AdsPower] 已回收 {len(picked)} 个环境释放配额: {detail}")
             return [(r["email"], r["profile_id"]) for r in picked]
 
     def _stop_all(self, profile_ids):

@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/adspower-guidelines.md", "reason": "AdsPower 配额与环境回收的既有约束"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "SQL 与模型层的既有约定"}
+{"file": ".trellis/spec/backend/multi-platform-guidelines.md", "reason": "平台终态语义与按 email 而非 platform 分配环境的理由"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "牺牲活账号那条日志的写法约定"}

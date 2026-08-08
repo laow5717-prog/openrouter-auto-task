@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量检查基线"}
+{"file": ".trellis/spec/backend/adspower-guidelines.md", "reason": "校验回收判据未破坏配额保护"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "校验 SQL 占位符与聚合正确性"}

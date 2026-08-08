@@ -119,13 +119,48 @@ so proactive tidying costs sessions we may still need.
 Candidates come from `AdsPowerProfileModel.reclaim_candidates`. The ordering key
 is **how much login state the profile still holds**, not how "done" the account
 is — a registration that never completed leaves an empty profile, so those go
-first. Three tiers, oldest `last_used_at` first within each:
+first. Four tiers, oldest `last_used_at` first within each:
 
 | Tier | Condition | Rationale |
 |---|---|---|
 | 0 | The account row is gone from `accounts` (orphaned mapping) | Nothing left to preserve |
 | 1 | `identity_status ∈ (failed, pending, rejected, flagged, banned, suspended)` | GitHub side is dead — useless on *every* platform |
-| 2 | Identity usable, **and** the mailbox has at least one `platform_accounts` row, **and** all of them are terminal | Every platform that was started is finished |
+| 2 | Identity usable, **and** the mailbox has at least one `platform_accounts` row, **and** all of them are in `_PLATFORM_DONE` (`archived` / `subscribed`) | Every platform that was started is genuinely finished |
+| 3 | Same, but at least one platform row is `recharged` | **Last resort** — see below |
+
+### Tier 3: `recharged` is not "done", and costs real money to delete
+
+`recharged` means *"has some balance, not yet at `balance_cap`"* — the account
+will be picked up again next round by `_reusable_recharged()`. Deleting its
+profile costs a full GitHub re-login **plus** a new-device email verification
+(minutes, and one verification code) the next time it runs.
+
+So tier 3 is reclaimed only when tiers 0–2 yield nothing, and **only one profile
+per reclaim call**, even when `reclaim_batch` is 3. Batching here pays that cost
+three times over when freeing a single slot would have been enough. Within the
+tier, order by `MAX(credits_balance) DESC` — the closer to `balance_cap`, the
+fewer top-ups remain and the smaller the expected loss. `NULL` balances sort
+**last**: `update_balance` returns early when `balance_after` can't be read
+(routine on infron, occasional on opencode), so `NULL` means "unknown", and
+unknown is preserved.
+
+The sacrifice gets its own log line naming the account and its balance. How often
+it appears *is* the quota-pressure metric — if it is frequent, the thing to adjust
+is `balance_cap` or the number of accounts in rotation, not the reclaim predicate.
+
+> **2026-08-08 incident.** `_PLATFORM_TERMINAL` in `adspower_profile.py` included
+> `recharged`, so tier 2 swallowed accounts that were still in rotation. The
+> 08-05 `reuse-by-balance-cap` change had already redefined `recharged` as
+> non-terminal *for rotation* and said so in `app.py`, but the reclaim predicate
+> was never updated. Result: 5 of 14 `recharged` accounts had lost their mapping,
+> each paying a re-login plus an email code on its next run. The user noticed it
+> as "the AdsPower browser for an account keeps changing".
+>
+> **Do not re-sync this file's status sets with `utils.PLATFORM_TERMINAL_STATUSES`.**
+> A comment used to say "keep both in sync"; that comment is what propagated the
+> bug. The two answer different questions — *can this account still be topped up*
+> vs *does this profile still hold login state worth keeping* — and `recharged`
+> answers them differently.
 
 Profiles are keyed by **email, not by (platform, email)** — see
 [Multi-Platform](./multi-platform-guidelines.md) for why splitting them is a net
