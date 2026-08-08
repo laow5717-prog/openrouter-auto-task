@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/api/index.md", "reason": "API 端点的既有约定"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端组件与 API 调用约定"}
+{"file": ".trellis/spec/backend/adspower-guidelines.md", "reason": "环境释放的 best-effort 红线与回收档位"}
+{"file": ".trellis/spec/backend/multi-platform-guidelines.md", "reason": "身份层与平台层状态语义的分界"}

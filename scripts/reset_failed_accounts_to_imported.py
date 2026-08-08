@@ -33,13 +33,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.database import Database
-
-# 视为「注册没成」的身份状态。三者都由 _register_one_account 写入：
-#   failed    注册流程未走完
-#   pending   碰上 Arkose 人机验证，主动跳过
-# suspended 刻意不在其中——那是「注册出来就被 GitHub 挂起」，同一个邮箱重注册大概率
-# 还是同样下场，退回 imported 只会让它每轮都白跑一次。要重试请显式加 --include-suspended。
-RESETTABLE = ('failed', 'pending')
+# 判定逻辑与后台 UI 的 /api/accounts/reset-imported 共用一份，见该模块 docstring。
+# 两边各写一份会漂移，而漂移的表现是「重置了一批账号，跑起来全领不走」——不报错，只白跑。
+from src.services.account_reset import RESETTABLE, classify_for_reset, load_hotmail_emails
 
 
 def _counts(db):
@@ -48,17 +44,6 @@ def _counts(db):
         "FROM accounts GROUP BY 1 ORDER BY c DESC"
     )
     return {dict(r)['s']: dict(r)['c'] for r in rows}
-
-
-def _hotmail_emails():
-    """hotmail.xlsx 里的邮箱集合。文件不存在时返回空集（不是错误——多数账号
-    的收码链接在 DB 里，xlsx 只是第二来源）。"""
-    try:
-        from src.services.hotmail_inbox import read_hotmail_accounts
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return {a.email for a in read_hotmail_accounts(os.path.join(base, 'hotmail.xlsx'))}
-    except Exception:
-        return set()
 
 
 def main(apply, statuses):
@@ -77,11 +62,10 @@ def main(apply, statuses):
         print("无需处理。")
         return
 
-    xlsx = _hotmail_emails()
-    ready, skipped = [], []
-    for r in rows:
-        has_link = bool((r.get('email_verify_link') or '').strip())
-        (ready if (has_link or r['email'] in xlsx) else skipped).append(r)
+    # SQL 已按 statuses 过滤过，所以 bad_status 必为空；仍走同一个分类函数，
+    # 保证脚本与 UI 的判定逐字一致。
+    ready, _bad_status, skipped = classify_for_reset(
+        rows, load_hotmail_emails(), statuses=statuses)
 
     print(f"  可重置（有收码数据）: {len(ready)}")
     print(f"  跳过（无收码链接且不在 hotmail.xlsx，重置了也领不走）: {len(skipped)}")

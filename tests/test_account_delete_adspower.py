@@ -126,3 +126,73 @@ def test_delete_without_pool_still_removes_account(client, monkeypatch):
     body = c.post('/api/accounts/delete', json={'emails': ['a@x.com']}).get_json()
 
     assert body['deleted'] == 1 and body['adspower']['reason']
+
+
+# --- 归档同样要释放环境（2026-08-08） ---------------------------------------
+#
+# 归档 = 「以后不再参与任何任务」，那一格配额留着就是白占，与删账号是同一件事。
+# 区别只在账号行还在（可以取消归档），所以这里额外验「状态改了、行还在」。
+
+def _status(app, email):
+    row = app.config['DB'].fetchone(
+        "SELECT identity_status FROM accounts WHERE email=?", (email,))
+    return row['identity_status'] if row else None
+
+
+def test_archive_releases_profiles(client, monkeypatch):
+    c, app = client
+    _seed(app, 'a@x.com', 'b@x.com')
+    pool = FakePool({"released": ['a@x.com', 'b@x.com'], "skipped_busy": [],
+                     "failed": [], "no_profile": []})
+    _wire(monkeypatch, app, pool=pool)
+
+    body = c.post('/api/accounts/archive',
+                  json={'emails': ['a@x.com', 'b@x.com']}).get_json()
+
+    assert pool.calls == [['a@x.com', 'b@x.com']]
+    assert body['retired'] == 2
+    assert body['adspower']['released'] == ['a@x.com', 'b@x.com']
+    # 与删除的区别：账号行还在，只是状态变了（可以取消归档）
+    assert _exists(app, 'a@x.com')
+    assert _status(app, 'a@x.com') == 'retired'
+
+
+def test_busy_account_keeps_profile_but_is_still_archived(client, monkeypatch):
+    """正在跑的账号：环境保留（删了那个 worker 的浏览器会凭空消失），状态照改。"""
+    c, app = client
+    _seed(app, 'busy@x.com')
+    pool = FakePool({"released": [], "skipped_busy": ['busy@x.com'],
+                     "failed": [], "no_profile": []})
+    _wire(monkeypatch, app, pool=pool)
+
+    body = c.post('/api/accounts/archive', json={'emails': ['busy@x.com']}).get_json()
+
+    assert body['retired'] == 1
+    assert body['adspower']['skipped_busy'] == ['busy@x.com']
+    assert _status(app, 'busy@x.com') == 'retired'
+
+
+def test_adspower_failure_never_blocks_archive(client, monkeypatch):
+    """环境释放抛异常也不许让归档失败——与删账号同一条红线。"""
+    c, app = client
+    _seed(app, 'a@x.com')
+    _wire(monkeypatch, app, pool=FakePool(boom=RuntimeError("adspower down")))
+
+    body = c.post('/api/accounts/archive', json={'emails': ['a@x.com']}).get_json()
+
+    assert body['retired'] == 1
+    assert _status(app, 'a@x.com') == 'retired'
+    assert body['adspower']['reason']
+
+
+def test_archive_works_when_adspower_disabled(client, monkeypatch):
+    c, app = client
+    _seed(app, 'a@x.com')
+    pool = FakePool()
+    _wire(monkeypatch, app, enabled=False, pool=pool)
+
+    body = c.post('/api/accounts/archive', json={'emails': ['a@x.com']}).get_json()
+
+    assert pool.calls == [], 'AdsPower 关着时不该去碰它'
+    assert body['retired'] == 1
+    assert _status(app, 'a@x.com') == 'retired'

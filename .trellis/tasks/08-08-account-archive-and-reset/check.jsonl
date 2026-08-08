@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量基线，含排序/判据类测试必须先证明会红"}
+{"file": ".trellis/spec/api/index.md", "reason": "校验端点契约"}

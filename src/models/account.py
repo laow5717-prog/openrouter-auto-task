@@ -53,6 +53,36 @@ class AccountModel:
             (identity_status, email),
         )
 
+    def set_identity_status(self, emails, identity_status, only_from=None):
+        """批量改身份状态，返回实际改动行数。
+
+        only_from 非空时加一条 `AND identity_status=?` —— 用于「取消归档」这类
+        只该作用于某个来源状态的操作：批量接口误传几个正常账号时，不该把它们的
+        状态也一起改掉。
+
+        返回的是 `rowcount`（真实改动数）而不是 `len(emails)`：传进来的邮箱可能不存在，
+        或已经是目标状态。前端拿这个数字回显，报虚数会让人以为改了其实没改。
+        """
+        if not emails:
+            return 0
+        marks = ','.join('?' * len(emails))
+        sql = ("UPDATE accounts SET identity_status=?, "
+               "updated_at=datetime('now','localtime') "
+               f"WHERE email IN ({marks})")
+        params = [identity_status] + list(emails)
+        if only_from:
+            sql += " AND COALESCE(identity_status,'')=?"
+            params.append(only_from)
+        return self.db.execute(sql, tuple(params)).rowcount
+
+    def get_by_emails(self, emails):
+        if not emails:
+            return []
+        marks = ','.join('?' * len(emails))
+        rows = self.db.fetchall(
+            f"SELECT * FROM accounts WHERE email IN ({marks}) ORDER BY id", tuple(emails))
+        return [dict(r) for r in rows]
+
     def reset_failed_to_registered(self):
         """一次性修正：把被误标 'failed'（实际可用）的账号批量改回 'registered'。
 

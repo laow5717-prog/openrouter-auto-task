@@ -41,8 +41,14 @@ CARD_STATUS_NOT_SELECTABLE = CARD_STATUS_UNUSABLE + (CARD_STATUS_BOUND,)
 # routes.start_daily_pipeline 的启动门只用了 ('banned','archived')，于是「启动时说有
 # N 个可充值账号，实际跑起来只有 M 个」。统一到这里。
 
-# 身份层终态：GitHub 侧已不可用，任何平台都别再拿它去跑
-IDENTITY_TERMINAL_STATUSES = ('banned', 'suspended', 'rejected', 'flagged')
+# 身份层终态：任何平台都别再拿它去跑
+#
+# 前四个是「账号坏了」——GitHub 侧封禁/挂起/拒绝/受限，不是我们能决定的。
+# retired 不同：账号本身是好的，是**用户在后台主动归档**，明确表示不再参与任何任务。
+# 放进同一个集合是因为下游只关心「还能不能跑」这一个问题；四处判据
+# （app._payable_now / app._reusable_recharged / routes._usable / routes 订阅门）
+# 全都只调 is_identity_terminal，所以加在这里一处就够，不必逐个入口去改。
+IDENTITY_TERMINAL_STATUSES = ('banned', 'suspended', 'rejected', 'flagged', 'retired')
 
 # 平台层终态：该账号在这个平台上本轮无需再处理
 PLATFORM_TERMINAL_STATUSES = ('archived', 'recharged', 'subscribed')

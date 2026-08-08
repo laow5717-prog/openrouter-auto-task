@@ -113,6 +113,37 @@ itself, or what happened at one merchant?**
 | AdsPower browser profile | **global, per email** | See below |
 | `[Stripe字段错误]` cards | **global** | The card data itself is malformed; it will be malformed everywhere |
 
+### 两层的状态值不许重名
+
+`accounts.identity_status` 与 `platform_accounts.status` 是两张表的两列，重名在 DB 层
+不会出错——但前端**用同一张映射表渲染这两列**
+（`Accounts.vue` 的 `statusMap` / `accStatusLabel`，身份列和平台列调的是同一个函数）。
+所以同名 = 两列显示完全一样的徽章，用户分不出是哪一层的状态。
+
+2026-08-08 加「用户主动归档账号」时踩到：平台层已有 `archived`（余额达 `balance_cap`），
+身份层若也叫 `archived`，列表里会出现两个「已归档」而含义完全不同。改用 `retired`
+（UI 文案仍写「归档」，用户的心智模型不变）。
+
+同理，`IDENTITY_TERMINAL_STATUSES` 与 `PLATFORM_TERMINAL_STATUSES` 各有一个同名元素时，
+读代码要先确认在说哪一层——这类歧义在 review 时最容易被放过。
+
+### 加一个身份层终态，只需改一处
+
+四处「这账号还能不能跑」的判据全部共用 `is_identity_terminal()`：
+
+```
+app.py::_payable_now()          可充值账号
+app.py::_reusable_recharged()   余额未满的复用池
+routes.py::_usable()            充值启动门 + 复用池计数
+routes.py 订阅启动门
+```
+
+（`_registerable_imported()` 只认 `identity_status == 'imported'`，天然排除任何新终态。）
+
+这是设计红利，但也脆：新写的入口若自己硬编码一组状态而不调这个谓词，新终态会在那条
+路径上**静默失效**。`tests/test_account_archive_reset.py` 逐个入口钉住了语义，加入口时
+一并加测试。
+
 ### Why AdsPower profiles stay per-email
 
 Tempting to split, wrong to split. A profile exists to preserve cookies, and the

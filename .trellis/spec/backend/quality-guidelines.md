@@ -61,6 +61,28 @@ Questions to answer:
 变异要选对：改常量的**值**（让 A 也落进 B 档）往往只是让行为更保守，模拟不出原 bug；
 要改的是**分类逻辑本身**（让 B 落回 A 档）。选错变异会得到「测试抓不住」的假结论。
 
+### 端点测试必须掐断外部服务
+
+开发机上 AdsPower 客户端是常驻的。用 Flask `test_client` 打一个会碰
+`_release_adspower_for` 的端点时，**它会真的连上本机 AdsPower 并调删除接口**——测试
+不报错、看起来是绿的，但已经在动真实环境。
+
+`tests/test_account_delete_adspower.py` 有现成的隔离基建，新测试直接复用，别重建：
+
+```python
+def _wire(monkeypatch, app, enabled=True, pool=None):
+    state = app.config['APP_STATE']
+    monkeypatch.setattr(type(state), 'adspower_enabled',
+                        property(lambda self: enabled), raising=False)
+    monkeypatch.setattr(type(state), '_ensure_adspower',
+                        lambda self: (None, pool), raising=False)
+```
+
+只验状态流转、不关心环境的测试，把 `adspower_enabled` 直接设成 `False` 即可。
+
+判断方法：端点摸到了 `AppState._ensure_adspower` / `_release_adspower_for` /
+任何 `requests` 调用，就必须 monkeypatch。**测试通过不等于测试干净。**
+
 ---
 
 ## Code Review Checklist

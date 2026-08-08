@@ -8,6 +8,8 @@
         <button class="action-btn" @click="handleImport">导入账号</button>
         <a href="/api/accounts/template" class="action-btn" style="text-decoration:none">下载模版</a>
         <div class="filter-sep"></div>
+        <button class="action-btn" @click="handleArchive" :disabled="selected.size === 0">归档选中</button>
+        <button class="action-btn" @click="handleResetImported" :disabled="selected.size === 0">重置为待注册</button>
         <button class="action-btn danger" @click="handleDelete" :disabled="selected.size === 0">删除选中</button>
         <button class="action-btn" @click="handleExport('selected')">导出选中</button>
         <button class="action-btn" @click="handleExport('filtered')">导出搜索结果</button>
@@ -29,6 +31,7 @@
         <option value="rejected">已拒绝</option>
         <option value="flagged">GitHub受限</option>
         <option value="banned">已封禁</option>
+        <option value="retired">已归档（停用）</option>
       </select>
       <select v-model="filters.platform_status" class="filter-select" title="该账号在当前平台的状态">
         <option value="">全部平台状态</option>
@@ -124,6 +127,9 @@
                 @click="handleRecharge(acc.email)"
               >{{ rechargingEmail === acc.email ? '充值中...' : '充值' }}</button>
               <button class="row-log-btn" @click="showRechargeLogs(acc.email)">充值记录</button>
+              <!-- 取消归档是低频的纠错操作，只对已归档的行显示，不占工具栏位置 -->
+              <button v-if="acc.identity_status === 'retired'" class="row-log-btn"
+                      @click="handleUnarchive(acc.email)">取消归档</button>
               <button class="row-delete-btn" @click="handleDeleteOne(acc.email)">删除</button>
             </td>
           </tr>
@@ -225,7 +231,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, importAccounts, rechargeAccount, openAccountBrowser, getOpenBrowsers, getRechargeLogsByEmail, getCardGroups } from '../api'
+import { getAccounts, getAccountCards, exportAccounts, deleteAccounts, importAccounts, rechargeAccount, openAccountBrowser, getOpenBrowsers, getRechargeLogsByEmail, getCardGroups, archiveAccounts, unarchiveAccounts, resetAccountsToImported } from '../api'
 import { useAppStore } from '../stores/app'
 const store = useAppStore()
 
@@ -298,6 +304,9 @@ const statusMap = {
   rejected: '已拒绝',
   flagged: 'GitHub受限',       // GitHub 反滥用 flag，无法授权第三方 OAuth，所有平台通吃
   banned: '已封禁',
+  // 用户在后台主动归档：账号本身没坏，是人决定不再用它。底层值刻意不叫 archived——
+  // 那个已经是平台层的「余额充满」，而这张表两层共用，同名就没法区分了。
+  retired: '已归档（停用）',
   // 平台层
   archived: '已归档',          // 余额≥阈值，该平台的充值跳过
   subscribed: '已订阅',
@@ -311,7 +320,7 @@ function accStatusClass(s) {
   if (s === 'registered') return 'success'
   if (s === 'subscribed' || s === 'recharged') return 'success'
   if (s === 'failed') return 'fail'
-  if (s === 'archived' || s === 'pending' || s === 'imported') return 'warn'
+  if (s === 'archived' || s === 'pending' || s === 'imported' || s === 'retired') return 'warn'
   return ''
 }
 
@@ -408,6 +417,80 @@ async function handleDelete() {
   } catch (e) {
     alert('删除失败: ' + e.message)
   }
+}
+
+async function handleArchive() {
+  if (selected.size === 0) return
+  const count = selected.size
+  if (!confirm(
+    `确定要归档选中的 ${count} 个账号吗？\n\n` +
+    `归档后该账号不再参与任何任务（充值、订阅、注册补号一律跳过），\n` +
+    `并会同步删除它的 AdsPower 浏览器环境以释放配额。\n\n` +
+    `可以在列表里点「取消归档」恢复，但环境已删除，恢复后首次运行\n` +
+    `需要重新登录 GitHub（会触发一次新设备邮箱验证）。`
+  )) return
+  try {
+    const res = await archiveAccounts(Array.from(selected))
+    selected.clear()
+    await loadData()
+    alert(`已归档 ${res?.retired ?? 0} 个账号`)
+    reportAdsPower(res?.adspower)
+  } catch (e) {
+    alert('归档失败: ' + e.message)
+  }
+}
+
+async function handleUnarchive(email) {
+  if (!confirm(
+    `确定要取消归档 ${email} 吗？\n\n` +
+    `它会恢复为「已注册」并重新参与任务。归档时环境已删除，\n` +
+    `首次运行需要重新登录 GitHub（会触发一次新设备邮箱验证）。`
+  )) return
+  try {
+    const res = await unarchiveAccounts([email])
+    await loadData()
+    if (!res?.restored) alert('没有账号被恢复（它可能不是已归档状态）')
+  } catch (e) {
+    alert('取消归档失败: ' + e.message)
+  }
+}
+
+async function handleResetImported() {
+  if (selected.size === 0) return
+  if (!confirm(
+    `确定要把选中的 ${selected.size} 个账号重置为「仅导入」吗？\n\n` +
+    `重置后它们会在下一轮任务里重新注册 GitHub。\n` +
+    `只有「注册失败」和「待处理」状态的账号会被重置，其余自动跳过。`
+  )) return
+  try {
+    const res = await resetAccountsToImported(Array.from(selected))
+    selected.clear()
+    await loadData()
+    reportReset(res)
+  } catch (e) {
+    alert('重置失败: ' + e.message)
+  }
+}
+
+// 分类回显：用户选了 38 个只重置了 12 个时，必须能当场看出另外 26 个为什么没动，
+// 否则会以为功能坏了。
+function reportReset(res) {
+  const parts = [`已重置 ${res?.reset?.length ?? 0} 个账号为「仅导入」`]
+  const badStatus = res?.skipped_status || []
+  const noMailbox = res?.skipped_no_mailbox || []
+  if (badStatus.length) {
+    const detail = badStatus.slice(0, 5)
+      .map(a => `${a.email}（${statusMap[a.status] || a.status || '未知'}）`).join('\n')
+    parts.push(`跳过 ${badStatus.length} 个：状态不是「注册失败/待处理」\n${detail}` +
+      (badStatus.length > 5 ? `\n... 另有 ${badStatus.length - 5} 个` : ''))
+  }
+  if (noMailbox.length) {
+    parts.push(
+      `跳过 ${noMailbox.length} 个：没有收信链接，重置了也领不走\n` +
+      noMailbox.slice(0, 5).join('\n') +
+      (noMailbox.length > 5 ? `\n... 另有 ${noMailbox.length - 5} 个` : ''))
+  }
+  alert(parts.join('\n\n'))
 }
 
 async function handleDeleteOne(email) {

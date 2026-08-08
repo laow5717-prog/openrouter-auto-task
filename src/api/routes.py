@@ -587,10 +587,87 @@ def delete_accounts():
     return jsonify({"deleted": count, "adspower": ads})
 
 
+@api.route('/api/accounts/archive', methods=['POST'])
+def archive_accounts():
+    """批量归档：identity_status='retired'，并同步释放 AdsPower 环境。
+
+    `retired` 是身份层终态，表示**用户主动决定不再用这个账号**（区别于
+    banned/suspended 那种「账号坏了」）。它在 utils.IDENTITY_TERMINAL_STATUSES 里，
+    而四处「还能不能跑」的判据全都只调 is_identity_terminal，所以归档即刻对
+    充值/复用/订阅/补号全部生效，不需要逐个平台去标。
+
+    环境一并释放：只有 12 格配额，归档账号还占着就是白占。释放是 best-effort——
+    AdsPower 没开/删除失败都不该让归档失败（与 delete_accounts 同一条红线），
+    残留映射由 reclaim 的 IDENTITY_DEAD_ORDER 兜底（retired 在其中）。
+    """
+    models = get_models()
+    emails = (request.json or {}).get('emails', [])
+    if not emails:
+        return jsonify({"error": "没有指定要归档的账号"}), 400
+
+    count = models['account'].set_identity_status(emails, 'retired')
+    ads = _release_adspower_for(emails)
+    return jsonify({"retired": count, "adspower": ads})
+
+
+@api.route('/api/accounts/unarchive', methods=['POST'])
+def unarchive_accounts():
+    """取消归档：retired → registered。
+
+    WHERE 里带 identity_status='retired'，只动归档过的行——批量接口误传几个正常账号
+    时不该把它们的状态也改掉。
+
+    环境在归档时已经被删了，所以恢复后首次运行要重新 GitHub 登录，并会触发一次
+    新设备邮箱验证。前端提示里要写明这一点。
+    """
+    models = get_models()
+    emails = (request.json or {}).get('emails', [])
+    if not emails:
+        return jsonify({"error": "没有指定要取消归档的账号"}), 400
+
+    count = models['account'].set_identity_status(
+        emails, 'registered', only_from='retired')
+    return jsonify({"restored": count})
+
+
+@api.route('/api/accounts/reset-imported', methods=['POST'])
+def reset_accounts_to_imported():
+    """批量把注册失败的账号退回 imported，让下一轮重新注册 GitHub。
+
+    判定走 services.account_reset（与命令行脚本共用一份），它挡住两类账号：
+      - 状态不是 failed/pending 的（suspended 刻意不可重置，见该模块 docstring）
+      - 拿不到收码数据的（重置了也领不走，只会让列表多几行看着能用其实不能用的账号）
+
+    返回三类明细而不是一个数字：用户选了 38 个结果只重置了 12 个时，必须能当场看出
+    另外 26 个为什么没动，否则会以为功能坏了。
+    """
+    from src.services.account_reset import classify_for_reset, load_hotmail_emails
+
+    models = get_models()
+    emails = (request.json or {}).get('emails', [])
+    if not emails:
+        return jsonify({"error": "没有指定要重置的账号"}), 400
+
+    accounts = models['account'].get_by_emails(emails)
+    ready, bad_status, no_mailbox = classify_for_reset(
+        accounts, load_hotmail_emails())
+
+    if ready:
+        models['account'].set_identity_status(
+            [a['email'] for a in ready], 'imported')
+    return jsonify({
+        "reset": [a['email'] for a in ready],
+        "skipped_status": [
+            {"email": a['email'], "status": a.get('identity_status') or ''}
+            for a in bad_status],
+        "skipped_no_mailbox": [a['email'] for a in no_mailbox],
+    })
+
+
 def _release_adspower_for(emails):
     """删账号时同步删掉它们的 AdsPower 环境，返回给前端看的结果摘要。
 
-    绝不抛异常：调用方是删除接口，环境释放失败不该让账号删不掉。
+    绝不抛异常：调用方是删除/归档接口，环境释放失败不该让账号删不掉、归不了档。
     """
     result = {"released": [], "skipped_busy": [], "failed": [], "reason": ""}
     state = get_app_state()
