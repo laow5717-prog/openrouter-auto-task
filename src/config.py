@@ -112,12 +112,15 @@ class ConcurrencyConfig:
     """每日流水线的并发执行配置。
 
     max_workers: **每个平台**同时驱动的浏览器 worker 数，作为未单独配置的平台的
-                 默认值。有效范围 1-4，越界由 WorkerPool 夹紧；上限 4 源于有头
-                 Chrome 每实例约 300-500MB 内存的开销。
-                 多平台并发时总数要按平台累加，还受 adspower.total_quota 约束。
-    platform_workers: 按平台覆盖，如 {opencode: 4, infron: 2}。没列到的平台用
+                 默认值。有效范围 1-10，越界由 WorkerPool 夹紧。
+                 ⚠️ 10 是**代码上限**，不是能实际开满的数：各平台并发度之和还受
+                 adspower.total_quota（11 个环境，两平台共用）约束，以及内存约束
+                 （有头 Chrome 每实例约 300-500MB）。见 worker.MAX_WORKERS 的注释。
+    platform_workers: 按平台覆盖，如 {opencode: 8, infron: 2}。没列到的平台用
                  max_workers。分开配的理由很实际——不同平台单账号耗时差很多，
                  慢的那个多开几个才不至于拖住整体。
+                 每个平台的值应 ≤ 它在 adspower.platform_quota 里的自有额度，
+                 否则超出的 worker 要向对方借额度，对方在跑时就得排队等。
     claim_timeout_minutes: 卡被领取（processing 态）后多久无进展视为 worker 失联，
                  由回收线程重置回 pending。
     """

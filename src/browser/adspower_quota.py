@@ -45,7 +45,10 @@ class AdsPowerQuota:
     """
 
     TOTAL = 11
-    DEFAULT_RESERVED = {'opencode': 7, 'infron': 4}
+    # 与 config.yaml 的 adspower.platform_quota 保持一致（config 没配时才用到这里）。
+    # 分配跟着 concurrency.platform_workers 走：opencode 8 个 worker 就要 8 个自有额度，
+    # 少了会让第 8 个每轮都去借，对方在跑时并发度就悄悄退化成 7。
+    DEFAULT_RESERVED = {'opencode': 8, 'infron': 3}
 
     def __init__(self, total=None, reserved=None):
         self.total = int(total) if total else self.TOTAL

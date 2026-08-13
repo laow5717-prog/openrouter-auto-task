@@ -39,14 +39,16 @@ batch:
 
 # 每日流水线并发配置
 concurrency:
-  max_workers: 2              # **每个平台**的默认并发度，1-4。设为 1 即退回串行
+  max_workers: 2              # **每个平台**的默认并发度，1-10。设为 1 即退回串行
                               # 每个实例是有头 Chrome，约占 300-500MB 内存
   # 按平台覆盖。没列到的平台用上面的 max_workers。
   # 分开配是因为不同平台单账号耗时差很多，慢的那个多开几个才不至于拖住整体。
-  # ⚠️ 总数是**按平台累加**的：4 + 2 = 6 个浏览器（约 2-3 GB 内存），
+  # ⚠️ 总数是**按平台累加**的：8 + 2 = 10 个浏览器（约 3-5 GB 内存），
   #    且必须 ≤ adspower.total_quota（11），也受各平台 platform_quota 约束。
+  #    这里留了 1 个配额缓冲，不要写满 11——满配额时环境回收与借还没有回旋余地，
+  #    一个没及时释放的环境就会让下一个 worker 干等 quota_wait_seconds。
   platform_workers:
-    opencode: 4
+    opencode: 8
     infron: 2
   claim_timeout_minutes: 20   # 卡被领取后多久无进展视为 worker 失联，自动回收为 pending
 
@@ -94,9 +96,11 @@ adspower:
   total_quota: 11
   # 各平台的自有额度。对方空闲时可借用，但总数始终受 total_quota 约束；
   # 原主需要时借用方会在**下一个账号边界**归还（协作式，不中断正在跑的付款）。
+  # 自有额度要 ≥ 该平台的 concurrency.platform_workers，否则超出的 worker 每轮
+  # 都要向对方借——对方在跑时就变成排队等，并发度名义上是 8、实际只有 7。
   platform_quota:
-    opencode: 7
-    infron: 4
+    opencode: 8
+    infron: 3
   # 等配额的最长秒数。配额是两平台共用的资源，对方跑完就会释放，
   # 所以拿不到时是等待而非报错——直接判失败会让账号白白进失败集合。
   quota_wait_seconds: 300

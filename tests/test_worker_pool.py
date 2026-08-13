@@ -10,7 +10,7 @@
 import threading
 
 from src.web.app import AppState
-from src.web.worker import WorkerPool, clamp_workers, get_current_worker
+from src.web.worker import WorkerPool, clamp_workers, get_current_worker, MAX_WORKERS
 
 
 def _pool(max_workers):
@@ -22,10 +22,12 @@ def _pool(max_workers):
 
 
 def test_clamp_workers_bounds():
+    # 上界跟着 worker.MAX_WORKERS 走，不写死数字——它是会调的（4 → 10），
+    # 写死的话每次调都要回来改这里，而漏改的表现是测试红、不是行为错。
     assert clamp_workers(0) == 1
     assert clamp_workers(1) == 1
     assert clamp_workers(4) == 4
-    assert clamp_workers(99) == 4
+    assert clamp_workers(99) == MAX_WORKERS
     assert clamp_workers(-5) == 1
 
 
@@ -37,8 +39,8 @@ def test_clamp_workers_handles_garbage():
 
 def test_clamp_logs_when_adjusting():
     st, pool = _pool(99)
-    assert pool.max_workers == 4
-    assert any('已调整为 4' in line for line in st.get_logs())
+    assert pool.max_workers == MAX_WORKERS
+    assert any(f'已调整为 {MAX_WORKERS}' in line for line in st.get_logs())
 
 
 # ==================== 串行等价性 ====================
