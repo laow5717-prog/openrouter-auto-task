@@ -20,6 +20,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.browser.driver import create_driver, close_driver  # noqa: E402
+from src.payments.stripe_checkout import (  # noqa: E402
+    pick_currency_usd, select_card_method,
+)
 
 PROFILE = "manual"
 ZEN_URL = "https://opencode.ai/zen"
@@ -172,28 +175,6 @@ def main():
             close_driver(session)
 
 
-FIND_USD_JS = r"""
-() => {
-  // 在 Stripe Checkout 币种选择区找「美金」块，返回其中心坐标。
-  // 币种块文本形如 "🇺🇸 $21.23" / "US$21.23"，排除含 ¥ 或 CN 的人民币块。
-  const cands = [];
-  document.querySelectorAll('button, [role=button], label, div, a').forEach(el => {
-    const t = (el.innerText || '').trim();
-    if (!t || t.length > 24) return;
-    const isUsd = /\$\s?\d/.test(t) && !/[¥￥]/.test(t) && !/CN/i.test(t);
-    if (!isUsd) return;
-    const r = el.getBoundingClientRect();
-    if (r.width < 20 || r.height < 10) return;
-    cands.push({ text: t, x: r.left + r.width/2, y: r.top + r.height/2, area: r.width*r.height });
-  });
-  if (!cands.length) return null;
-  // 取面积最小的叶子块（避免点到包含它的大容器）
-  cands.sort((a,b) => a.area - b.area);
-  return cands[0];
-}
-"""
-
-
 FRAME_INPUTS_JS = r"""
 () => {
   const out = [];
@@ -255,26 +236,13 @@ def _fill_card(session, c):
 
 
 def _click_card_radio(session):
-    """选中 Stripe Checkout 的 Card 支付方式（accordion radio）。"""
-    page = session.page
-    sels = [
-        "label[for='payment-method-accordion-item-title-card']",
-        "#payment-method-accordion-item-title-card",
-        "[data-testid='card-accordion-item-button']",
-        "text=Card",
-    ]
-    last = ""
-    for sel in sels:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
-                last = f"{sel}: 0 match"
-                continue
-            loc.click(timeout=4000, force=True)
-            return f"clicked {sel!r}"
-        except Exception as e:
-            last = f"{sel}: {str(e)[:60]}"
-    return f"fail ({last})"
+    """选中 Card 支付方式 —— 委托给生产实现。
+
+    同样不再自留副本：原来那份写死的 accordion id 已被 Stripe 改版淘汰，而且它按
+    「点没点着某个选择器」判成败，而 Card 常常本来就是选中的（卡字段已渲染、无需点）。
+    生产实现改判「卡字段在不在」，脚本跟着走才能复现真实链路的行为。
+    """
+    return "ok" if select_card_method(session, None) else "fail"
 
 
 def _dump_frames(session):
@@ -296,19 +264,14 @@ def _dump_frames(session):
 
 
 def _pick_currency_usd(session):
-    """在 Stripe Checkout 币种区点选美金块（坐标真实点击，兼容 React）。"""
-    page = session.page
-    try:
-        target = page.evaluate(FIND_USD_JS)
-    except Exception as e:
-        return f"evaluate 失败: {str(e)[:100]}"
-    if not target:
-        return "未找到美金币种块"
-    try:
-        page.mouse.click(float(target["x"]), float(target["y"]))
-        return f"已点击美金币种: {target['text']!r} @({int(target['x'])},{int(target['y'])})"
-    except Exception as e:
-        return f"点击失败: {str(e)[:100]} (target={target.get('text')!r})"
+    """选美金币种 —— 委托给生产实现。
+
+    这里曾有一份独立副本（坐标点击 + FIND_USD_JS），判据是「文本含 $数字 且不含 ¥/CN」。
+    它排掉了人民币却排不掉港币："HK$173.26" 里就有 `$1`，于是照样命中。2026-08-13
+    生产侧同一个坑让云机上 11 张卡连续判「页面故障」——排查脚本用着同样有病的判据，
+    只会把排查带偏。副本不再保留：这两个函数本来就该是同一份。
+    """
+    return pick_currency_usd(session, None)
 
 
 def _click_by_text(session, text):

@@ -17,23 +17,6 @@ import time
 
 from src.browser.monitor import step as _step
 
-_FIND_USD_JS = r"""
-() => {
-  const cands = [];
-  document.querySelectorAll('button, [role=button], label, div, a').forEach(el => {
-    const t = (el.innerText || '').trim();
-    if (!t || t.length > 24) return;
-    if (!(/\$\s?\d/.test(t) && !/[¥￥]/.test(t) && !/CN/i.test(t))) return;
-    const r = el.getBoundingClientRect();
-    if (r.width < 20 || r.height < 10) return;
-    cands.push({ text: t, x: r.left + r.width/2, y: r.top + r.height/2, area: r.width*r.height });
-  });
-  if (!cands.length) return null;
-  cands.sort((a,b) => a.area - b.area);
-  return cands[0];
-}
-"""
-
 # 判定支付结果时扫描 Stripe 主结账页文本的「明确拒付」信号。
 # 只保留强拒付句式——实机（scripts/probe_pay_result.py）确认拒付时主 frame 稳定出现
 # "Your card was declined..." / "insufficient funds" 等。刻意不含 "try again" / "error"
@@ -176,12 +159,113 @@ def _wait_stripe_frame(session, timeout=60, mark=CHECKOUT_MARK):
     return None
 
 
+# 结账页「表单已渲染完」的判据：卡号输入框或支付方式 accordion 任一出现即可。
+# 单看 URL 是不够的——start_recharge 在 302 到 checkout.stripe.com 的**瞬间**就宣布
+# 「已进入 Stripe Checkout」，此时页面还是个空壳，Stripe 的 React 应用要再拉几百 KB
+# JS 才渲染出字段。本机快所以固定 sleep(3) 撞对了，云主机（网络/CPU 更慢）撞不对，
+# 表现是所有选择器 count()==0、每张卡都「页面故障」。
+_FORM_READY_SELECTORS = (
+    "#cardNumber",
+    "[data-testid='card-accordion-item']",
+    "#payment-method-label-card",
+    "#payment-method-accordion-item-title-card",
+)
+
+
+def wait_checkout_form_ready(session, timeout=25, mark=CHECKOUT_MARK):
+    """轮询等待结账表单渲染完成。已就绪立即返回，故可在多处重复调用而不叠加等待。
+
+    返回 True 表示看到了表单元素；超时返回 False（调用方仍可继续尝试，只是大概率失败）。
+    """
+    deadline = time.time() + timeout
+    while True:
+        fr = _stripe_frame(session, retries=1, mark=mark)
+        for sel in _FORM_READY_SELECTORS:
+            try:
+                if fr.locator(sel).count():
+                    return True
+            except Exception:
+                continue
+        if time.time() >= deadline:
+            return False
+        time.sleep(1)
+
+
+def _dump_checkout_dom(session, tag):
+    """把结账页现场（URL + 支付方式相关元素 + 按钮文本）打进日志。
+
+    存在的理由：Stripe 会改版结账页 DOM，改版后现象是「所有选择器都不命中」，
+    日志里只有一句「失败」，看不出是页面没渲染完还是结构变了。2026-08-13 这次
+    （accordion id 换成 card-accordion-item、币种换成 CurrencyOptionButton）就是
+    靠人工去云机上抓 DOM 才定位的——这个函数让下次不必再抓一遍。
+    """
+    try:
+        fr = _stripe_frame(session)
+        info = fr.evaluate(
+            "()=>({url:location.href,"
+            "ids:[...document.querySelectorAll('[id*=payment],[id*=card],[data-testid*=card]')]"
+            ".map(e=>e.id||e.getAttribute('data-testid')).filter(Boolean).slice(0,20),"
+            "btns:[...document.querySelectorAll('button')]"
+            ".map(e=>(e.innerText||'').trim()).filter(Boolean).slice(0,20)})"
+        )
+        print(f"  [诊断/{tag}] {info}", flush=True)
+    except Exception as e:
+        print(f"  [诊断/{tag}] dump 失败: {str(e)[:80]}", flush=True)
+
+
+# 美元币种按钮的金额文本必须**以 $ 开头**。
+#
+# 绝不能用宽松的 `\$\s?\d`：新版结账页把币种渲染成一排 button.CurrencyOptionButton，
+# 文本形如 "HK$173.26" / "$21.23"，宽松正则对港币也命中（"HK$1" 里就有 `$1`），
+# `.first` 于是取到港币按钮——而当前选中的那个带 disabled，点它必然 5s timeout。
+# 这正是 2026-08-13 云机上「没选货币 + 每张卡失败」的第一个成因。
+_USD_AMOUNT_RE = re.compile(r"^\$\s?\d")
+
+
+def _is_usd_option(btn):
+    """该币种按钮是不是美元。优先看国旗 img 的 alt（最稳），回退看金额文本。"""
+    try:
+        if btn.locator("img[alt='US']").count():
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(_USD_AMOUNT_RE.match((btn.inner_text(timeout=2000) or "").strip()))
+    except Exception:
+        return False
+
+
 def pick_currency_usd(session, monitor):
     """点选美金币种（frame-aware）。找不到不算致命（默认币种仍可支付）。"""
+    wait_checkout_form_ready(session)
     fr = _stripe_frame(session)
+
+    # 新版：一排 button.CurrencyOptionButton，内含国旗 img[alt=XX] + span.CurrencyAmount
     try:
-        # 美元币种按钮文本形如 "$21.23"（含 $ 数字）；CN¥ 按钮不含 $
-        btn = fr.get_by_role("button", name=re.compile(r"\$\s?\d")).first
+        btns = fr.locator("button.CurrencyOptionButton")
+        n = btns.count()
+    except Exception:
+        n = 0
+    for i in range(n):
+        btn = btns.nth(i)
+        try:
+            if not _is_usd_option(btn):
+                continue
+            # 当前选中的币种按钮是 is-active + disabled，点它只会白等一个 timeout
+            cls = btn.get_attribute("class") or ""
+            if "is-active" in cls or btn.is_disabled():
+                _step(monitor, session, "币种已是美元")
+                return "已是美元"
+            btn.click(timeout=5000)
+            _step(monitor, session, "选择美金币种")
+            time.sleep(2)
+            return "已选美金"
+        except Exception as e:
+            return f"选美金失败: {str(e)[:60]}"
+
+    # 回退（旧版结构）：正则同样收紧到**行首** $，否则会误点 HK$/CA$ 等按钮
+    try:
+        btn = fr.get_by_role("button", name=re.compile(r"^\s*\$\s?\d")).first
         if btn.count():
             btn.click(timeout=5000)
             _step(monitor, session, "选择美金币种")
@@ -192,22 +276,70 @@ def pick_currency_usd(session, monitor):
     return "未找到美金按钮（可能已是美元）"
 
 
+# 新版 accordion item 选中时挂在 class 上的标记。
+_CARD_SELECTED_MARK = "PaymentMethodFormAccordionItem--selected"
+
+
+def _card_fields_present(fr):
+    """卡号输入框是否已渲染——这是「Card 已经是当前支付方式」的充分证据。"""
+    try:
+        return bool(fr.locator("#cardNumber").count())
+    except Exception:
+        return False
+
+
 def select_card_method(session, monitor):
-    """选中 Card 支付方式（accordion radio，无 inner_text 需按 id 点）。返回 bool。"""
-    page = _stripe_frame(session)
+    """选中 Card 支付方式。返回 bool。
+
+    **Card 常常本来就是选中的**：实机 DOM 里 card-accordion-item 直接带
+    `--selected`，卡号/有效期/CVC 字段已经渲染在页面上，没有任何东西需要点。
+    此时若因为「点不到 accordion 标题」就返回 False，上层会判 outcome=error 跳过
+    这张卡——2026-08-13 云机上连跳 11 张卡就是这么来的（页面完全正常）。
+    所以判据是**卡字段在不在**，不是**点没点成功**。
+
+    accordion 的 id 会随 Stripe 改版变化（旧：payment-method-accordion-item-title-card，
+    新：card-accordion-item / payment-method-label-card），故多候选逐个试。
+    """
+    if not wait_checkout_form_ready(session):
+        _dump_checkout_dom(session, "form-not-ready")
+        return False
+    fr = _stripe_frame(session)
+
+    # 已经是 Card：不点，直接过
+    if _card_fields_present(fr):
+        _step(monitor, session, "Card 已是当前支付方式（卡字段已渲染）")
+        return True
+    try:
+        item = fr.locator("[data-testid='card-accordion-item']").first
+        if item.count() and _CARD_SELECTED_MARK in (item.get_attribute("class") or ""):
+            _step(monitor, session, "Card 已选中")
+            time.sleep(2)
+            return True
+    except Exception:
+        pass
+
     for sel in [
+        "[data-testid='card-accordion-item']",
+        "#payment-method-label-card",
         "#payment-method-accordion-item-title-card",
         "label[for='payment-method-accordion-item-title-card']",
     ]:
         try:
-            loc = page.locator(sel).first
-            if loc.count():
-                loc.click(timeout=5000, force=True)
-                _step(monitor, session, "选中 Card 支付方式")
-                time.sleep(4)  # 等卡字段渲染
+            loc = fr.locator(sel).first
+            if not loc.count():
+                continue
+            loc.click(timeout=5000, force=True)
+            _step(monitor, session, "选中 Card 支付方式")
+            time.sleep(4)  # 等卡字段渲染
+            if _card_fields_present(_stripe_frame(session)):
                 return True
         except Exception:
             continue
+
+    # 点过一轮后卡字段仍可能是异步渲染出来的，再宽限一次再判死
+    if _card_fields_present(_stripe_frame(session)):
+        return True
+    _dump_checkout_dom(session, "select-card-failed")
     return False
 
 
