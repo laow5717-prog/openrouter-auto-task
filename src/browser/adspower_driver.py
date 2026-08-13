@@ -39,7 +39,18 @@ ADSPOWER_PROXY_BYPASS = (
     "*.stripe.com;stripe.com;*.stripecdn.com;b.stripecdn.com;js.stripe.com;"
     "m.stripe.com;m.stripe.network;*.stripe.network"
 )
-ADSPOWER_LAUNCH_ARGS = [f"--proxy-bypass-list={ADSPOWER_PROXY_BYPASS}"]
+# 接管 AdsPower 环境后强制的窗口尺寸。
+#
+# AdsPower 自己给的默认窗口偏小，Stripe 结账页会挤成窄单栏——币种切换、支付方式
+# accordion 这类控件被折叠或挤出可视区，点击容易落空，人工看截图排查也费劲。
+# 选 1600x1000：常见笔电分辨率，两栏结账页能完整展开，又不会超出 1920x1080 云主机
+# 的屏幕（超出会被窗口管理器裁掉，等于白设）。屏幕更大想占更满就调这里。
+ADSPOWER_WINDOW_SIZE = (1600, 1000)
+
+ADSPOWER_LAUNCH_ARGS = [
+    f"--proxy-bypass-list={ADSPOWER_PROXY_BYPASS}",
+    f"--window-size={ADSPOWER_WINDOW_SIZE[0]},{ADSPOWER_WINDOW_SIZE[1]}",
+]
 
 # 接管后等 AdsPower 把初始标签页换完。不是玄学等待：AdsPower 启动时先开一个占位 tab，
 # 随后关掉换成正式的，期间拿到的 Page 句柄会失效（见模块 docstring 第 3 条）。
@@ -422,6 +433,32 @@ def _pick_page(context):
     return context.new_page()
 
 
+def _resize_window(context, page, size=None):
+    """把接管到的窗口调到 ADSPOWER_WINDOW_SIZE。尽力而为，失败不影响主流程。
+
+    为什么不能只靠 launch_args 的 --window-size：那个开关只在**新建窗口**时生效，
+    而 AdsPower 复用已有环境时窗口尺寸沿用上次记录的值，新传的参数被忽略。所以接管
+    之后还要用 CDP Browser.setWindowBounds 明确压一次，两条路都走才在新建/复用两种
+    情况下都拿到想要的尺寸。
+
+    windowState 必须先置 normal：窗口处于 minimized/maximized 时 setWindowBounds
+    不接受 width/height（CDP 会直接报错）。
+    """
+    w, h = size or ADSPOWER_WINDOW_SIZE
+    try:
+        cdp = context.new_cdp_session(page)
+        window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
+        cdp.send("Browser.setWindowBounds",
+                 {"windowId": window_id, "bounds": {"windowState": "normal"}})
+        cdp.send("Browser.setWindowBounds",
+                 {"windowId": window_id,
+                  "bounds": {"left": 0, "top": 0, "width": w, "height": h}})
+        return True
+    except Exception as e:
+        print(f"  ⚠️ 调整窗口尺寸失败(忽略): {str(e)[:80]}")
+        return False
+
+
 def create_driver_adspower(email, pool, client, launch_args=None, headless=False):
     """启动/接管该账号的 AdsPower 环境，返回与本地栈同构的 BrowserSession。
 
@@ -458,6 +495,10 @@ def create_driver_adspower(email, pool, client, launch_args=None, headless=False
         context = browser.contexts[0]
         time.sleep(_TAKEOVER_SETTLE_SEC)
         page = _pick_page(context)
+
+        # 窗口调大：AdsPower 默认窗口偏小，Stripe 结账页会挤成窄单栏
+        if not headless:
+            _resize_window(context, page)
 
         context.set_default_timeout(DEFAULT_TIMEOUT_MS)
         context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
