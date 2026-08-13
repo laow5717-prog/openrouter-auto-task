@@ -17,9 +17,15 @@ src/browser/adspower_driver.py。
 3. **环境数有硬上限（本机实测 12）。** 创建到上限时返回 code=-1 且 msg 含
    `exceeds the limit`，这是需要触发环境回收的唯一信号，故单独归为
    AdsPowerQuotaExceeded，不能和普通失败混在一起。
+
+4. **创建环境另有「每日次数」限额，与上面第 3 条是两回事。** 撞到时 msg 是
+   `Exceeding import daily limit, recovery after 2 hours`，归为
+   AdsPowerDailyLimitExceeded。两者的处置方式**正相反**，别混：前者回收几个环境
+   就能继续建，后者回收再多也没用，只能停手等恢复。
 """
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -60,6 +66,47 @@ class AdsPowerQuotaExceeded(AdsPowerError):
     """环境数达到套餐上限。唯一该触发环境回收的错误。"""
 
 
+class AdsPowerDailyLimitExceeded(AdsPowerError):
+    """今日**创建次数**用尽：`Exceeding import daily limit, recovery after N hours`。
+
+    与 AdsPowerQuotaExceeded 是两个不同的限制，处置方式相反：
+      QuotaExceeded → 环境**总数**满了（实测 12），回收几个就能接着建；
+      本异常        → 今日创建**次数**用尽，与现存环境数无关。回收到一个不剩也腾不出
+                     一次创建机会，重试只会把限额撞得更深，唯一正解是停手等恢复。
+
+    2026-08-11 的现场说明了分错类的代价：这个文案当时两个分类模式都不匹配
+    （`exceeding … limit` ≠ `exceeds the limit`），降级成普通 AdsPowerError 后被
+    worker 当作「本轮跳过、下轮重试」的瞬时故障，7 个账号在它上面重试了 233 次
+    （单个账号最多 66 次），而 AdsPower 侧环境数一共才 6 个、配额根本没满。
+
+    recovery_seconds: 恢复时长（秒）。不传就从 msg 里自解析——_call 是用
+    `_classify(msg)(text)` 统一构造异常的，没有给某一类异常传额外参数的口子。
+    """
+
+    def __init__(self, msg, recovery_seconds=None):
+        super().__init__(msg)
+        if recovery_seconds is None:
+            recovery_seconds = parse_recovery_seconds(msg)
+        self.recovery_seconds = recovery_seconds
+
+
+# "recovery after 2 hours" / "recovery after 30 minutes"
+_RECOVERY_RE = re.compile(r"recovery\s+after\s+(\d+)\s*(hour|minute)", re.I)
+
+# 解不出恢复时长时的保守冻结时长。取 2 小时是因为实测文案给的就是 2 hours；
+# 宁可多等也不要少等——早醒一次就是又一轮无谓的重试。
+DEFAULT_DAILY_LIMIT_RECOVERY_SEC = 2 * 3600
+
+
+def parse_recovery_seconds(msg):
+    """从错误文案里解出恢复时长（秒）。解不出返回 None，由调用方决定兜底值。"""
+    m = _RECOVERY_RE.search(msg or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n * 3600 if m.group(2).lower() == "hour" else n * 60
+
+
 class AdsPowerProfileMissing(AdsPowerError):
     """指定的 profile_id 在 AdsPower 侧不存在（通常是用户在客户端里手工删了）。
 
@@ -71,7 +118,15 @@ def _classify(msg):
     """把 AdsPower 的错误文案映射到异常类。文案匹配是唯一可用的信号——
     接口对所有业务错误一律返回 code=-1，没有细分错误码。"""
     low = (msg or "").lower()
-    if "exceeds the limit" in low or "number of imported accounts" in low:
+    # daily limit 必须判在配额之前：它的文案里同样有 "limit"，而两者的处置方式相反
+    # （回收 vs 停手等恢复），归错类的后果见 AdsPowerDailyLimitExceeded 的 docstring。
+    if "daily limit" in low:
+        return AdsPowerDailyLimitExceeded
+    # 「环境总数满了」的文案有两种时态写法，都要认：
+    #   `... exceeds the limit`（v1）/ `Exceeding the limit of ...`（v2）。
+    # 只认第一种正是 2026-08-11 那次分类失败的同类隐患。
+    if ("exceeds the limit" in low or "exceeding the limit" in low
+            or "number of imported accounts" in low):
         return AdsPowerQuotaExceeded
     if "api-key" in low or "api key" in low or "unauthorized" in low:
         return AdsPowerUnavailable
@@ -166,6 +221,17 @@ class AdsPowerClient:
         """创建环境，返回 (profile_id, profile_no)。配额满时抛 AdsPowerQuotaExceeded。"""
         data = self._call("/api/v2/browser-profile/create", payload)
         return data.get("profile_id"), data.get("profile_no")
+
+    def update_profile(self, profile_id, payload):
+        """改已有环境的配置，只传要改的字段，没传的保持不变。
+
+        典型用途是换代理：代理管理里的条目被删重建后（proxy_id 全变），老环境会被
+        AdsPower 悄悄退回 no_proxy——也就是直连本机 IP，反关联静默失效且日志上看不出来。
+        重绑代理比删环境重建划算得多：环境里的 GitHub 授权态能保住。
+        """
+        body = dict(payload or {})
+        body["profile_id"] = str(profile_id)
+        self._call("/api/v2/browser-profile/update", body)
 
     def start_profile(self, profile_id, launch_args=None, headless=False):
         """启动环境，返回 (ws_endpoint, debug_port)。

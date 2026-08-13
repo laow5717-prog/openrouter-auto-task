@@ -27,7 +27,7 @@ from src.models.card_payment_state import CardPaymentStateModel
 from src.models.proxy import ProxyModel
 from src.models.adspower_profile import AdsPowerProfileModel
 from src.models.settings import SettingsModel
-from src.services.adspower import AdsPowerError
+from src.services.adspower import AdsPowerError, AdsPowerDailyLimitExceeded
 from src.utils import is_identity_terminal, is_platform_terminal
 from src.services import registration, card as card_service
 from src.api.routes import api
@@ -341,13 +341,62 @@ class AppState:
                     group_id=cfg.adspower.group_id,
                     reclaim_batch=cfg.adspower.reclaim_batch,
                     ua_systems=cfg.adspower.ua_systems,
-                    log=self.add_log,
+                    # 用模块级 dispatch_print 而不是 self.add_log：后者只写内存里那份
+                    # 上限 1000 条的 UI 缓冲，**不进 stdout，也就不进 server.log**。
+                    # 于是环境回收这条链路（配额满 / 回收了谁 / 无可回收）在事后排查时
+                    # 完全不可见——2026-08-11 就是因此误判过一次「回收已生效」，而实际
+                    # 上 reclaim 一直返回空。dispatch_print 还会按 contextvar 解析 worker
+                    # 归属，日志能带上 [W3] 前缀，看得出是哪个 worker 在抢配额。
+                    log=dispatch_print,
                     # 回收时跳过正在被 worker 使用的账号——删掉正在用的环境
                     # 会让那个 worker 的浏览器凭空消失。
                     is_busy=self.account_registry.is_claimed,
                 )
                 self._adspower_creds = creds
             return self._adspower_client, self._adspower_pool
+
+    def _adspower_creation_frozen(self):
+        """AdsPower「今日创建环境次数用尽」还剩几秒解冻；0 表示没冻结（含未启用）。
+
+        读的是 AdsPowerProfilePool 的类级闸，不经过实例——这里可能在 pool 还没建起来
+        时就被问到，而闸本身是进程级的。
+        """
+        if not self.adspower_enabled:
+            return 0.0
+        from src.browser.adspower_driver import AdsPowerProfilePool
+        return AdsPowerProfilePool.creation_frozen_seconds()
+
+    def _prefer_existing_profiles(self, rows):
+        """把**已有 AdsPower 环境**的账号排到前面，其余相对顺序不变。
+
+        环境配额只有 11 而账号成百上千。领一个「还没有环境的账号」意味着要先删掉别人的
+        环境才能建自己的，而并发跑起来时别人多半正占着——`reclaim` 的 `_is_busy` 会把它们
+        全挡掉，于是谁也删不成。2026-08-11 的现场：候选明明有 6 个可回收环境，8 个 worker
+        却齐刷刷卡在「配额已满且没有可回收的环境」上空转，直到整轮收敛。
+
+        先把有现成环境的账号消化掉，一来复用环境根本不碰配额，二来它们跑完释放后，
+        回收才有真正挑得动的候选。这与 `_reusable_recharged` 作为「环境紧张时的泄压阀」
+        是同一个思路，只是那条管的是充值档、这条管的是注册档。
+
+        稳定排序：同为「有环境」或同为「没环境」的，仍按调用方给的顺序（账号 id 升序）。
+        """
+        if not self.adspower_enabled or not rows:
+            return rows
+        have = {r['email'] for r in self.models['adspower_profile'].get_all()}
+        if not have:
+            return rows
+        return sorted(rows, key=lambda a: a['email'] not in have)
+
+    def _recall_note(self, exc):
+        """AdsPower 起不来时向借用方请求归还额度，返回给日志用的后缀。
+
+        日限额是例外：它不是配额问题，对方把额度全还回来也照样建不出环境，
+        发归还请求只会平白打断对方正在跑的账号。
+        """
+        if isinstance(exc, AdsPowerDailyLimitExceeded):
+            return ""
+        asked = self.quota.request_recall(self.platform)
+        return f"；已向借用方请求归还 {asked} 个额度" if asked else ""
 
     def browser_factory(self, track_for_teardown=True):
         """返回 callable(email) -> BrowserSession；未启用 AdsPower 时返回 None。
@@ -381,13 +430,24 @@ class AppState:
             # 点「查看」都会在第一次检查点立刻放弃，报「等待配额超时」——而配额其实是
             # 空的。手动开的浏览器本来也不该被某个任务的停止操作掐掉。
             _should_stop = (lambda: self.stop_requested) if track_for_teardown else None
-            if not self.quota.acquire(self.platform,
-                                      timeout=cfg.adspower.quota_wait_seconds,
-                                      should_stop=_should_stop):
+            # 先非阻塞试一次，拿不到**先说一声**再长等。
+            # 直接长等的话这里最多静默 300 秒：日志停在「步骤 2/4：打开 GitHub 注册页」
+            # 之后再无下文，看起来和卡死一模一样，而实际只是在排队等配额。
+            # 2026-08-11 排查那次活锁时，正是这段静默让人误以为 worker 挂了。
+            if not self.quota.acquire(self.platform, timeout=0, should_stop=_should_stop):
                 snap = self.quota.snapshot()
-                raise AdsPowerError(
-                    f"等待 AdsPower 环境配额超时（本平台 {snap['held'].get(self.platform, 0)}/"
-                    f"{snap['reserved'].get(self.platform, '?')}，总 {snap['total_held']}/{snap['total']}）")
+                dispatch_print(
+                    f"[AdsPower] {email} 等待环境配额…（本平台 "
+                    f"{snap['held'].get(self.platform, 0)}/{snap['reserved'].get(self.platform, '?')}，"
+                    f"总 {snap['total_held']}/{snap['total']}，最多等 "
+                    f"{cfg.adspower.quota_wait_seconds} 秒）")
+                if not self.quota.acquire(self.platform,
+                                          timeout=cfg.adspower.quota_wait_seconds,
+                                          should_stop=_should_stop):
+                    snap = self.quota.snapshot()
+                    raise AdsPowerError(
+                        f"等待 AdsPower 环境配额超时（本平台 {snap['held'].get(self.platform, 0)}/"
+                        f"{snap['reserved'].get(self.platform, '?')}，总 {snap['total_held']}/{snap['total']}）")
 
             released = threading.Event()
 
@@ -1048,12 +1108,12 @@ class AppState:
             # 待注册 imported 账号（有收码数据：DB 自带 link 或 xlsx 命中；未在 done）。
             # 'imported' 是身份层状态——GitHub 都还没注册，与平台无关。
             def _registerable_imported():
-                return [
+                return self._prefer_existing_profiles([
                     a for a in account_model.get_all(order_desc=False)
                     if (a.get('identity_status') or '') == 'imported'
                     and a['email'] not in done
                     and self._hotmail_for_account(a)
-                ]
+                ])
 
             # ── 余额未满的已充值账号 ──
             # 与可充值账号**同一档**一起领（见 _try_claim），只有两类都领不到才去注册。
@@ -1241,10 +1301,16 @@ class AppState:
                                                      + (recharge_cfg or cfg.recharge).amount_min)
                         return 'item', ('recharge', a, proxy, pkey)
                 # ── 第二档：现成账号都领不到了，才去注册 ──
-                for a in _registerable_imported():
-                    if self.account_registry.claim(a['email'], owner=platform):
-                        proxy, pkey = _acquire_proxy_for(a.get('id', 0))
-                        return 'item', ('register', a, proxy, pkey)
+                # AdsPower 创建被冻结时**不产出 register**：补号必然是新账号、必然要
+                # 建新环境，而创建已被本地闸挡死（见 AdsPowerProfilePool 的冻结闸）。
+                # 放它进来只会让每个账号走一遍前置流程再原地失败，把日志刷满，还因为
+                # 「有账号在飞」拖着轮边界不收敛。
+                frozen = self._adspower_creation_frozen()
+                if frozen <= 0:
+                    for a in _registerable_imported():
+                        if self.account_registry.claim(a['email'], owner=platform):
+                            proxy, pkey = _acquire_proxy_for(a.get('id', 0))
+                            return 'item', ('register', a, proxy, pkey)
                 # 「本轮还有账号在飞吗」——**必须只看本平台**。registry 是跨平台共享的，
                 # 不过滤的话本平台会把另一个平台正在跑的账号当成自己这轮在飞，于是永远
                 # 走 'wait'、轮边界永不触发、失败账号永不重试、idle_rounds 永不递增——
@@ -1252,6 +1318,11 @@ class AppState:
                 if self.account_registry.snapshot(owner=platform):
                     return 'wait', None
                 if not failed_this_round:
+                    if frozen > 0:
+                        return 'done', (
+                            f"AdsPower 今日创建环境次数已用尽（约 {frozen / 60:.0f} 分钟后恢复），"
+                            "现有环境的账号已全部处理完；注册补号需要新环境，故本次收敛。"
+                            "恢复后重新启动任务即可")
                     return 'done', "无可充值账号、无 imported 可注册、也无余额未满的已充值账号可复用"
                 # ── 轮转边界：所有账号都试过一遍且无人在飞。有进展就开下一轮重试失败账号
                 with state_lock:
@@ -1393,9 +1464,8 @@ class AppState:
                     # 配额是会随别的账号跑完而释放的，下一轮重试完全合理。
                     with state_lock:
                         failed_this_round.add(email)   # 本轮跳过，下一轮重试；账号状态不动
-                    asked = self.quota.request_recall(self.platform)
-                    note = f"；已向借用方请求归还 {asked} 个额度" if asked else ""
-                    self._hooked_print(f"AdsPower 环境暂不可用，跳过 {email}: {e}{note}")
+                    self._hooked_print(
+                        f"AdsPower 环境暂不可用，跳过 {email}: {e}{self._recall_note(e)}")
                 except Exception as e:
                     with state_lock:
                         stats['fail'] += 1
@@ -1808,9 +1878,8 @@ class AppState:
                         # 而按平台拆分后置 stop 只停自己、配额却是共用的，
                         # 结果是一个平台饿死等待、另一个反复抛错自杀。
                         # 改为只跳过本账号 + 请求归还，由「整轮零进展」兜底收敛。
-                        asked = self.quota.request_recall(self.platform)
-                        note = f"；已向借用方请求归还 {asked} 个额度" if asked else ""
-                        self._hooked_print(f"AdsPower 环境暂不可用，跳过 {email}: {e}{note}")
+                        self._hooked_print(
+                            f"AdsPower 环境暂不可用，跳过 {email}: {e}{self._recall_note(e)}")
                     except Exception as e:
                         with round_lock:
                             round_stats['other'] += 1

@@ -35,6 +35,23 @@ def _full_cards(n):
              'state': 's', 'zip': '12345'} for i in range(n)]
 
 
+
+def _burn_one_card(db):
+    """把一张还可用的卡标为 invalid，模拟「这张卡被刷废了」。
+
+    走 CardPoolModel 而不是裸 SQL——可选卡缓存的失效钩子挂在 model 上，绕过它
+    测出来的就不是真实链路的形状了。
+    """
+    from src.models.card_pool import CardPoolModel
+    row = db.fetchone(
+        "SELECT cp.card_number FROM card_pool cp "
+        "LEFT JOIN card_platform_state cps "
+        "  ON cps.card_number = cp.card_number AND cps.platform = 'opencode' "
+        "WHERE COALESCE(cp.status,'') != 'expired' "
+        "  AND COALESCE(cps.status,'') NOT IN ('invalid','bound') LIMIT 1")
+    if row:
+        CardPoolModel(db).mark_invalid_by_number('opencode', row['card_number'])
+
 class _Tracker:
     """记录并发峰值与「同一 email 是否被并发处理」，并模拟注册/充值对 DB 的状态推进。"""
 
@@ -132,14 +149,10 @@ class _FlakyOnceTracker(_Tracker):
             threading.Event().wait(self.delay)
             if first:
                 # 烧掉一张可用卡：可选卡集合变化 → 轮转判定视为「有进展」。
-                # invalid 现在是**平台状态**，写 card_platform_state 而不是 card_pool。
-                self.db.execute(
-                    "INSERT OR REPLACE INTO card_platform_state (card_number, platform, status) "
-                    "SELECT cp.card_number, 'opencode', 'invalid' FROM card_pool cp "
-                    "LEFT JOIN card_platform_state cps "
-                    "  ON cps.card_number = cp.card_number AND cps.platform = 'opencode' "
-                    "WHERE COALESCE(cp.status,'') != 'expired' "
-                    "  AND COALESCE(cps.status,'') NOT IN ('invalid','bound') LIMIT 1")
+                # 必须走 CardPoolModel 而不是裸 SQL：真实链路就是这么标废的，而
+                # 可选卡缓存的失效钩子挂在 model 上（见 CardPoolModel._invalidate_usable_cache）。
+                # 裸 SQL 绕过钩子会让缓存留着已废的卡，测出来的是一个现实中不存在的形状。
+                _burn_one_card(self.db)
                 return "failed", "declined"
             self._mark_recharged(email)
             return "success", ""
@@ -178,13 +191,7 @@ class _AlwaysFailBurningCardsTracker(_Tracker):
             with self.lock:
                 self.recharged_calls.append(email)
             threading.Event().wait(self.delay)
-            self.db.execute(
-                "INSERT OR REPLACE INTO card_platform_state (card_number, platform, status) "
-                "SELECT cp.card_number, 'opencode', 'invalid' FROM card_pool cp "
-                "LEFT JOIN card_platform_state cps "
-                "  ON cps.card_number = cp.card_number AND cps.platform = 'opencode' "
-                "WHERE COALESCE(cp.status,'') != 'expired' "
-                "  AND COALESCE(cps.status,'') NOT IN ('invalid','bound') LIMIT 1")
+            _burn_one_card(self.db)
             return "failed", "declined"
         finally:
             self._exit(email)
@@ -447,3 +454,74 @@ def test_idle_counter_resets_after_a_round_that_burned_cards(no_browser):
     assert r['usable_cards_left'] == 16 - burned, "只该少掉烧掉的那几张"
     assert r['is_running'] is False
     assert r['claims_left'] == 0 and r['in_flight_cards'] == 0
+
+
+# ---------------------------------------------------------------------------
+# 注册档的领取顺序：已有 AdsPower 环境的账号优先
+#
+# 回归 2026-08-11 的活锁：环境配额 11 顶满，8 个 worker 里凡是领到「还没有环境的
+# 账号」的，都要先删掉别人的环境才能建自己的，而并发下别人正占着（reclaim 的
+# _is_busy 全挡掉），于是齐刷刷卡在「配额已满且没有可回收的环境」上空转到收敛。
+# ---------------------------------------------------------------------------
+
+def _state_with_profiles(mapped_emails, adspower=True):
+    """建一个带 AdsPower 环境映射的 AppState。"""
+    db = Database(tempfile.mktemp(suffix='.db'))
+    models = build_models(db)
+    for i in range(5):
+        db.execute("INSERT INTO accounts (email, identity_status) VALUES (?, 'imported')",
+                   (f'imp{i}@example.com',))
+    for i, email in enumerate(mapped_emails):
+        models['adspower_profile'].upsert(email, f'pid{i}', str(i), '1')
+    # adspower_enabled 是从 settings 读的 property，走 DB 而不是给对象塞属性——
+    # 塞属性在真实对象上根本赋不上（没有 setter），测试会静默测了个假开关。
+    models['settings'].set('adspower.enabled', '1' if adspower else '0')
+    return AppState(db, models), db
+
+
+def test_accounts_with_existing_profile_are_claimed_first():
+    """有现成环境的排前面——复用环境根本不碰配额。"""
+    state, db = _state_with_profiles(['imp3@example.com', 'imp1@example.com'])
+    try:
+        rows = [{'email': f'imp{i}@example.com'} for i in range(5)]
+        out = [a['email'] for a in state._prefer_existing_profiles(rows)]
+        assert out[:2] == ['imp1@example.com', 'imp3@example.com'], \
+            '有环境的没有排到前面，会继续去建新环境而撞满配额'
+        assert set(out) == {f'imp{i}@example.com' for i in range(5)}, '不能丢账号'
+    finally:
+        db.close()
+
+
+def test_prefer_existing_profiles_is_stable():
+    """同为「有环境」或同为「没环境」的，仍保持调用方给的顺序（账号 id 升序）。
+
+    不稳定的话，每次 _try_claim 的顺序都在抖，失败账号的重试节奏也跟着乱。
+    """
+    state, db = _state_with_profiles(['imp0@example.com', 'imp4@example.com'])
+    try:
+        rows = [{'email': f'imp{i}@example.com'} for i in range(5)]
+        out = [a['email'] for a in state._prefer_existing_profiles(rows)]
+        assert out == ['imp0@example.com', 'imp4@example.com',
+                       'imp1@example.com', 'imp2@example.com', 'imp3@example.com']
+    finally:
+        db.close()
+
+
+def test_prefer_existing_profiles_noop_without_adspower():
+    """没开 AdsPower 时没有「环境」这个概念，顺序原样返回。"""
+    state, db = _state_with_profiles(['imp3@example.com'], adspower=False)
+    try:
+        rows = [{'email': f'imp{i}@example.com'} for i in range(5)]
+        out = [a['email'] for a in state._prefer_existing_profiles(rows)]
+        assert out == [f'imp{i}@example.com' for i in range(5)]
+    finally:
+        db.close()
+
+
+def test_registerable_imported_applies_the_preference():
+    """守住接线：排序逻辑要真的用在注册档的领取上，而不是只存在于方法里。"""
+    import inspect
+    src = inspect.getsource(AppState.run_daily_pipeline)
+    i = src.index('def _registerable_imported')
+    assert '_prefer_existing_profiles' in src[i:i + 500], \
+        '_registerable_imported 没有按「已有环境优先」排序'

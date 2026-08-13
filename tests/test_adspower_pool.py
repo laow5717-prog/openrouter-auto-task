@@ -7,6 +7,7 @@ scripts/probe_adspower.py 人工验证，那部分依赖本机 AdsPower 客户�
 
 import tempfile
 import os
+import time
 
 import pytest
 
@@ -14,7 +15,10 @@ from src.browser import driver as D
 from src.browser.adspower_driver import AdsPowerProfilePool
 from src.models.adspower_profile import AdsPowerProfileModel
 from src.models.database import Database
-from src.services.adspower import AdsPowerQuotaExceeded, AdsPowerError
+from src.services.adspower import (
+    AdsPowerQuotaExceeded, AdsPowerError, AdsPowerDailyLimitExceeded,
+    DEFAULT_DAILY_LIMIT_RECOVERY_SEC, _classify,
+)
 
 
 class FakeClient:
@@ -224,6 +228,64 @@ def test_registered_accounts_are_never_reclaimed(db):
     with pytest.raises(AdsPowerQuotaExceeded):
         pool.ensure_profile("new@x.com")
     assert client.deleted == []
+
+
+def test_imported_profiles_are_reclaimable(db):
+    """还没注册的账号，环境是刚建好准备用的，里面空无一物，必须可回收。
+
+    2026-08-11 线上事故：imported 漏在回收名单外，6 个「建好环境但注册没跑完」的账号
+    把配额占死。现场是 12 个环境全部处于停止状态、一个都没在用，reclaim_candidates
+    却返回 0 个候选，每个新账号都报「配额已满且无可回收」。
+    """
+    client = FakeClient(quota=1)
+    pool = _pool(db, client, reclaim_batch=1)
+    _account(db, "half@x.com", "imported")     # 建了环境但注册没跑完
+    _account(db, "new@x.com", "imported")
+
+    stale_pid, _, _ = pool.ensure_profile("half@x.com")
+    _new_pid, _, created = pool.ensure_profile("new@x.com")
+
+    assert created is True
+    assert stale_pid in client.deleted
+
+
+def test_imported_is_reclaimed_before_failed(db):
+    """imported 比 failed 更该先删：后者好歹试过注册，前者连试都没试。"""
+    client = FakeClient(quota=2)
+    pool = _pool(db, client, reclaim_batch=1)
+    _account(db, "tried@x.com", "failed")
+    _account(db, "untried@x.com", "imported")
+    _account(db, "new@x.com", "imported")
+
+    failed_pid, _, _ = pool.ensure_profile("tried@x.com")
+    imported_pid, _, _ = pool.ensure_profile("untried@x.com")
+    pool.ensure_profile("new@x.com")
+
+    assert client.deleted == [imported_pid]
+    assert failed_pid not in client.deleted
+
+
+def test_only_registered_keeps_its_profile(db):
+    """规则总述：环境的全部价值是那份 GitHub 授权态，只有 registered 有它。
+
+    这条守的是判据本身而不是某一个状态——将来新增身份状态时，默认应该是「可回收」，
+    忘了加进名单就会重演 08-03 / 08-11 那两次配额占死。
+    """
+    from src.models.adspower_profile import IDENTITY_DEAD_ORDER
+
+    # 账号列表页能筛选的全部身份状态（frontend/src/views/Accounts.vue 的下拉项）
+    all_statuses = {'imported', 'registered', 'pending', 'failed', 'suspended',
+                    'rejected', 'flagged', 'banned', 'retired'}
+    assert all_statuses - {'registered'} == set(IDENTITY_DEAD_ORDER), \
+        '除 registered 外的身份状态必须全部可回收'
+
+    profiles = AdsPowerProfileModel(db)
+    for i, status in enumerate(sorted(all_statuses)):
+        _account(db, f"{status}@x.com", status)
+        profiles.upsert(f"{status}@x.com", f"pid{i}", str(i), "1")
+
+    kept = {r["email"] for r in profiles.reclaim_candidates(limit=50)}
+    assert kept == {f"{s}@x.com" for s in all_statuses - {'registered'}}
 
 
 def test_reclaim_prefers_useless_profiles_first(db):
@@ -703,3 +765,246 @@ def test_remote_quit_stops_even_if_disconnect_fails():
     session = _remote_session(lambda: stops.append(1), BadBrowser(), _FakePlaywright())
     session.quit()
     assert stops == [1]
+
+
+# ---------------------------------------------------------------------------
+# 「今日创建次数用尽」的冻结闸
+#
+# 回归的是 2026-08-11 的现场：AdsPower 报 "Exceeding import daily limit, recovery
+# after 2 hours"，而 _classify 当时只认 "exceeds the limit"，于是它降级成普通
+# AdsPowerError，被 worker 当成瞬时故障「本轮跳过、下轮重试」。7 个账号在它上面重试了
+# 233 次，把限额越撞越深——而 AdsPower 侧环境总共才 6 个，配额根本没满。
+# ---------------------------------------------------------------------------
+
+_DAILY_MSG = ("AdsPower 接口失败（/api/v2/browser-profile/create）: "
+              "Exceeding import daily limit, recovery after 2 hours")
+
+
+class DailyLimitClient(FakeClient):
+    """create 一律报「今日创建次数用尽」。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.create_calls = 0
+
+    def create_profile(self, payload):
+        self.create_calls += 1
+        raise AdsPowerDailyLimitExceeded(_DAILY_MSG)
+
+
+@pytest.fixture(autouse=True)
+def _reset_daily_limit():
+    """冻结闸是**类级**的（故意的，见 AdsPowerProfilePool 的注释），测试之间必须复位，
+    否则先跑的用例会把后面所有建环境的用例一起挡掉。"""
+    AdsPowerProfilePool._daily_limit_until = 0.0
+    yield
+    AdsPowerProfilePool._daily_limit_until = 0.0
+
+
+def test_daily_limit_is_not_classified_as_quota():
+    """日限额与配额满必须是两个异常：前者回收无用，后者回收就能解。
+
+    归错类的代价就是那 233 次必败重试。
+    """
+    assert _classify("Exceeding import daily limit, recovery after 2 hours") \
+        is AdsPowerDailyLimitExceeded
+    assert _classify("The number of imported accounts exceeds the limit") \
+        is AdsPowerQuotaExceeded
+    # 恢复时长要能解出来，冻结多久靠它
+    assert AdsPowerDailyLimitExceeded(_DAILY_MSG).recovery_seconds == 7200
+
+
+def test_daily_limit_freezes_creation_after_a_single_request(db):
+    """撞墙一次之后就地冻结：后面的账号本地短路，不再发请求。
+
+    这是整个修复的核心断言——修复前这里会是 7 次请求，每次都把限额撞得更深。
+    """
+    client = DailyLimitClient()
+    pool = _pool(db, client)
+    for i in range(7):
+        _account(db, f"a{i}@x.com", "registered")
+        with pytest.raises(AdsPowerDailyLimitExceeded):
+            pool.ensure_profile(f"a{i}@x.com")
+    assert client.create_calls == 1, "冻结期内仍在向 AdsPower 发创建请求"
+
+
+def test_frozen_creation_still_serves_existing_mappings(db):
+    """冻结只挡**新建**。已有环境的账号照常跑，否则一次日限额会让整条流水线停摆。"""
+    client = DailyLimitClient()
+    pool = _pool(db, client)
+    _account(db, "old@x.com", "registered")
+    AdsPowerProfileModel(db).upsert("old@x.com", "pid-existing", "1", "7")
+
+    with pytest.raises(AdsPowerDailyLimitExceeded):
+        pool.ensure_profile("new@x.com")          # 落闸
+
+    pid, proxy_id, created = pool.ensure_profile("old@x.com")
+    assert (pid, created) == ("pid-existing", False)
+    assert client.create_calls == 1
+
+
+def test_freeze_is_not_shortened_by_a_later_shorter_recovery():
+    """并发下几个 worker 会几乎同时撞墙；后到的若用更短的时长覆盖，冻结期会被悄悄缩短。"""
+    AdsPowerProfilePool._freeze_creation(7200)
+    AdsPowerProfilePool._freeze_creation(60)
+    assert AdsPowerProfilePool.creation_frozen_seconds() > 7000
+
+
+def test_freeze_falls_back_to_two_hours_when_unparsable():
+    """文案里没有 "recovery after N" 时也得冻住，宁可多等也不要立刻又去撞。"""
+    _fresh, remain = AdsPowerProfilePool._freeze_creation(None)
+    assert abs(remain - DEFAULT_DAILY_LIMIT_RECOVERY_SEC) < 5
+
+
+def test_creation_resumes_after_freeze_expires(db):
+    """到点就该放行，否则一次日限额会永久禁掉建环境。"""
+    client = DailyLimitClient()
+    pool = _pool(db, client)
+    _account(db, "a@x.com", "registered")
+    with pytest.raises(AdsPowerDailyLimitExceeded):
+        pool.ensure_profile("a@x.com")
+    assert client.create_calls == 1
+
+    AdsPowerProfilePool._daily_limit_until = time.time() - 1     # 模拟到期
+    with pytest.raises(AdsPowerDailyLimitExceeded):
+        pool.ensure_profile("a@x.com")
+    assert client.create_calls == 2, "解冻后没有重新尝试真实请求"
+
+
+def test_daily_limit_on_the_post_reclaim_retry_also_freezes(db):
+    """配额满 → 回收 → 重试，这条路径上的重试同样可能撞日限额，也必须落闸。
+
+    配额和创建次数是两个独立的闸，前者放行不代表后者放行。
+    """
+    class QuotaThenDailyLimit(FakeClient):
+        def __init__(self):
+            super().__init__(quota=0)
+            self.create_calls = 0
+
+        def create_profile(self, payload):
+            self.create_calls += 1
+            if self.create_calls == 1:
+                raise AdsPowerQuotaExceeded("... exceeds the limit of 12")
+            raise AdsPowerDailyLimitExceeded(_DAILY_MSG)
+
+    client = QuotaThenDailyLimit()
+    pool = _pool(db, client)
+    _account(db, "dead@x.com", "failed")          # 可回收，让回收拿得出候选
+    AdsPowerProfileModel(db).upsert("dead@x.com", "pid-dead", "1", "1")
+    _account(db, "new@x.com", "registered")
+
+    with pytest.raises(AdsPowerDailyLimitExceeded):
+        pool.ensure_profile("new@x.com")
+    assert client.create_calls == 2               # 首次撞配额 + 回收后重试撞日限额
+    assert AdsPowerProfilePool.creation_frozen_seconds() > 7000, \
+        "回收后重试撞到的日限额没有落闸，下一个账号又会去撞一次"
+
+
+def test_recall_is_skipped_for_daily_limit():
+    """日限额不是配额问题：对方把额度全还回来也建不出环境，不该打断它。"""
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState._recall_note)
+    assert 'AdsPowerDailyLimitExceeded' in src, '_recall_note 没有豁免日限额'
+    assert 'request_recall' in src, '_recall_note 不再请求归还额度了'
+
+
+def test_pipeline_stops_producing_register_work_while_frozen():
+    """冻结期内不再产出「注册补号」：补号必然是新账号、必然要新环境。
+
+    源码断言而非行为断言——那段逻辑埋在 run_daily_pipeline 的闭包里，构造真实
+    调用要拉起整个流水线。这里只守住「检查在产出之前」这个结构。
+    """
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState.run_daily_pipeline)
+    # 定位**调用点**而不是 def 行——两者都含 '_registerable_imported()'。
+    i = src.index('for a in _registerable_imported()')
+    head = src[max(0, i - 900):i]
+    assert '_adspower_creation_frozen' in head, \
+        '产出 register 之前没有检查 AdsPower 创建是否被冻结'
+
+
+# ---------------------------------------------------------------------------
+# 静默等待的可观测性
+#
+# 2026-08-11 排查活锁时，日志停在「步骤 2/4：打开 GitHub 注册页」之后再无下文，
+# 看起来像 worker 挂了。实际是卡在 browser_factory 里两个不出声的等待上：
+# 先是 quota.acquire（最长 300 秒），再是环境池锁（无超时）。
+# ---------------------------------------------------------------------------
+
+def test_pool_lock_wait_is_logged(db):
+    """池锁排队要出声，否则这段等待在日志上和卡死无法区分。"""
+    import threading
+
+    logs = []
+    pool = _pool(db, FakeClient())
+    pool._log = logs.append
+    _account(db, "a@x.com", "registered")
+
+    holding, release, done = threading.Event(), threading.Event(), threading.Event()
+
+    def hold_lock():
+        with pool._lock:          # RLock 可重入，必须由**另一个线程**占着才挡得住
+            holding.set()
+            release.wait(5)
+
+    def try_ensure():
+        pool.ensure_profile("a@x.com")
+        done.set()
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert holding.wait(5)
+
+    waiter = threading.Thread(target=try_ensure)
+    waiter.start()
+    time.sleep(0.3)               # 让它确实撞上锁
+    assert any("等待环境池" in m for m in logs), "池锁排队没有任何日志"
+    assert not done.is_set(), "锁还被占着就返回了，说明根本没排队"
+
+    release.set()
+    holder.join(5)
+    waiter.join(5)
+    assert done.is_set(), "锁释放后没能继续"
+
+
+def test_pool_lock_is_released_on_error(db):
+    """探锁改写后仍要保证异常路径释放锁——漏了就是全流水线死锁。"""
+    class Boom(FakeClient):
+        def list_all_proxies(self):
+            raise AdsPowerError("boom")
+
+    pool = _pool(db, Boom())
+    _account(db, "a@x.com", "registered")
+    with pytest.raises(AdsPowerError):
+        pool.ensure_profile("a@x.com")
+    assert pool._lock.acquire(blocking=False), "异常路径没释放池锁"
+    pool._lock.release()
+
+
+def test_quota_wait_is_announced_before_blocking():
+    """配额等不到时要先播报再长等，不能静默 300 秒。"""
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState.browser_factory)
+    i = src.index("quota.acquire")
+    assert "timeout=0" in src[i:i + 200], "没有先做非阻塞探测就直接长等"
+    assert "等待环境配额" in src, "长等之前没有播报"
+
+
+def test_pool_logs_go_to_stdout_not_just_ui_buffer():
+    """环境池的日志必须进 server.log。
+
+    add_log 只写内存里那份上限 1000 条的 UI 缓冲，事后 grep server.log 一无所获——
+    2026-08-11 就因此误判过「回收已生效」，实际 reclaim 一直返回空。
+    """
+    import inspect
+    from src.web.app import AppState
+
+    src = inspect.getsource(AppState._ensure_adspower)
+    assert "log=dispatch_print" in src, \
+        "环境池日志又接回 add_log 了，回收链路在 server.log 里会重新变成不可见"

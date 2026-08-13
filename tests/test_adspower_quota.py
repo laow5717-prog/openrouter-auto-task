@@ -285,11 +285,18 @@ def test_quota_exhaustion_no_longer_stops_the_whole_run():
     for fn in (AppState.run_daily_pipeline, AppState.run_daily_subscribe_pipeline):
         src = inspect.getsource(fn)
         i = src.index('except AdsPowerError')
-        block = src[i:i + 1200]
+        # 窗口要盖住整个 handler：那段注释很长，1200 字符会在 _hooked_print 那行中间
+        # 截断，断言就变成了「注释写了多少字」的函数。
+        block = src[i:i + 2000]
         assert 'self.stop_requested = True' not in block, \
             f'{fn.__name__}: 配额异常仍在置全局 stop'
-        assert 'request_recall' in block, \
+        # 归还请求本身在 _recall_note 里（两条管线共用，且日限额要豁免——见下一个
+        # 测试）。这里只要求 handler 确实走到了它，具体逻辑由 _recall_note 自己保证。
+        assert '_recall_note' in block, \
             f'{fn.__name__}: 没有向借用方请求归还额度'
+
+    assert 'request_recall' in inspect.getsource(AppState._recall_note), \
+        '_recall_note 不再请求归还额度了，两条管线的归还路径一起断了'
 
 
 def test_teardown_reconciles_leaked_quota():

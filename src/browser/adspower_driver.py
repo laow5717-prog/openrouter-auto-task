@@ -28,6 +28,7 @@ from src.browser.driver import (
 from src.models.adspower_profile import RECHARGED_RANK
 from src.services.adspower import (
     AdsPowerQuotaExceeded, AdsPowerProfileMissing, AdsPowerError,
+    AdsPowerDailyLimitExceeded, DEFAULT_DAILY_LIMIT_RECOVERY_SEC,
 )
 
 
@@ -88,6 +89,41 @@ class AdsPowerProfilePool:
     代价是建环境阶段无并发（几秒级），换来的是不会活锁。
     """
 
+    # ---- 「今日创建次数用尽」的冻结闸 ----
+    #
+    # 撞到 AdsPowerDailyLimitExceeded 后，在恢复时间之前**本地直接短路**，不再发出
+    # 任何 create 请求。少了这道闸，每个还没有环境映射的账号都会各自去撞一次，而且
+    # 失败后进的是 failed_this_round（本轮跳过、下轮重试）——2026-08-11 就是这样用
+    # 7 个账号打出了 233 次必败请求，把限额越撞越深。
+    #
+    # **类级**而非实例级：日限额是 AdsPower 账户级的资源，而 pool 会在 UI 改配置时被
+    # 整个重建（app._ensure_adspower 里 creds 变更那条分支），实例级状态一重建就丢，
+    # 冻结完立刻又开始撞。代价是换 API Key 到另一个 AdsPower 账户时冻结不会跟着清——
+    # 相比反复撞限额，这个误等是更便宜的一侧。
+    _daily_limit_until = 0.0
+    _daily_limit_lock = threading.Lock()
+
+    @classmethod
+    def creation_frozen_seconds(cls):
+        """距离可以再次创建环境还剩几秒。0 表示没冻结。"""
+        with cls._daily_limit_lock:
+            return max(0.0, cls._daily_limit_until - time.time())
+
+    @classmethod
+    def _freeze_creation(cls, seconds):
+        """记下冻结截止时刻。返回 (是否是本次新设的, 剩余秒数)。
+
+        取 max 而不是无条件覆盖：并发下几个 worker 可能几乎同时撞到同一堵墙，
+        后到的那个若用自己的（更短的）恢复时长覆盖，会把冻结期悄悄缩短。
+        """
+        seconds = float(seconds or DEFAULT_DAILY_LIMIT_RECOVERY_SEC)
+        until = time.time() + seconds
+        with cls._daily_limit_lock:
+            fresh = until > cls._daily_limit_until
+            if fresh:
+                cls._daily_limit_until = until
+            return fresh, max(0.0, cls._daily_limit_until - time.time())
+
     def __init__(self, client, profile_model, group_id="0",
                  reclaim_batch=DEFAULT_RECLAIM_BATCH, log=None, is_busy=None,
                  ua_systems=None):
@@ -142,15 +178,34 @@ class AdsPowerProfilePool:
 
         命中本地映射即复用（保住登录态）；否则挑代理建新环境，撞配额则回收后重试一次。
         """
-        with self._lock:
+        # 池锁把整条「挑代理→建环境→撞配额→回收→重试」串行化，每一步都是带限流的
+        # AdsPower 请求，并发下后来者可能要排队十几秒。先探一次锁，等得上再说一声——
+        # 否则这段等待完全静默，调用方的日志停在「打开注册页」之后再无下文。
+        if not self._lock.acquire(blocking=False):
+            self._log(f"[AdsPower] {email} 等待环境池（另一个账号正在建环境或回收）…")
+            self._lock.acquire()
+        try:
             row = self.profiles.get_by_email(email)
             if row and row.get("profile_id"):
                 self.profiles.touch(email)
                 return row["profile_id"], row.get("proxy_id") or "", False
             return self._create_profile(email)
+        finally:
+            self._lock.release()
 
     def _create_profile(self, email):
-        """建环境。调用方须持有 _lock。"""
+        """建环境。调用方须持有 _lock。
+
+        撞到「今日创建次数用尽」时会冻结创建（见类属性 _daily_limit_until），冻结期内
+        后续调用**不再发请求**，直接抛同一个异常。已有环境映射的账号不受影响——那条
+        路径在 ensure_profile 里就返回了，压根不会走到这。
+        """
+        frozen = self.creation_frozen_seconds()
+        if frozen > 0:
+            raise AdsPowerDailyLimitExceeded(
+                f"AdsPower 今日创建环境次数已用尽，还需等待约 {frozen / 60:.0f} 分钟"
+                f"（本地已冻结创建，未再发请求）", recovery_seconds=frozen)
+
         proxy_id = self.pick_free_proxy()
         payload = {
             "name": _profile_name(email),
@@ -160,7 +215,7 @@ class AdsPowerProfilePool:
             "fingerprint_config": _fingerprint_config(self.ua_systems),
         }
         try:
-            profile_id, profile_no = self.client.create_profile(payload)
+            profile_id, profile_no = self._create_or_freeze(payload)
         except AdsPowerQuotaExceeded as e:
             self._log(f"[AdsPower] 环境配额已满（{str(e)[:120]}），开始回收已完成账号的环境")
             freed = self.reclaim(exclude={email})
@@ -168,12 +223,30 @@ class AdsPowerProfilePool:
                 raise AdsPowerQuotaExceeded(
                     "AdsPower 环境配额已满，且没有可回收的环境"
                     "（所有环境都属于尚未完成或正在运行的账号）") from e
-            profile_id, profile_no = self.client.create_profile(payload)
+            # 重试这次同样可能撞日限额（配额与次数是两个独立的闸），所以走同一个包装。
+            profile_id, profile_no = self._create_or_freeze(payload)
 
         self.profiles.upsert(email, profile_id, profile_no, proxy_id)
         self._log(f"[AdsPower] 为 {email} 新建环境 {profile_id}（编号 {profile_no}，"
                   f"代理 proxy_id={proxy_id}）")
         return profile_id, proxy_id, True
+
+    def _create_or_freeze(self, payload):
+        """create_profile 的薄包装：撞到日限额就落下冻结闸再把异常抛出去。
+
+        日志只在**首次**落闸时打——冻结期内每个账号都会经过这里，逐次打印会把两小时
+        的日志刷成同一句话，反而盖掉真正的问题。
+        """
+        try:
+            return self.client.create_profile(payload)
+        except AdsPowerDailyLimitExceeded as e:
+            fresh, remain = self._freeze_creation(e.recovery_seconds)
+            if fresh:
+                self._log(
+                    f"[AdsPower] 今日创建环境次数已用尽（{str(e)[:120]}）。"
+                    f"已冻结新建环境约 {remain / 60:.0f} 分钟——这不是环境配额满，"
+                    f"回收环境没有用，只能等恢复；期间已有环境的账号照常运行")
+            raise
 
     def reclaim(self, exclude=None, limit=None):
         """删掉已完成账号的环境以腾出配额，返回被回收的 [(email, profile_id)]。
