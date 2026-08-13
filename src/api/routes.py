@@ -1228,8 +1228,9 @@ def get_card_pool(group_id):
     page_size = int(request.args.get('page_size', 20))
     bucket = request.args.get('bucket', '')  # ''=全部 / valid / unverified / invalid
 
-    # 先按当前日期刷新过期状态，列表里直接能看到哪些卡已过期
-    models['card_pool'].refresh_expired_status(group_id)
+    # 先按当前日期刷新过期状态，列表里直接能看到哪些卡已过期。
+    # force=True 跳过节流：用户在看列表，就是要最新结果；节流是给取卡热路径准备的。
+    models['card_pool'].refresh_expired_status(group_id, force=True)
     cards, total = models['card_pool'].get_by_group(
         platform, group_id, page=page, page_size=page_size, bucket=bucket)
 

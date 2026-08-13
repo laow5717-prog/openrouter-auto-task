@@ -16,6 +16,9 @@
 串平台，所以这里不给默认值。
 """
 
+import threading
+import time
+
 from src.utils import (
     is_card_expired,
     CARD_STATUS_EXPIRED,
@@ -46,8 +49,40 @@ _CP_COLS = ("cp.id, cp.group_id, cp.card_number, cp.expiry_month, cp.expiry_year
 
 
 class CardPoolModel:
+    # 过期刷新的节流窗口。卡的过期状态按**天**变化，秒级重复扫描毫无意义，
+    # 而它在 8 个 worker 的取卡热路径上、又握着全局 DB 锁（见 refresh_expired_status）。
+    _EXPIRY_REFRESH_TTL_SEC = 300
+
+    # group_id -> 上次真正扫描的 monotonic 时刻。**类级**：models 会在多处各建一个
+    # CardPoolModel 实例（build_models 每次调用都新建一份），实例级的话节流形同虚设。
+    _expiry_refreshed_at = {}
+
+    # 可选卡集合的短缓存：(platform, group_id) -> (monotonic, usable, unusable)。
+    #
+    # get_usable_cards_as_list 要把整个分组的行拉进 Python 转成 dict——3.2 万张卡的分组
+    # 实测 210ms，而它在 8 个 worker 的取卡热路径上、握着全局 DB 锁（2026-08-13 现场：
+    # 大半时间在等锁，8 个 worker 只跑得动 4 个浏览器）。
+    #
+    # 缓存安全性靠两条：TTL 只有几秒；且任何改变卡可选性的写操作都会立刻清掉它
+    # （见 _invalidate_usable_cache 的调用点）。即便真读到几秒前的快照，下游也还有兜底
+    # ——registration 在用卡前会**实时复查冷却**，payment_registry 另有跨 worker 排他。
+    _USABLE_CACHE_TTL_SEC = 5.0
+    _usable_cache = {}
+    _usable_cache_lock = threading.Lock()
+
     def __init__(self, db):
         self.db = db
+
+    @classmethod
+    def _invalidate_usable_cache(cls):
+        """任何改变「哪些卡可选」的写操作之后都要调。
+
+        整体清空而不是按 key 清：一次写最多影响一两个 (platform, group) 组合，而缓存
+        本来就只有几个条目、重建也只要一次查询；按 key 精细失效反而容易漏——漏一个
+        就是拿着过期快照反复去刷一张已经判废的卡。
+        """
+        with cls._usable_cache_lock:
+            cls._usable_cache.clear()
 
     def find_cards_in_other_groups(self, group_id, card_numbers):
         """检查哪些卡号已存在于其他分组中，返回 {card_number: group_name}"""
@@ -99,6 +134,8 @@ class CardPoolModel:
                 added += 1
             except Exception:
                 skipped += 1
+        if added:
+            self._invalidate_usable_cache()
         return added, skipped, conflicts
 
     # ---------- 桶（界面分类） ----------
@@ -198,6 +235,7 @@ class CardPoolModel:
                 )""",
             (platform, group_id, *CARD_STATUS_UNUSABLE),
         )
+        self._invalidate_usable_cache()
         return cursor.rowcount
 
     def move_non_invalid_to_group(self, platform, source_group_ids, target_group_id,
@@ -246,6 +284,7 @@ class CardPoolModel:
                     "UPDATE card_pool SET group_id=? WHERE id=?", (target_group_id, r['id']))
                 seen.add(num)
                 moved += 1
+        self._invalidate_usable_cache()
         return {'moved': moved, 'deduped': deduped}
 
     # 桶 → 可移动性：'non_invalid' 不是 _bucket_where 的桶，单独拼（= 有效 + 未验证）
@@ -294,6 +333,7 @@ class CardPoolModel:
                     "UPDATE card_pool SET group_id=? WHERE id=?", (target_group_id, r['id']))
                 seen.add(r['card_number'])
                 moved += 1
+        self._invalidate_usable_cache()
         return {'moved': moved, 'skipped': skipped}
 
     # ---------- 取卡 ----------
@@ -351,38 +391,85 @@ class CardPoolModel:
         「已绑定」「无效」都只在本平台成立——同一张卡在别的平台照样出现在可选集里，
         这正是多平台改造要的效果。
         """
+        # 键带库路径，理由同 _expiry_refreshed_at：类级缓存跨 Database 实例共享。
+        key = (getattr(self.db, 'db_path', ''), platform, group_id)
+        with self._usable_cache_lock:
+            hit = self._usable_cache.get(key)
+            if hit is not None and (time.monotonic() - hit[0]) < self._USABLE_CACHE_TTL_SEC:
+                # 返回浅拷贝：调用方对列表做 append/remove 不该污染缓存
+                # （dict 本身共享——没有调用方会去改卡的字段）。
+                return list(hit[1]), list(hit[2])
+
         self.refresh_expired_status(group_id)
         cards = self.get_cards_as_list(group_id, platform)
         usable = [c for c in cards if c['status'] not in CARD_STATUS_NOT_SELECTABLE]
         unusable = [c for c in cards if c['status'] in CARD_STATUS_NOT_SELECTABLE]
-        return usable, unusable
 
-    def refresh_expired_status(self, group_id=None):
-        """按当前日期重新判定过期卡并标记为 expired（卡会随时间推移过期，故每次取卡前刷新）。
+        with self._usable_cache_lock:
+            self._usable_cache[key] = (time.monotonic(), usable, unusable)
+        return list(usable), list(unusable)
+
+    def refresh_expired_status(self, group_id=None, force=False):
+        """按当前日期重新判定过期卡并标记为 expired（卡会随时间推移过期，故取卡前刷新）。
 
         平台无关，故不需要 platform 参数：有效期是卡自己的属性。
 
         拆表后这里也不再需要「不覆盖 paid/invalid/bound」的判断了——那三个状态已经
         搬到 card_platform_state，与本列不再争同一个格子，两边可以各自为真。一张被
         绑走后又到期的卡，现在既是 bound 又是 expired，信息不再互相顶掉。
+
+        ## 两处性能约束（2026-08-13）
+
+        这个方法在**每次取卡**时都会被调用，而取卡在 8 个 worker 的热路径上，
+        全部压在 Database 那把全局锁上。原实现是「拉出分组全部行 → Python 逐行判断
+        → 每张过期卡单独 UPDATE」，在 3.2 万张卡的分组上要 300ms 以上，直接把整个
+        进程的 DB 访问堵住：worker 大半时间在等锁（8 个 worker 只跑得动 4 个浏览器），
+        连每秒轮询的 /api/status 都被挤到超时。两处针对性改动：
+
+        1. **只扫未标记过期的行**（`status != 'expired'`）。过期是单向的、标了就不会
+           回头，已标记的行每次重扫纯属浪费。配合 idx_card_pool_group_status 索引，
+           稳态下这个查询几乎不返回行。
+        2. **按分组节流**：同一分组 _EXPIRY_REFRESH_TTL_SEC 内只真正扫一次。卡的过期
+           状态按**天**变化，秒级重复扫描没有任何意义。force=True 可跳过节流，供
+           界面上的手动刷新用——那种场景用户就是要看最新结果。
+
+        批量 UPDATE 也合并成一条 `WHERE id IN (...)`，省掉 N 次单行写。
         """
+        now = time.monotonic()
+        # 键要带上库路径：类级状态在多个 Database 实例之间是共享的（测试各用各的
+        # 临时库、group_id 却都是 1），不区分库就会互相读到对方的节流记录。
+        key = (getattr(self.db, 'db_path', ''), group_id if group_id is not None else '__all__')
+        if not force:
+            last = self._expiry_refreshed_at.get(key)
+            if last is not None and (now - last) < self._EXPIRY_REFRESH_TTL_SEC:
+                return 0
+
+        # 只看还没被标成 expired 的行：过期是单向的，标过就不必再看
         if group_id is None:
-            rows = self.db.fetchall("SELECT id, expiry_month, expiry_year, status FROM card_pool")
+            rows = self.db.fetchall(
+                "SELECT id, expiry_month, expiry_year FROM card_pool "
+                "WHERE COALESCE(status,'') != ?", (CARD_STATUS_EXPIRED,))
         else:
             rows = self.db.fetchall(
-                "SELECT id, expiry_month, expiry_year, status FROM card_pool WHERE group_id=?",
-                (group_id,),
+                "SELECT id, expiry_month, expiry_year FROM card_pool "
+                "WHERE group_id=? AND COALESCE(status,'') != ?",
+                (group_id, CARD_STATUS_EXPIRED),
             )
-        marked = 0
-        for r in rows:
-            if (r['status'] or '') == CARD_STATUS_EXPIRED:
-                continue
-            if is_card_expired(r['expiry_month'], r['expiry_year']):
-                self.db.execute(
-                    "UPDATE card_pool SET status=? WHERE id=?", (CARD_STATUS_EXPIRED, r['id'])
-                )
-                marked += 1
-        return marked
+
+        expired_ids = [r['id'] for r in rows
+                       if is_card_expired(r['expiry_month'], r['expiry_year'])]
+        # 分批是因为 SQLite 的变量数上限（SQLITE_MAX_VARIABLE_NUMBER，老版本低至 999）
+        for i in range(0, len(expired_ids), 500):
+            chunk = expired_ids[i:i + 500]
+            marks = ','.join('?' * len(chunk))
+            self.db.execute(
+                f"UPDATE card_pool SET status=? WHERE id IN ({marks})",
+                (CARD_STATUS_EXPIRED, *chunk))
+
+        if expired_ids:
+            self._invalidate_usable_cache()
+        self._expiry_refreshed_at[key] = now
+        return len(expired_ids)
 
     # ---------- 状态标记（全部按平台） ----------
 
@@ -394,6 +481,7 @@ class CardPoolModel:
             "  status=excluded.status, updated_at=excluded.updated_at",
             (card_number, platform, status),
         )
+        self._invalidate_usable_cache()
 
     def get_platform_status(self, platform, card_number):
         row = self.db.fetchone(
@@ -434,6 +522,7 @@ class CardPoolModel:
 
     def mark_expired_by_number(self, card_number):
         """标记为已过期（有效期已过）。平台无关，写 card_pool。"""
+        self._invalidate_usable_cache()
         self.db.execute(
             "UPDATE card_pool SET status=? WHERE card_number=?",
             (CARD_STATUS_EXPIRED, card_number),
@@ -464,9 +553,11 @@ class CardPoolModel:
     # ---------- 杂项 ----------
 
     def delete_card(self, card_id):
+        self._invalidate_usable_cache()
         self.db.execute("DELETE FROM card_pool WHERE id=?", (card_id,))
 
     def delete_by_group(self, group_id):
+        self._invalidate_usable_cache()
         cursor = self.db.execute("DELETE FROM card_pool WHERE group_id=?", (group_id,))
         return cursor.rowcount
 

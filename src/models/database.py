@@ -406,6 +406,18 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 """
 
+# 卡池的按分组访问路径。card_pool 此前只有 UNIQUE(card_number, group_id) 的自动索引，
+# 它的前导列是 card_number，按 group_id 过滤用不上，于是每次取卡都要全表扫。
+# 实测（3.2 万张卡的分组）：取一次可选卡 309ms，而这条路径在每个 worker 每次领卡时
+# 都要走一遍，全部压在 Database 那把全局锁上——8 个 worker 因此大半时间在排队等锁，
+# 同时只有 4 个浏览器跑得动，连 /api/status 都被挤到超时（2026-08-13 现场）。
+_SCHEMA_V19 = """
+CREATE INDEX IF NOT EXISTS idx_card_pool_group ON card_pool(group_id);
+CREATE INDEX IF NOT EXISTS idx_card_pool_group_status ON card_pool(group_id, status);
+CREATE INDEX IF NOT EXISTS idx_rl_platform_status_card
+    ON recharge_logs(platform, status, card_display);
+"""
+
 _ADD_COLUMN_RE = re.compile(r'^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)', re.I)
 
 _MIGRATIONS = {
@@ -427,6 +439,7 @@ _MIGRATIONS = {
     16: _SCHEMA_V16,
     17: _SCHEMA_V17,
     18: _SCHEMA_V18,
+    19: _SCHEMA_V19,
 }
 
 
