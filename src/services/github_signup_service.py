@@ -248,8 +248,12 @@ def signup_one(headless=False, semi_auto=False, keep_open=False, account=None,
             session = create_driver(headless=headless,
                                     profile_id=(address if use_hotmail else None),
                                     proxy=proxy)
-        if not gh.open_signup(session):
-            result["reason"] = "GitHub 注册页加载失败（邮箱框未出现）"
+        ok, block, detail = gh.open_signup(session)
+        if not ok:
+            # 拦截 / 503 / 空白页都是 GitHub 侧的临时状况，账号本身没问题。
+            # outcome 单独给值，好让编排层把账号留在可重试状态而不是判 failed。
+            result["outcome"] = block or "signup_page_unavailable"
+            result["reason"] = detail or "GitHub 注册页加载失败（邮箱框未出现）"
             result["screenshot"] = _screenshot(session, address)
             result["final_url"] = session.current_url
             return result

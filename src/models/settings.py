@@ -21,6 +21,16 @@ KEY_ADSPOWER_ENABLED = 'adspower.enabled'
 KEY_ADSPOWER_API_KEY = 'adspower.api_key'
 KEY_ADSPOWER_BASE_URL = 'adspower.base_url'
 
+# 并发度按平台存一行，键名带平台 slug。
+# 不存一个「全局 max_workers」的覆盖值：yaml 里那个是「没单独配的平台用什么」，
+# 而 UI 上列出的就是全部平台、每个都有自己的输入框，再留一个全局值只会造成
+# 「界面显示 3、实际跑 8」这种两个真相打架的局面。
+KEY_WORKERS_PREFIX = 'concurrency.workers.'
+
+
+def workers_key(platform):
+    return f'{KEY_WORKERS_PREFIX}{platform}'
+
 _TRUE = ('1', 'true', 'yes', 'on')
 
 
@@ -84,6 +94,44 @@ class SettingsModel:
             'api_key': got.get(KEY_ADSPOWER_API_KEY) or cfg_adspower.api_key,
             'base_url': got.get(KEY_ADSPOWER_BASE_URL) or cfg_adspower.base_url,
         }
+
+    # ---------- 并发度生效配置 ----------
+
+    def workers_effective(self, cfg_concurrency, platform):
+        """该平台的**生效并发度**：DB 设过就用 DB，否则回落 config.yaml。
+
+        yaml 侧的回落链本身是两级的（platform_workers[platform] → max_workers），
+        由 ConcurrencyConfig.workers_for 负责，这里不重复实现。
+
+        存进来的值可能是脏的（手改过库、或旧版本写入过 0）。这里不做夹紧，
+        只保证「解析不出整数就当没设过」——夹紧统一由 worker.clamp_workers 做，
+        那是并发度唯一的守门处，两处都夹会让上限改动漏改一处。
+        """
+        raw = self.get(workers_key(platform))
+        if raw is not None and str(raw).strip() != '':
+            try:
+                return int(str(raw).strip())
+            except ValueError:
+                pass
+        return cfg_concurrency.workers_for(platform)
+
+    def workers_overrides(self, platforms):
+        """这些平台里**在 UI 上设过**并发度的那些，{platform: int}。
+
+        供界面区分「这是我设的」和「这是 config.yaml 的默认值」——与 AdsPower 那边
+        的 from_db 同一个用途。
+        """
+        got = self.get_many([workers_key(p) for p in platforms])
+        out = {}
+        for p in platforms:
+            raw = got.get(workers_key(p))
+            if raw is None or str(raw).strip() == '':
+                continue
+            try:
+                out[p] = int(str(raw).strip())
+            except ValueError:
+                continue
+        return out
 
 
 # API Key 在界面上**明文**回显、明文提交。

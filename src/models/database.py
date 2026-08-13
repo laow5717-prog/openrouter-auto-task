@@ -418,6 +418,17 @@ CREATE INDEX IF NOT EXISTS idx_rl_platform_status_card
     ON recharge_logs(platform, status, card_display);
 """
 
+# 归档前的身份状态。归档是 identity_status='retired' 就地覆盖，原值当场丢失，
+# 于是取消归档只能一律恢复成 'registered'——把一个 banned 账号归档再取消归档，
+# 它会「痊愈」成已注册并重新参与任务，而封禁是 GitHub 那边的事实，不会因此改变。
+# 存下原值，取消归档时还原回去。
+#
+# 空串表示「没有归档过」或「归档时是老版本、没留下原值」，后者取消归档时仍回落
+# 'registered'——那是旧数据，猜不出原值，保持既有行为比瞎猜好。
+_SCHEMA_V20 = """
+ALTER TABLE accounts ADD COLUMN identity_status_before_retire TEXT DEFAULT '';
+"""
+
 _ADD_COLUMN_RE = re.compile(r'^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)', re.I)
 
 _MIGRATIONS = {
@@ -440,6 +451,7 @@ _MIGRATIONS = {
     17: _SCHEMA_V17,
     18: _SCHEMA_V18,
     19: _SCHEMA_V19,
+    20: _SCHEMA_V20,
 }
 
 

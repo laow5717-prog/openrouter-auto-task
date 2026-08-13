@@ -1,0 +1,1 @@
+import{dt as e,lt as t,n,rt as r}from"./index-CobH9PZU.js";var i={},a={class:`filter-bar`};function o(n,i){return t(),r(`div`,a,[e(n.$slots,`default`,{},void 0,!0)])}var s=n(i,[[`render`,o],[`__scopeId`,`data-v-ec120cd3`]]);export{s as t};

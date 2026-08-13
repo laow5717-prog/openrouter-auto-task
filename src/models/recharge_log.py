@@ -271,27 +271,37 @@ class RechargeLogModel:
             'failed_count': int(row['failed_count'] or 0) if row else 0,
         }
 
+    # 卡号非空的成功记录。卡片数只能在这个子集上数，账号数不行——见 _distinct_counts。
+    _HAS_CARD = "card_display IS NOT NULL AND card_display != ''"
+
     def _distinct_counts(self, platform, range_sql, range_params):
         """区间内用掉的**不同卡片数**与涉及的**不同账号数**。
 
-        必须与 _amount_counts 分成两条 SQL：COUNT(DISTINCT x) 里塞不进 CASE WHEN
-        的成功/失败分岔，硬写成 COUNT(DISTINCT CASE WHEN ... END) 会把 NULL 也算进
-        分组、结果偏大且难察觉。这里直接把 status='success' 提到 WHERE 里。
+        两个数字的行子集**故意不同**，用一条 SQL 里的两种表达式区分：
+
+          card_count    只数有卡号的成功记录。没有卡号就无从判断是哪张卡。
+          account_count 数**全部**成功记录。一条没有卡号的 success 属于异常数据
+                        （写入路径 _log_card_attempt 总会带卡号），但它确实是一笔
+                        充进去的钱，对应的账号必须算进「涉及账号数」。
+
+        曾经两者共用「卡号非空」这个子集，理由是对账时能确定它们看的是同一批行。
+        代价是账号数与调用方按账号拆出来的「已核销 / 在用」两段对不上：那两段是在
+        全部成功记录上拆的，于是页面上「N 个 + M 个 ≠ 涉及账号数」。屏幕上能直接
+        相加验算的关系，比两个内部数字共用行子集这种看不见的性质重要得多。
+
+        COUNT(DISTINCT CASE ... END) 是安全的：ELSE 分支给出的 NULL 不计入去重集合
+        （已在 sqlite 上验证），所以卡片数不会因为混进无卡号的行而偏大。
 
         卡号按**去空格后的完整串**去重，而不是像 count_success_by_last4 那样取末 4 位——
         那个妥协是为兼容历史脱敏串做的，用在「今天用掉几张卡」上会把不同卡号的同末 4 位
         合并成一张，数字偏小。代价是历史脱敏串（'•••• 1234'）会被当成独立一张卡，
         早期日期的卡片数可能偏大；页面上对该列有 title 说明。
-
-        注意 card_display 非空过滤同时裁掉了 account_count：一条没有卡号的 success
-        记录属于异常数据（写入路径 _log_card_attempt 总会带卡号），与其为账号数再打一条
-        SQL，不如让两个数字口径完全一致——对账时能确定它们看的是同一批行。
         """
         row = self.db.fetchone(
-            "SELECT COUNT(DISTINCT replace(card_display,' ','')) AS card_count, "
+            "SELECT COUNT(DISTINCT CASE WHEN "
+            f"{self._HAS_CARD} THEN replace(card_display,' ','') END) AS card_count, "
             "COUNT(DISTINCT email) AS account_count "
-            "FROM recharge_logs WHERE platform=? AND status='success' "
-            "AND card_display IS NOT NULL AND card_display != ''"
+            "FROM recharge_logs WHERE platform=? AND status='success'"
             f"{range_sql}",
             [platform] + list(range_params),
         )
@@ -353,12 +363,15 @@ class RechargeLogModel:
             "GROUP BY DATE(created_at) ORDER BY date DESC",
             params,
         )
+        # 与 _distinct_counts 同口径：卡片数只数有卡号的行，账号数数全部成功行。
+        # 逐日表与汇总条的同名列必须是同一个定义，否则把某天的数字和区间总数
+        # 放在一起看时会对不上，而页面上没有任何东西提示两者算法不同。
         distinct_rows = self.db.fetchall(
             "SELECT DATE(created_at) AS date, "
-            "COUNT(DISTINCT replace(card_display,' ','')) AS card_count, "
+            "COUNT(DISTINCT CASE WHEN "
+            f"{self._HAS_CARD} THEN replace(card_display,' ','') END) AS card_count, "
             "COUNT(DISTINCT email) AS account_count "
-            "FROM recharge_logs WHERE platform=? AND status='success' "
-            "AND card_display IS NOT NULL AND card_display != ''"
+            "FROM recharge_logs WHERE platform=? AND status='success'"
             f"{range_sql} "
             "GROUP BY DATE(created_at)",
             params,

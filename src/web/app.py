@@ -35,6 +35,17 @@ from src.web.worker import (
     WorkerState, WorkerPool, AccountRegistry, PaymentCardRegistry, ProxyRegistry,
     ClaimReaper, get_current_worker,
 )
+from src.browser.github_signup import (
+    BLOCK_RESTRICTED, BLOCK_UNAVAILABLE, BLOCK_BLANK,
+)
+
+# 注册页根本没打开时的 outcome。这些都是 GitHub 侧的临时状况——反滥用按出口 IP
+# 拦截、GitHub 自己 503、或者返回空白页——账号从未被 GitHub 审视过，更谈不上被拒。
+# 判 failed 会让它退出 imported 池、要人工「重置为待注册」才回得来，与 2026-08-03
+# 配额耗尽误废 30 个账号是同一类错误。一律按 pending 留待下一轮（换代理后多半能过）。
+RETRYABLE_SIGNUP_OUTCOMES = frozenset({
+    BLOCK_RESTRICTED, BLOCK_UNAVAILABLE, BLOCK_BLANK, 'signup_page_unavailable',
+})
 
 
 # Stripe 付款域名绕过代理直连。i-proxy 等住宅/移动代理把支付类域名（stripe.com）
@@ -312,6 +323,14 @@ class AppState:
     @property
     def adspower_enabled(self):
         return bool(self.adspower_settings()['enabled'])
+
+    def workers_setting(self):
+        """本平台的**生效并发度**：UI 存进 DB 的覆盖值优先，没设过回落 config.yaml。
+
+        与 adspower_settings 同样每次读库不缓存——它在 UI 上随时可改，缓存一份
+        就得再解决失效时机的问题，而读一行 sqlite 的开销远小于那个复杂度。
+        """
+        return self.models['settings'].workers_effective(cfg.concurrency, self.platform)
 
     def _ensure_adspower(self):
         """惰性创建 AdsPower 客户端与环境池。未启用时返回 (None, None)。
@@ -1075,10 +1094,15 @@ class AppState:
         produce_lock = threading.Lock()   # 「找账号 + claim」原子领取
         state_lock = threading.Lock()     # 护 done + stats 的读写
 
-        # 并发度读 config（clamp 1-4）。max_workers=1 仍走 WorkerPool 同线程分支（应急串行）。
         # 并发度按平台取：不同平台单账号耗时差很多，慢的那个多开几个才不至于
-        # 拖住整体。未单独配置的平台回落到 concurrency.max_workers。
-        pool = WorkerPool(self, cfg.concurrency.workers_for(self.platform))
+        # 拖住整体。取值优先级为 UI 设置 → config.yaml 的 platform_workers → max_workers，
+        # 由 workers_effective 统一解析；越界在 WorkerPool 里 clamp 到 1-10。
+        # max_workers=1 仍走 WorkerPool 同线程分支（应急串行）。
+        #
+        # 在这里读而不是启动时读一次：UI 上改完不必重启，下一轮任务就用新值。
+        # 反过来说**本轮不会变**——运行中缩减线程池要处理正在飞的账号怎么收尾，
+        # 那是另一件事，这里刻意只在起跑线读一次。
+        pool = WorkerPool(self, self.workers_setting())
 
         try:
             self._hooked_print(f"\n{'#' * 50}")
@@ -1581,6 +1605,8 @@ class AppState:
         AdsPowerError（配额满 / 客户端没开）**向上抛出、不改账号状态**：浏览器都没起来，
         谈不上「这个账号注册失败」。若在此标 failed，账号会退出 imported 池永不重试——
         2026-08-03 一次配额耗尽就这样误废了 30 个刚导入的账号。
+
+        GitHub 侧的临时状况（反滥用拦截 / 503 / 空白页）同理，见 RETRYABLE_SIGNUP_OUTCOMES。
         """
         models = self.models
         worker = worker or self.primary_worker
@@ -1600,6 +1626,12 @@ class AppState:
         if oc == 'reached_captcha':
             models['account'].update_identity_status(email, 'pending')
             return "skipped", "碰 Arkose，跳过（全自动模式不等人工）"
+        # 注册页压根没打开：GitHub 拦了、挂了、或返回空白页。账号本身没被 GitHub
+        # 拒绝过，标 failed 会把它踢出 imported 池、要人工点「重置为待注册」才回得来。
+        # 与上面 Arkose 同样按 pending 处理——下一轮换个代理很可能就过了。
+        if oc in RETRYABLE_SIGNUP_OUTCOMES:
+            models['account'].update_identity_status(email, 'pending')
+            return "skipped", r.get('reason') or f"GitHub 注册页不可用: {oc}"
         if oc == 'account_suspended':
             models['account'].upsert(email, login_password=r.get('github_password'),
                                      email_password=hacc.password,

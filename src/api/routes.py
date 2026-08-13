@@ -16,6 +16,26 @@ from src.utils import is_card_expired, is_identity_terminal, is_platform_termina
 
 api = Blueprint('api', __name__)
 
+# 「已核销」在库里的取值。归档页签与充值报表的核销判据都读它——
+# 这个字符串散在多处硬编码时，改判据必然漏掉某一处。
+ACCOUNT_RETIRED_STATUS = 'retired'
+
+# 账号列表页签 → 身份状态集合。
+#
+# 「在用」只认 registered：它曾经是「除了已归档的全部」，于是注册失败、仅导入、
+# 已封禁的账号统统被算成在用——那个口径回答的其实是「没被手动归档过」，
+# 与「这个账号还能跑」没有关系。
+#
+# ACCOUNT_SCOPE_CATCH_ALL 这一组不在这里列举，由「总数 − 其余各组」倒推得到，
+# 所以 NULL、空串、以及将来新增却忘了归类的状态都会落进「待处理」被看见，
+# 不会从五个页签里一起消失。
+ACCOUNT_SCOPE_STATUSES = {
+    'active': ('registered',),
+    'abnormal': ('failed', 'banned', 'suspended', 'rejected', 'flagged'),
+    'retired': (ACCOUNT_RETIRED_STATUS,),
+}
+ACCOUNT_SCOPE_CATCH_ALL = 'pending'   # 待处理：imported / pending / 未归类
+
 
 def get_app_state():
     """默认平台的运行上下文。
@@ -140,6 +160,92 @@ def save_adspower_settings():
         sm.set(S.KEY_ADSPOWER_API_KEY, key or None)
 
     return get_adspower_settings()
+
+
+@api.route('/api/settings/concurrency', methods=['GET'])
+def get_concurrency_settings():
+    """各平台的生效并发度 + 用于判断是否配得过头的配额信息。
+
+    配额一起返回，是因为「能设多少」根本不由并发度自己决定：AdsPower 的环境数
+    才是硬约束。只给一个 1-10 的输入框，用户设成 10+10 之后看到的现象会是
+    「并发度写着 10，实际一直有 worker 在等配额」，而界面上没有任何线索指向配额。
+    """
+    from src.models import settings as S
+    import src.platforms as platforms
+    from src.web.worker import MIN_WORKERS, MAX_WORKERS
+
+    models = get_models()
+    sm = models['settings']
+    descs = platforms.describe_all()
+    slugs = [p['slug'] for p in descs]
+    overrides = sm.workers_overrides(slugs)
+
+    items = []
+    for p in descs:
+        slug = p['slug']
+        items.append({
+            "slug": slug,
+            "display_name": p.get('display_name') or slug,
+            "workers": sm.workers_effective(cfg.concurrency, slug),
+            "yaml_default": cfg.concurrency.workers_for(slug),
+            "from_db": slug in overrides,
+            # 该平台的自有额度。并发度超过它的部分每轮都要向别的平台借环境，
+            # 对方在跑时就退化成排队等——名义并发度和实际吞吐会对不上。
+            "platform_quota": (cfg.adspower.platform_quota or {}).get(slug),
+        })
+
+    return jsonify({
+        "data": items,
+        "min_workers": MIN_WORKERS,
+        "max_workers": MAX_WORKERS,
+        "total_quota": cfg.adspower.total_quota,
+        "adspower_enabled": bool(get_app_state().adspower_settings()['enabled']),
+    })
+
+
+@api.route('/api/settings/concurrency', methods=['PUT'])
+def save_concurrency_settings():
+    """保存各平台并发度。{"workers": {"opencode": 6, ...}}
+
+    与 AdsPower 那边同样的三态语义：字段缺席=不动，空串/null=清除覆盖回落 yaml，
+    给值=覆盖。
+
+    越界直接 400 而不是静默夹紧：夹紧发生在 WorkerPool 里、要等下一次跑任务才
+    在日志里露头，而此刻用户正盯着设置页，报错是唯一能让他当场知道的时机。
+    """
+    from src.models import settings as S
+    import src.platforms as platforms
+    from src.web.worker import MIN_WORKERS, MAX_WORKERS
+
+    models = get_models()
+    sm = models['settings']
+    workers = (request.json or {}).get('workers')
+    if not isinstance(workers, dict):
+        return jsonify({"error": "workers 需为 {平台: 并发度} 对象"}), 400
+
+    known = {p['slug'] for p in platforms.describe_all()}
+    pending = {}
+    for slug, raw in workers.items():
+        if slug not in known:
+            return jsonify({"error": f"未知平台: {slug}"}), 400
+        if raw is None or str(raw).strip() == '':
+            pending[slug] = None          # 清除覆盖，回落 yaml
+            continue
+        try:
+            n = int(str(raw).strip())
+        except ValueError:
+            return jsonify({"error": f"{slug} 的并发度需为整数"}), 400
+        if not (MIN_WORKERS <= n <= MAX_WORKERS):
+            return jsonify({
+                "error": f"{slug} 的并发度需在 {MIN_WORKERS}-{MAX_WORKERS} 之间"}), 400
+        pending[slug] = n
+
+    # 全部校验通过后才落库：中途 400 会留下一半新一半旧的状态，
+    # 而用户看到的是「保存失败」，不会想到有些平台其实已经改了。
+    for slug, val in pending.items():
+        sm.set(S.workers_key(slug), val)
+
+    return get_concurrency_settings()
 
 
 @api.route('/api/settings/adspower/test', methods=['POST'])
@@ -468,10 +574,29 @@ def get_accounts():
     date_from = request.args.get('date_from', '')
     date_to = request.args.get('date_to', '')
 
+    # 页签：all（默认）/ active / pending / abnormal / retired，见 ACCOUNT_SCOPE_STATUSES。
+    scope = (request.args.get('scope') or 'all').strip()
+    identity_statuses = ()
+    exclude_identity_statuses = ()
+    if scope in ACCOUNT_SCOPE_STATUSES:
+        identity_statuses = ACCOUNT_SCOPE_STATUSES[scope]
+    elif scope == ACCOUNT_SCOPE_CATCH_ALL:
+        # 兜底组没有自己的状态清单，用「排除其余各组」表达，与计数那边同一个定义
+        exclude_identity_statuses = tuple(
+            s for group in ACCOUNT_SCOPE_STATUSES.values() for s in group)
+
     accounts, total = models['account'].get_paginated(
         page=page, page_size=page_size,
         keyword=keyword, identity_status=identity_status,
         date_from=date_from, date_to=date_to,
+        identity_statuses=identity_statuses,
+        exclude_identity_statuses=exclude_identity_statuses,
+    )
+    # 页签计数不带 scope，也不带 platform_status——后者是分页后在 Python 里过滤的
+    # （见下方注释），把它算进页签数字会让计数与列表各说各话。
+    scope_counts = models['account'].count_by_status_groups(
+        ACCOUNT_SCOPE_STATUSES, catch_all_key=ACCOUNT_SCOPE_CATCH_ALL,
+        keyword=keyword, date_from=date_from, date_to=date_to,
     )
 
     emails = [acc['email'] for acc in accounts]
@@ -517,7 +642,7 @@ def get_accounts():
         })
 
     return jsonify({"data": data, "total": total, "page": page, "page_size": page_size,
-                    "platform": platform})
+                    "platform": platform, "scope": scope, "scope_counts": scope_counts})
 
 
 @api.route('/api/accounts/template')
@@ -612,14 +737,23 @@ def archive_accounts():
     if not emails:
         return jsonify({"error": "没有指定要归档的账号"}), 400
 
-    count = models['account'].set_identity_status(emails, 'retired')
+    # retire 会先把当前身份状态存进 identity_status_before_retire 再覆盖，
+    # 好让取消归档能还原回去（banned 归档后取消归档不该变成 registered）。
+    count = models['account'].retire(emails, retired_status=ACCOUNT_RETIRED_STATUS)
     ads = _release_adspower_for(emails)
     return jsonify({"retired": count, "adspower": ads})
 
 
 @api.route('/api/accounts/unarchive', methods=['POST'])
 def unarchive_accounts():
-    """取消归档：retired → registered。
+    """取消归档：恢复成**归档前**的身份状态。
+
+    曾经是写死的 retired → registered。归档会就地覆盖 identity_status，原值当场丢失，
+    于是把一个 banned 账号归档再取消归档，它会「痊愈」成已注册并重新参与任务——
+    而封禁是 GitHub 那边的事实，不会因为在本地点了两下按钮就消失。现在归档时把原值
+    存进 identity_status_before_retire，这里还原回去。
+
+    V20 迁移之前归档的账号没有留下原值，仍回落 registered：那是既有数据，猜不出来。
 
     WHERE 里带 identity_status='retired'，只动归档过的行——批量接口误传几个正常账号
     时不该把它们的状态也改掉。
@@ -632,8 +766,7 @@ def unarchive_accounts():
     if not emails:
         return jsonify({"error": "没有指定要取消归档的账号"}), 400
 
-    count = models['account'].set_identity_status(
-        emails, 'registered', only_from='retired')
+    count = models['account'].unretire(emails, retired_status=ACCOUNT_RETIRED_STATUS)
     return jsonify({"restored": count})
 
 

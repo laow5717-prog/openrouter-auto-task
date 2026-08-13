@@ -142,3 +142,7 @@ export const saveAdspowerSettings = (body) => request('/api/settings/adspower', 
   method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 }).then(r => r.json())
 export const testAdspowerSettings = () => post('/api/settings/adspower/test')
+export const getConcurrencySettings = () => get('/api/settings/concurrency')
+export const saveConcurrencySettings = (body) => request('/api/settings/concurrency', {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+}).then(r => r.json())

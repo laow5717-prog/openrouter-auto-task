@@ -40,6 +40,18 @@ TERM_VERIFY_EMAIL = "verify_email"   # 未出验证码，GitHub 直接进「输�
 TERM_REJECTED = "rejected_by_github"
 TERM_UNKNOWN = "unknown"
 
+# 注册页打不开时的**具体原因**。三种都是 GitHub 侧的临时状况，与账号本身无关，
+# 编排层据此把账号留在可重试状态，而不是判成「注册失败」。
+BLOCK_RESTRICTED = "access_restricted"      # 反滥用拦截页（按出口 IP）
+BLOCK_UNAVAILABLE = "github_unavailable"    # GitHub 503「独角兽」页
+BLOCK_BLANK = "blank_page"                  # 页面全空，什么都没渲染出来
+BLOCK_NONE = ""                             # 页面正常，只是没等到邮箱框
+
+# 拦截页正文里的 IP，形如 "Automated (bot) activity on your network (IP 1.2.3.4)"。
+# 抓出来是为了让日志能指认是**哪个代理**被 GitHub 标记了——没有它，
+# 面对一批失败账号根本不知道该换哪条代理。
+_RE_BLOCK_IP = re.compile(r'\(IP\s+([0-9a-fA-F.:]+)\)')
+
 
 def _human_type(page, selector, text):
     """逐字符输入，规避一次性 fill 粘贴的机器特征。先聚焦点击再敲字符。"""
@@ -61,15 +73,54 @@ def _field_error(page, selector):
         return ""
 
 
+def classify_block(session):
+    """邮箱框没出现时，判断到底卡在什么页面上。返回 (BLOCK_*, 说明文本)。
+
+    存在的理由是「同一个现象、三种完全不同的成因」：反滥用拦截、GitHub 503、
+    以及页面确实变了。此前这三种一律报「邮箱输入框未出现，页面结构可能已变」，
+    那句话把人直接引向选择器排查，而实测 40 张截图里 17 张是前两种——
+    去改选择器一辈子也修不好，因为选择器根本没问题。
+
+    判据取页面正文关键字而不是 DOM 结构：这三张都是 GitHub 的静态错误页，
+    没有稳定的 id/class 可依赖，正文措辞反而是最不容易变的部分。
+    """
+    try:
+        body = (session.page.inner_text('body') or '').strip()
+    except Exception:
+        body = ''
+    low = body.lower()
+
+    if 'access is temporarily restricted' in low or 'unusual activity' in low:
+        m = _RE_BLOCK_IP.search(body)
+        ip = m.group(1) if m else ''
+        detail = f"GitHub 反滥用拦截（出口 IP {ip} 被标记为自动化流量）" if ip \
+            else "GitHub 反滥用拦截（未能从页面解析出被标记的 IP）"
+        return BLOCK_RESTRICTED, detail
+
+    if 'no server is currently available' in low:
+        return BLOCK_UNAVAILABLE, "GitHub 服务暂不可用（503 独角兽页）"
+
+    if not body:
+        return BLOCK_BLANK, "页面完全空白，未渲染出任何内容"
+
+    return BLOCK_NONE, f"页面已加载但邮箱框未出现，正文开头: {body[:120]}"
+
+
 def open_signup(session):
-    """导航到 signup 页并等待邮箱框可见。返回 True/False。"""
+    """导航到 signup 页并等待邮箱框可见。
+
+    返回 (ok, block, detail)：ok 为 True 时 block 为 BLOCK_NONE。
+    失败时 block 指明是 GitHub 拦截 / 服务不可用 / 空白页 / 还是页面真的变了——
+    编排层要靠它区分「账号有问题」和「这次运气不好」。
+    """
     print("打开 GitHub 注册页...")
     _safe_goto(session, SIGNUP_URL)
     session.capture_frame()
-    ok = _wait_visible(session.page.locator(SEL_EMAIL), timeout=30000)
-    if not ok:
-        print("  ❌ 邮箱输入框未出现，页面结构可能已变")
-    return ok
+    if _wait_visible(session.page.locator(SEL_EMAIL), timeout=30000):
+        return True, BLOCK_NONE, ""
+    block, detail = classify_block(session)
+    print(f"  ❌ {detail}")
+    return False, block, detail
 
 
 def fill_signup_form(session, email, password, username):

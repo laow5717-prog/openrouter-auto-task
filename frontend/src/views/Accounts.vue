@@ -19,19 +19,25 @@
 
     <div v-if="importMsg" style="padding:8px 12px;font-size:12px;line-height:1.7" v-html="importMsg"></div>
 
+    <!-- 归档维度归页签管：它同时决定后端的查询条件与分页总数，
+         所以不能只在前端切当前页的数据（那样「已归档」页签只会显示本页碰巧有的那几个） -->
+    <div class="scope-tabs">
+      <button v-for="t in SCOPE_TABS" :key="t.key" :title="t.hint"
+              class="scope-tab" :class="{ active: scope === t.key }"
+              @click="switchScope(t.key)">
+        {{ t.label }}
+        <span class="scope-tab-count">{{ scopeCounts[t.key] }}</span>
+      </button>
+    </div>
+
     <FilterBar>
       <input v-model="filters.keyword" class="filter-input" placeholder="搜索邮箱..." style="width:200px">
-      <select v-model="filters.identity_status" class="filter-select" title="GitHub 注册与封禁结果，跨平台一致">
+      <!-- 下拉只列当前页签内的状态：跨页签的选项在这里选中必然得到空列表。
+           在用/已归档页签下只有一种状态，下拉整个隐藏。 -->
+      <select v-if="identityOptions.length" v-model="filters.identity_status"
+              class="filter-select" title="GitHub 注册与封禁结果，跨平台一致">
         <option value="">全部身份状态</option>
-        <option value="imported">仅导入</option>
-        <option value="registered">已注册</option>
-        <option value="pending">待处理</option>
-        <option value="failed">注册失败</option>
-        <option value="suspended">已挂起</option>
-        <option value="rejected">已拒绝</option>
-        <option value="flagged">GitHub受限</option>
-        <option value="banned">已封禁</option>
-        <option value="retired">已核销（已归档）</option>
+        <option v-for="s in identityOptions" :key="s" :value="s">{{ accStatusLabel(s) }}</option>
       </select>
       <select v-model="filters.platform_status" class="filter-select" title="该账号在当前平台的状态">
         <option value="">全部平台状态</option>
@@ -57,15 +63,19 @@
       <span class="page-sum-item">
         今日 <b class="green">${{ money(pageSum.today) }}</b> · 累计 <b>${{ money(pageSum.total) }}</b>
       </span>
-      <span class="page-sum-sep"></span>
-      <span class="page-sum-item">
-        已核销 {{ pageSum.retiredCount }} 个：今日 <b>${{ money(pageSum.retiredToday) }}</b> ·
-        累计 <b>${{ money(pageSum.retiredTotal) }}</b>
-      </span>
-      <span class="page-sum-item">
-        在用 {{ accounts.length - pageSum.retiredCount }} 个：今日 <b>${{ money(pageSum.activeToday) }}</b> ·
-        累计 <b>${{ money(pageSum.activeTotal) }}</b>
-      </span>
+      <!-- 「全部」页签才拆分：另外两个页签下每一行的归属都由页签本身定死了，
+           再拆一次只会得到「一组等于全部、另一组恒为 0」 -->
+      <template v-if="scope === 'all' && pageSum.retiredCount > 0">
+        <span class="page-sum-sep"></span>
+        <span class="page-sum-item">
+          已核销 {{ pageSum.retiredCount }} 个：今日 <b>${{ money(pageSum.retiredToday) }}</b> ·
+          累计 <b>${{ money(pageSum.retiredTotal) }}</b>
+        </span>
+        <span class="page-sum-item">
+          在用 {{ accounts.length - pageSum.retiredCount }} 个：今日 <b>${{ money(pageSum.activeToday) }}</b> ·
+          累计 <b>${{ money(pageSum.activeTotal) }}</b>
+        </span>
+      </template>
     </div>
 
     <div style="overflow-x:auto">
@@ -95,7 +105,9 @@
           <tr v-else-if="accounts.length === 0">
             <td colspan="14" class="table-empty">暂无数据</td>
           </tr>
-          <tr v-for="acc in accounts" :key="acc.email">
+          <!-- 已核销的行压暗一档：「全部」页签下它和在用账号混排，光看状态标签不够显眼 -->
+          <tr v-for="acc in accounts" :key="acc.email"
+              :class="{ 'retired-row': acc.identity_status === 'retired' }">
             <td><input type="checkbox" :checked="selected.has(acc.email)" @change="toggleSelect(acc.email, $event.target.checked)"></td>
             <td>{{ acc.email }}</td>
             <td style="font-family:monospace">{{ acc.password }}</td>
@@ -297,6 +309,31 @@ const selected = reactive(new Set())
 const importInput = ref(null)
 const importMsg = ref('')
 
+// 归档页签。scope 会随请求发给后端，由它决定 WHERE 条件与分页总数——
+// 纯前端切当前页的数据是错的：已归档账号散布在各页，那样「已归档」页签只会
+// 显示本页碰巧命中的那几个，而分页器还按全量总数在翻。
+// 「在用」只认 registered。它曾经是「除了已归档的全部」，于是注册失败、仅导入、
+// 已封禁的账号都被算成在用——那口径回答的是「没被手动归档过」，而不是「还能跑」。
+// 五个页签互不重叠且覆盖全部状态，后端 ACCOUNT_SCOPE_STATUSES 是同一份定义。
+const SCOPE_TABS = [
+  { key: 'all', label: '全部', hint: '不加身份状态过滤' },
+  { key: 'active', label: '在用', hint: '已注册且未归档，能参与任务' },
+  { key: 'pending', label: '待处理', hint: '仅导入 / 待处理，尚未跑出注册结果' },
+  { key: 'abnormal', label: '异常', hint: '注册失败、封禁、挂起、拒绝、GitHub 受限' },
+  { key: 'retired', label: '已归档', hint: '已核销，一律跳过所有任务' },
+]
+// 每个页签下可选的身份状态；空数组表示该页签只有一种状态，下拉没有意义
+const SCOPE_IDENTITY_OPTIONS = {
+  all: ['imported', 'registered', 'pending', 'failed', 'suspended', 'rejected', 'flagged', 'banned', 'retired'],
+  active: [],
+  pending: ['imported', 'pending'],
+  abnormal: ['failed', 'banned', 'suspended', 'rejected', 'flagged'],
+  retired: [],
+}
+const scope = ref('all')
+const scopeCounts = ref({ all: 0, active: 0, pending: 0, abnormal: 0, retired: 0 })
+const identityOptions = computed(() => SCOPE_IDENTITY_OPTIONS[scope.value] || [])
+
 // 充值状态
 const rechargingEmail = ref('')
 const rechargeConfirmVisible = ref(false)
@@ -386,7 +423,7 @@ function accStatusClass(s) {
 async function loadData() {
   loading.value = true
   try {
-    const params = { page: page.value, page_size: pageSize.value }
+    const params = { page: page.value, page_size: pageSize.value, scope: scope.value }
     if (filters.keyword) params.keyword = filters.keyword
     if (filters.identity_status) params.identity_status = filters.identity_status
     if (filters.platform_status) params.platform_status = filters.platform_status
@@ -396,11 +433,26 @@ async function loadData() {
     const result = await getAccounts(params)
     accounts.value = result.data || []
     total.value = result.total || 0
+    if (result.scope_counts) scopeCounts.value = result.scope_counts
   } catch (e) {
     console.error(e)
   } finally {
     loading.value = false
   }
+}
+
+// 切页签必须回到第 1 页：在「全部」的第 7 页切到只有 3 个账号的「已归档」，
+// 保留页码会落到空白页，看起来就像归档账号全丢了。
+//
+// 身份状态下拉也要清空：它的取值范围随页签变，留着上一个页签选的值（比如从「异常」
+// 带着 banned 切到「待处理」）会和页签条件求交集，得到一个空列表——而那时下拉已经
+// 不显示该选项了，用户在界面上找不到任何东西能解释这个空列表。
+function switchScope(key) {
+  if (scope.value === key) return
+  scope.value = key
+  filters.identity_status = ''
+  page.value = 1
+  loadData()
 }
 
 function resetFilter() {
@@ -502,7 +554,8 @@ async function handleArchive() {
 async function handleUnarchive(email) {
   if (!confirm(
     `确定要取消归档 ${email} 吗？\n\n` +
-    `它会恢复为「已注册」并重新参与任务。归档时环境已删除，\n` +
+    `它会恢复成归档前的身份状态（例如归档前是「已封禁」就仍是已封禁，\n` +
+    `不会因为取消归档就变成可用）。归档时环境已删除，若恢复后能参与任务，\n` +
     `首次运行需要重新登录 GitHub（会触发一次新设备邮箱验证）。`
   )) return
   try {
@@ -872,4 +925,48 @@ onUnmounted(stopBrowserPoll)
   border-radius: 6px;
   font-size: 12px;
 }
+
+.scope-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+}
+.scope-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 11px 16px;
+  background: none;
+  border: none;
+  /* 选中态靠这条底边表示，未选中给等宽透明边，避免切换时文字上下跳 1px */
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  color: var(--text-sub);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.scope-tab:hover { color: var(--text-main); }
+.scope-tab.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+}
+.scope-tab-count {
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: #f1f5f9;
+  color: var(--text-sub);
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.scope-tab.active .scope-tab-count {
+  background: #ffedd5;
+  color: var(--primary);
+}
+
+/* 已核销行压暗，仅在「全部」页签下起区分作用；「已归档」页签下整页都是它，不刺眼 */
+.retired-row { opacity: 0.65; }
 </style>
