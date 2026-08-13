@@ -29,4 +29,12 @@ data/*.db.bak-*
 
 # 游离空库 + 调试截图（不入库）
 /openrouter_auto.db
+/openrouter_auto.db-shm
+/openrouter_auto.db-wal
 data/screenshots/
+
+# 卡片底料。**整个目录都不入库**：里面是真实的卡号/CVC 与账号凭据。
+# 只忽略 *.xlsx 是不够的——同一批数据还以 .xls / .txt / .jpg 的形式散落在里面
+# （2026-08-13 提交前发现 10 个这样的文件正待加入，其中 2D.txt 首行就是
+# 「邮箱----密码----token」）。按目录整体排除，不给漏网的机会。
+底料/
