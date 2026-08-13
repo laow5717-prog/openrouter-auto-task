@@ -21,7 +21,7 @@ from src.payments.stripe_checkout import (
     _captcha_challenge_present, _threeds_challenge_present,
     _threeds_failure_modal, _close_threeds_modal, _count_top_layer_overlays,
     _threeds_challenge_lightbox, _close_challenge_lightbox, _THREEDS_CHALLENGE_GRACE_SEC,
-    _DECLINE_HINTS,
+    _DECLINE_HINTS, decline_line,
 )
 from src.platforms.opencode.login import login_and_open_own_go, _extract_wid
 from src.services import captcha as captcha_solver
@@ -240,14 +240,10 @@ def detect_subscribe_result(session, wid, monitor=None, timeout=200):
                 body = (fr.inner_text("body", timeout=1200) or "").lower()
             except Exception:
                 continue
-            for h in _DECLINE_HINTS:
-                idx = body.find(h)
-                if idx >= 0:
-                    seg = body[max(0, idx - 60):idx + 90]
-                    if any(w in seg for w in ("hcaptcha", "sitekey", "site key",
-                                              "challenge", "captcha")):
-                        continue   # 人机验证相关文案，非卡拒付，跳过
-                    return body[max(0, idx - 30):idx + 60].strip()
+            line = decline_line(body, exclude=("hcaptcha", "sitekey", "site key",
+                                               "challenge", "captcha"))
+            if line:
+                return line
         return None
 
     while time.time() < deadline:

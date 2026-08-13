@@ -72,6 +72,40 @@ _DECLINE_HINTS = [
     "error processing your request", "processing your request",
 ]
 
+# 拒付原因最长留多少字符。Stripe 的原因文案都是一句话，超出的多半是整帧被渲染成了
+# 一行（无换行），截断即可，真正的原因在句首。
+_DECLINE_LINE_MAX = 200
+
+
+def decline_line(body, hints=None, exclude=()):
+    """从帧文本里取出**含拒付关键词的那一行**，找不到返回空串。
+
+    exclude 里的词命中则跳过该行继续找下一行——hCaptcha 的内部状态文案
+    （challenge-expired / sitekey incorrect）会撞上 expired/incorrect 这些卡拒付
+    关键词，那是人机验证状态、不是卡的问题。按**行**判断比按字符窗口判断准：
+    窗口会把邻行的词也算进来，可能误杀真正的拒付行。
+
+    此前各调用点是按字符偏移截 `body[idx-30:idx+60]`。而 body 是整帧的 inner_text，
+    多行——支付方式列表、表单标签、按钮文字全在里面，于是截出来的片段两头各挂半行
+    无关内容，真正的原因被夹在中间：
+
+        club, unionpay                                      ← 上一行「支付方式列表」的尾巴
+        your card was declined. please contact your card issuer.   ← 真正的原因
+        cardholder name                                     ← 下一行的表单标签
+        b
+
+    后果不是充值成功率，而是**看不清问题**：日志和 UI 上第一眼全是「club, unionpay」
+    这类噪音，事后按原因归类也归不准（2026-08-12 统计时 26.9% 归不了类，就是被
+    两头的半行拖的）。按行取则每条恰好是一句完整的 Stripe 原因文案。
+    """
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if not line or (exclude and any(w in line for w in exclude)):
+            continue
+        if any(h in line for h in (hints or _DECLINE_HINTS)):
+            return line[:_DECLINE_LINE_MAX]
+    return ""
+
 # hCaptcha 图像挑战真正出现时，挑战帧内会渲染的提示文案（题面 / 题格）。
 # 只作二次确认用，主判据是帧 URL 的 #frame=challenge——见 _captcha_challenge_present。
 #

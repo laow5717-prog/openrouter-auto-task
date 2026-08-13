@@ -22,7 +22,7 @@ from src.payments.stripe_checkout import (
     _captcha_challenge_present, _captcha_frames_debug,
     _threeds_challenge_present, _count_top_layer_overlays, _threeds_failure_modal,
     _close_threeds_modal, _threeds_challenge_lightbox, _close_challenge_lightbox,
-    _DECLINE_HINTS, _THREEDS_CHALLENGE_GRACE_SEC,
+    _DECLINE_HINTS, _THREEDS_CHALLENGE_GRACE_SEC, decline_line,
 )
 
 WORKSPACE_RE = re.compile(r'/workspace/(wrk_[A-Za-z0-9]+)')
@@ -361,14 +361,9 @@ def detect_payment_result(session, wid, balance_before, monitor, timeout=120):
             # unable to authenticate your payment method）
             try:
                 body = (stripe_fr.inner_text("body", timeout=1500) or "").lower()
-                if any(h in body for h in _DECLINE_HINTS):
-                    snippet = ""
-                    for h in _DECLINE_HINTS:
-                        idx = body.find(h)
-                        if idx >= 0:
-                            snippet = body[max(0, idx-30):idx+60].strip()
-                            break
-                    return {"outcome": "failed", "detail": f"拒付/认证失败: {snippet[:120]}"}
+                snippet = decline_line(body)
+                if snippet:
+                    return {"outcome": "failed", "detail": f"拒付/认证失败: {snippet}"}
             except Exception:
                 pass
             # 3DS 交互挑战 Lightbox（challengeFrame）：需持卡人在发卡行侧验证，自动化下无人
