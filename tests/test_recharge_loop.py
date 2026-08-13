@@ -230,6 +230,30 @@ def test_attempt_cap_stops_the_loop(models):
     assert '上限' in err
 
 
+def test_zero_attempt_cap_means_unlimited(models):
+    """max_card_attempts=0 是「不限制」的哨兵值：卡池有多少张就试多少张。
+
+    2026-08-12 按要求把 opencode 从 8 改为不限制。这条守住 0 不会被当成
+    「一张都不试」——`attempts >= 0` 恒真，少一个 `> 0` 判断就是整条充值线停摆。
+    """
+    stub = StubAdapter(outcomes=['failed'] * 20, max_card_attempts=0)
+    ok, _err, _r, _l4, outcome = _run(stub, models, _cards(12))
+
+    assert (ok, outcome) == (False, 'failed')
+    assert len(_topups(stub)) == 12, '不限制时应把 12 张卡全试完'
+
+
+def test_zero_attempt_cap_still_honours_balance_cap(models):
+    """不限制试卡数**不等于**不限制充值额：balance_cap 是剩下的唯一一道上限。"""
+    stub = StubAdapter(outcomes=['success'] * 10, balances=[150.0] * 10,
+                       max_card_attempts=0)
+    cfg = RechargeConfig(balance_cap=100.0, fail_cooldown_hours=0)
+    ok, _err, _r, _l4, outcome = _run(stub, models, _cards(10), recharge_cfg=cfg)
+
+    assert (ok, outcome) == (True, 'topup')
+    assert len(_topups(stub)) == 1, '余额已超上限却还在充'
+
+
 def test_balance_cap_stops_the_loop(models):
     """AC9：适配器报得出余额时，余额达上限即停。"""
     stub = StubAdapter(outcomes=['success'] * 5, balances=[150.0] * 5)

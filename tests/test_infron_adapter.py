@@ -35,8 +35,16 @@ def test_infron_has_no_tenant_id():
 
 
 def test_infron_is_more_conservative_than_opencode():
-    """新平台风控未知，单次试卡上限应比 opencode 保守。"""
-    assert platforms.get('infron').max_card_attempts < platforms.get('opencode').max_card_attempts
+    """新平台风控未知，单次试卡上限应比 opencode 保守。
+
+    比较要按「实际有多严」而不是数值大小：0 是**不限制**的哨兵值，直接比大小的话
+    opencode 从 8 改成 0（2026-08-12 不限制）会让 `5 < 0` 变成假，测试红掉，而
+    infron 其实比以往更保守了。
+    """
+    infron = platforms.get('infron').max_card_attempts
+    opencode = platforms.get('opencode').max_card_attempts
+    assert infron > 0, 'infron 不该放开试卡上限——新平台风控未知'
+    assert opencode <= 0 or infron < opencode
 
 
 class _DeadSession:

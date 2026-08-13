@@ -137,7 +137,7 @@ class PlatformAdapter(Protocol):
     capabilities: frozenset
 
     # 平台参数。原先散落在 OPENCODE_* 环境变量里，各平台的风控阈值本就不同。
-    max_card_attempts: int        # 单账号单次最多试几张卡（防 velocity 风控）
+    max_card_attempts: int        # 单账号单次最多试几张卡（防 velocity 风控）；0 = 不限制
     recharge_skip_balance: float  # 登录后实时余额 ≥ 此值即跳过充值并归档
     default_topup_amount: float
 

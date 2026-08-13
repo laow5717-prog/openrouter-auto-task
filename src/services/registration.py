@@ -73,7 +73,8 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
     早先的实现是「付成一张卡即 return」，一个账号一轮只充一笔。现在成功后继续充，直到
     下列任一条件成立才收手换账号：
 
-      - 达到 adapter.max_card_attempts（试卡上限，防发卡行 velocity 风控）
+      - 达到 adapter.max_card_attempts（试卡上限，防发卡行 velocity 风控；**0 = 不限制**，
+        opencode 现在就是 0）
       - 余额达到 recharge_cfg.balance_cap（单账号余额上限）
       - 遇 needs_captcha（账号级拦截，立即停手）
       - payment_cards 用尽
@@ -85,6 +86,10 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
     粘卡把「卡用完了」这个天然刹车拿掉了，所以上面那份清单里 max_card_attempts 与
     balance_cap 成了仅有的两道上限；两者都在内层循环里逐笔复查，粘卡绕不过去。
+
+    ⚠️ max_card_attempts 设成 0（不限制）时，那两道上限**只剩 balance_cap 一道**。
+    对粘住的好卡没有影响——它照样充到 balance_cap 就换账号；影响的是坏卡路径：
+    一直换卡试下去，直到卡池耗尽或遇 hCaptcha，单账号单次的拒付次数不再有上限。
 
     归档预检与循环上限现在是**同一个数** recharge_cfg.balance_cap。早先它们是两个：
     归档用 adapter.recharge_skip_balance（20）、循环用 balance_cap（200），于是一个
@@ -268,9 +273,12 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                     responses, last4, "archived")
 
         # 单次充值最多尝试的卡数上限：卡池可能上千张，若不设限，一批坏卡会在同一
-        # 租户上连续制造大量拒付，极易触发支付方的反欺诈 velocity 风控（拒付率过高
+        # 租户上连续制造大量拒付，可能触发支付方的反欺诈 velocity 风控（拒付率过高
         # → 临时封锁租户或要求人工验证）。达到上限即停手，保护账号可用性，剩余卡留待
         # 下次。阈值由各平台自己定——风控松紧本就因平台而异。
+        #
+        # **0 或负数 = 不限制**（opencode 当前如此），此时这道闸完全让开，收手只靠
+        # 余额达 balance_cap / 卡池耗尽 / hCaptcha / 用户停止这几条。
         max_attempts = adapter.max_card_attempts
 
         errs = []
@@ -292,7 +300,7 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
         for idx, card in enumerate(cards):
             if should_stop and should_stop():
                 raise InterruptedError("用户请求停止")
-            if attempts >= max_attempts:
+            if max_attempts > 0 and attempts >= max_attempts:
                 errs.append(f"已达单次最多尝试 {max_attempts} 张卡上限，"
                             f"停止以避免触发风控（剩余 {len(cards) - idx} 张未试）")
                 stop_note = errs[-1]

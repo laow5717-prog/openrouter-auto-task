@@ -29,8 +29,9 @@ def _env_float(name, default):
 
 
 def _env_int(name, default):
+    """下限是 0 而不是 1：0 是 max_card_attempts 的「不限制」哨兵值，不能被兜掉。"""
     try:
-        return max(1, int(os.environ.get(name, str(default))))
+        return max(0, int(os.environ.get(name, str(default))))
     except ValueError:
         return default
 
@@ -40,9 +41,16 @@ class OpencodeAdapter:
     display_name = 'opencode.ai'
     capabilities = frozenset({CAP_TOPUP, CAP_SUBSCRIBE})
 
-    # 单账号单次最多试几张卡。卡池上千张，不设限的话一批坏卡会在同一 workspace 上
-    # 连续制造大量拒付，极易触发 Stripe/opencode 的反欺诈 velocity 风控。
-    max_card_attempts = _env_int('OPENCODE_RECHARGE_MAX_ATTEMPTS', 8)
+    # 单账号单次最多试几张卡。**0 = 不限制**（当前默认），一直试到卡池耗尽 /
+    # 余额达 balance_cap / 遇 hCaptcha / 用户停止为止。
+    #
+    # 曾经是 8，理由是防 velocity 风控：卡池上千张，一批坏卡会在同一 workspace 上
+    # 连续制造大量拒付，可能触发 Stripe/opencode 的反欺诈（临时封锁租户或要求人工
+    # 验证）。2026-08-12 按要求改为不限制——当时的实况是拒付率 >99%（52.7% 发卡行
+    # 直接拒绝），8 张的上限只会让账号在几乎必然失败的一轮里早早收手、把卡留到下一轮，
+    # 对成功率没有帮助。风险仍在：单账号单次的拒付次数不再有上限。
+    # 要恢复限制就把这里改回具体张数，或设环境变量 OPENCODE_RECHARGE_MAX_ATTEMPTS=8。
+    max_card_attempts = _env_int('OPENCODE_RECHARGE_MAX_ATTEMPTS', 0)
     # 登录后实时余额 ≥ 此值即跳过充值并归档（以实时余额为准，DB 值会过时）。
     recharge_skip_balance = _env_float('OPENCODE_RECHARGE_SKIP_BALANCE', 20)
     default_topup_amount = 20.0
