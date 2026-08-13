@@ -243,6 +243,30 @@ def test_zero_attempt_cap_means_unlimited(models):
     assert len(_topups(stub)) == 12, '不限制时应把 12 张卡全试完'
 
 
+def test_zero_attempt_cap_keeps_topping_up_after_a_success(models):
+    """回归 2026-08-14：不限制试卡数时，**成功之后**也必须接着充。
+
+    上一条守的是全失败路径（走外层换卡循环，那里的守卫带 `max_attempts > 0`）。
+    粘卡续充前还有第二道同名守卫在内层，它当时漏了 `> 0`，于是 `1 >= 0` 恒真——
+    第一笔一成功就 break 换账号。现象是每个账号只充一笔就收手，balance_cap 形同
+    虚设（生产上 cap=200，而 opencode 首充固定 $20，账号停在 $20）。
+
+    这个组合此前没有用例覆盖：`test_zero_attempt_cap_means_unlimited` 全是失败、
+    到不了内层；`test_zero_attempt_cap_still_honours_balance_cap` 第一笔余额就超
+    cap，在更靠前的上限判据处已经 break，同样到不了那道守卫。必须三者同时成立
+    才能复现：max_attempts=0 + 付款成功 + 余额尚未达 cap。
+    """
+    stub = StubAdapter(outcomes=['success'] * 10,
+                       balances=[20.0, 40.0, 60.0, 80.0, 100.0],
+                       max_card_attempts=0)
+    cfg = RechargeConfig(amount_min=20, amount_max=20, balance_cap=100.0,
+                         fail_cooldown_hours=0)
+    ok, _err, _r, _l4, outcome = _run(stub, models, _cards(1), recharge_cfg=cfg)
+
+    assert (ok, outcome) == (True, 'topup')
+    assert len(_topups(stub)) == 5, '应粘着这张卡一路充到 balance_cap，而不是一笔就走'
+
+
 def test_zero_attempt_cap_still_honours_balance_cap(models):
     """不限制试卡数**不等于**不限制充值额：balance_cap 是剩下的唯一一道上限。"""
     stub = StubAdapter(outcomes=['success'] * 10, balances=[150.0] * 10,

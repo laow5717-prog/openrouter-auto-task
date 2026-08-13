@@ -427,9 +427,15 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                         # 粘卡续刷前重跑两道外层守卫。少了它们，一张一直过款的好卡会把
                         # max_card_attempts 和用户的停止请求一起架空——外层的检查这一轮
                         # 已经跑过了，而我们根本不打算回到外层。
+                        #
+                        # `max_attempts > 0` 一个都不能少：0 是「不限制」的哨兵值
+                        # （opencode 当前就是 0），漏掉它 `1 >= 0` 恒真——第一笔一成功
+                        # 就 break 换账号，每个账号只充一笔，balance_cap 形同虚设。
+                        # 外层那道（见上面 max_attempts 定义处）一直是对的，唯独这道漏了，
+                        # 于是全失败路径正常、一成功就停摆，账号停在首充的 $20。
                         if should_stop and should_stop():
                             raise InterruptedError("用户请求停止")
-                        if attempts >= max_attempts:
+                        if max_attempts > 0 and attempts >= max_attempts:
                             errs.append(f"已达单次最多尝试 {max_attempts} 张卡上限，"
                                         f"停止以避免触发风控"
                                         f"（剩余 {len(cards) - idx - 1} 张未试）")
