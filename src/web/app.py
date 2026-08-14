@@ -41,8 +41,12 @@ from src.browser.github_signup import (
 
 # 注册页根本没打开时的 outcome。这些都是 GitHub 侧的临时状况——反滥用按出口 IP
 # 拦截、GitHub 自己 503、或者返回空白页——账号从未被 GitHub 审视过，更谈不上被拒。
-# 判 failed 会让它退出 imported 池、要人工「重置为待注册」才回得来，与 2026-08-03
-# 配额耗尽误废 30 个账号是同一类错误。一律按 pending 留待下一轮（换代理后多半能过）。
+#
+# 名字里的 RETRYABLE 现在只描述**性质**（换个代理重跑多半能过），不再意味着自动重试：
+# 这类结果与其它注册未完成一样标 identity_status='failed'，重跑要人工在账号列表点
+# 「重置为待注册」。改判理由见 _register_one_account 的 docstring。
+# 仍然单列这个集合，是因为它的失败原因与「GitHub 拒了这个账号」性质不同，日志与
+# 人工复核时要分得开。
 RETRYABLE_SIGNUP_OUTCOMES = frozenset({
     BLOCK_RESTRICTED, BLOCK_UNAVAILABLE, BLOCK_BLANK, 'signup_page_unavailable',
 })
@@ -519,6 +523,34 @@ class AppState:
                 pass   # 已经关掉的会报错，属正常
         if closed:
             self.add_log(f"[AdsPower] 收尾关闭了 {closed} 个浏览器环境")
+
+    def _release_adspower_profile(self, email, reason=''):
+        """当场删掉某账号的 AdsPower 环境（远端 + 本地映射），返回是否真的删掉了。
+
+        用在「注册没跑成」之后。那种环境里空无一物——GitHub 授权态是注册成功才有的
+        东西，而环境的全部价值就是它（见 models/adspower_profile.py 文件头）。留着
+        只是白占 12 格硬配额里的一格，直到下一次有人撞满配额、reclaim 才顺手删掉；
+        在那之前每个新账号都得先在「配额已满」上排队。跑完就删，配额立刻回池。
+
+        **不做 _is_busy 检查**（pool.release 本身也不做）：调用点在 signup_one 返回之后，
+        那时该账号的浏览器会话已经关了，账号虽仍被 worker claim 着，环境却确实闲着。
+
+        异常一律吞掉：AdsPower 客户端没开、环境已被人工删掉等等都不该让一次注册结果
+        写不进去——账号状态在调用本方法之前就已落库，这里只是腾配额。
+        """
+        if not self.adspower_enabled:
+            return False
+        try:
+            _, pool = self._ensure_adspower()
+            if pool is None:
+                return False
+            if pool.release(email):
+                self._hooked_print(
+                    f"[AdsPower] 已释放 {email} 的环境（{reason or '注册未完成'}）")
+                return True
+        except Exception as e:
+            self._hooked_print(f"[AdsPower] 释放 {email} 的环境失败: {str(e)[:150]}")
+        return False
 
     # ---------- worker 管理 ----------
 
@@ -1435,7 +1467,7 @@ class AppState:
                             if rr == "registered":
                                 stats['registered'] += 1
                             else:
-                                done.add(email)   # pending/suspended/failed，已离开 imported
+                                done.add(email)   # failed/suspended，已离开 imported
                     else:  # recharge
                         self.set_action(worker, f"充值账号 {email}")
                         self._hooked_print(f"\n充值账号: {email} {proxy_note}")
@@ -1593,10 +1625,20 @@ class AppState:
 
         返回 (result, detail)，result ∈ {"registered","skipped","failed"}：
           registered — signup_complete：identity_status='registered' 并存 GitHub 密码
-          skipped    — 无 hotmail 数据 / 碰 Arkose（identity_status='pending'）/ 注册即挂起（'suspended'）
-          failed     — 其它注册未完成（identity_status='failed'）
+          skipped    — 无收码数据（没起过浏览器，账号状态不动）
+          failed     — 注册没跑成：碰 Arkose / 注册页打不开 / 其它未完成
+                       （identity_status='failed'）；注册即挂起写 'suspended'
 
         写的全是**身份层**状态：GitHub 注册结果对所有平台一致，与目标平台无关。
+
+        ⚠️ 这里曾把「碰 Arkose」和「注册页打不开」写成 identity_status='pending'，
+        指望下一轮换个代理重试。代价是账号列表里堆出一批语义含糊的「待处理」——
+        它和「仅导入、还没轮到」在同一个页签里混着，看不出哪些是跑过一遍没成的，
+        而实际重试成功率并不足以抵消这份含糊。现按用户口径统一：注册没跑成就是失败，
+        账号进「异常」页签，要重跑就在账号列表点「重置为待注册」显式退回 imported。
+
+        跑完只要不是 registered 就**当场释放 AdsPower 环境**（见 _release_adspower_profile）：
+        没注册成的环境里没有任何 GitHub 授权态，留着纯占配额。
 
         供订阅任务（_subscribe_one_account）与充值任务（run_daily_pipeline 补号）共用，
         保证两条流水线注册行为一致。跑在 worker 线程；account 排他由外层 claim 保证。
@@ -1604,9 +1646,8 @@ class AppState:
 
         AdsPowerError（配额满 / 客户端没开）**向上抛出、不改账号状态**：浏览器都没起来，
         谈不上「这个账号注册失败」。若在此标 failed，账号会退出 imported 池永不重试——
-        2026-08-03 一次配额耗尽就这样误废了 30 个刚导入的账号。
-
-        GitHub 侧的临时状况（反滥用拦截 / 503 / 空白页）同理，见 RETRYABLE_SIGNUP_OUTCOMES。
+        2026-08-03 一次配额耗尽就这样误废了 30 个刚导入的账号。这条红线仍然有效：
+        它拦的是「浏览器没起来」，与上面「注册跑了没成」是两回事。
         """
         models = self.models
         worker = worker or self.primary_worker
@@ -1624,22 +1665,25 @@ class AppState:
                        browser_factory=self.browser_factory())
         oc = r.get('outcome')
         if oc == 'reached_captcha':
-            models['account'].update_identity_status(email, 'pending')
-            return "skipped", "碰 Arkose，跳过（全自动模式不等人工）"
-        # 注册页压根没打开：GitHub 拦了、挂了、或返回空白页。账号本身没被 GitHub
-        # 拒绝过，标 failed 会把它踢出 imported 池、要人工点「重置为待注册」才回得来。
-        # 与上面 Arkose 同样按 pending 处理——下一轮换个代理很可能就过了。
+            models['account'].update_identity_status(email, 'failed')
+            self._release_adspower_profile(email, '碰 Arkose 注册未完成')
+            return "failed", "碰 Arkose，注册未完成（全自动模式不等人工）"
+        # 注册页压根没打开：GitHub 拦了、挂了、或返回空白页。同样计注册失败——
+        # 账号进「异常」页签，人工确认后可批量「重置为待注册」换代理重跑。
         if oc in RETRYABLE_SIGNUP_OUTCOMES:
-            models['account'].update_identity_status(email, 'pending')
-            return "skipped", r.get('reason') or f"GitHub 注册页不可用: {oc}"
+            models['account'].update_identity_status(email, 'failed')
+            self._release_adspower_profile(email, f'注册页不可用: {oc}')
+            return "failed", r.get('reason') or f"GitHub 注册页不可用: {oc}"
         if oc == 'account_suspended':
             models['account'].upsert(email, login_password=r.get('github_password'),
                                      email_password=hacc.password,
                                      identity_status='suspended',
                                      email_verify_link=hacc.link)
+            self._release_adspower_profile(email, '注册即挂起')
             return "skipped", "注册即挂起"
         if oc != 'signup_complete':
             models['account'].update_identity_status(email, 'failed')
+            self._release_adspower_profile(email, f'注册失败: {oc}')
             return "failed", f"注册失败: {oc}"
         models['account'].upsert(email, login_password=r.get('github_password'),
                                  email_password=hacc.password,
