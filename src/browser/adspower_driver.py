@@ -28,7 +28,8 @@ from src.browser.driver import (
 from src.models.adspower_profile import RECHARGED_RANK
 from src.services.adspower import (
     AdsPowerQuotaExceeded, AdsPowerProfileMissing, AdsPowerError,
-    AdsPowerDailyLimitExceeded, DEFAULT_DAILY_LIMIT_RECOVERY_SEC,
+    AdsPowerDailyLimitExceeded, AdsPowerProfileLocked,
+    DEFAULT_DAILY_LIMIT_RECOVERY_SEC,
 )
 
 
@@ -58,6 +59,13 @@ _TAKEOVER_SETTLE_SEC = 2.0
 
 # 单次回收删几个环境。删多了浪费登录态，删少了并发下不够分。
 DEFAULT_RECLAIM_BATCH = 3
+
+# 撞上占用锁（AdsPowerProfileLocked）后等多久重试。锁有两种成因：
+#   a) 刚关掉的浏览器，AdsPower 云端状态还没翻转 —— 等几秒就好；
+#   b) 云端残留的占用记录（进程被强杀、或同账号在别处开着）—— 等多久都没用。
+# 取 5 秒是给 (a) 留够时间：_stop_all 里那 1.5 秒是「本机 stop 后状态翻转」的量级，
+# 而云端同步明显更慢——2026-08-16 现场有一批 delete 就是卡在 1.5 秒不够上。
+_LOCK_RETRY_SEC = 5.0
 
 # 环境指纹允许的操作系统。**只能是 Windows 或 macOS**：本项目所有页面选择器都按桌面版
 # 编写，随机到 Android/iOS 会拿到移动版 GitHub / Stripe 页面而整条流程失败。
@@ -304,7 +312,7 @@ class AdsPowerProfilePool:
             emails = [r["email"] for r in picked]
             self._stop_all(ids)
             try:
-                self.client.delete_profiles(ids)
+                self._delete_with_retry(ids)
             except AdsPowerError as e:
                 self._log(f"[AdsPower] 删除环境失败: {str(e)[:150]}")
                 return []
@@ -342,8 +350,29 @@ class AdsPowerProfilePool:
         if stopped:
             time.sleep(1.5)
 
+    def _delete_with_retry(self, profile_ids):
+        """删除这些环境；撞占用锁时等一会儿再 stop + delete 一次。
+
+        为什么必须重试：_stop_all 停完只等 1.5 秒，那是「本机 stop 后状态翻转」的
+        量级，云端的占用记录同步更慢。2026-08-16 现场，「注册失败当场释放环境」这条
+        新路径紧接在浏览器关闭之后，一批 delete 就撞上
+        `[] is being used by other users and cannot be deleted` —— 环境明明已经没人用了，
+        只是云端还没反应过来，而删除失败意味着那一格配额要等下一次 reclaim 才回得来。
+
+        重试仍失败就抛出去，由调用方决定怎么记账。**绝不在删除失败时清本地映射**
+        （那条红线在三个调用点都写着）：先清本地再删远端，一旦失败就留下查不到映射、
+        也没人再删的孤儿环境，那一格配额被永久吃掉。
+        """
+        try:
+            self.client.delete_profiles(profile_ids)
+        except AdsPowerProfileLocked:
+            self._log(f"[AdsPower] 环境仍被占用，{_LOCK_RETRY_SEC:.0f} 秒后重试删除…")
+            time.sleep(_LOCK_RETRY_SEC)
+            self._stop_all(profile_ids)
+            self.client.delete_profiles(profile_ids)
+
     def drop_mapping(self, email):
-        """删本地映射（用于「远端环境已不存在」的自愈），不碰远端。"""
+        """删本地映射（用于「远端环境已不存在」「占用锁解不开」的自愈），不碰远端。"""
         with self._lock:
             self.profiles.delete_by_email(email)
 
@@ -355,7 +384,7 @@ class AdsPowerProfilePool:
                 return False
             self._stop_all([row["profile_id"]])
             try:
-                self.client.delete_profiles([row["profile_id"]])
+                self._delete_with_retry([row["profile_id"]])
             except AdsPowerError as e:
                 self._log(f"[AdsPower] 删除 {email} 的环境失败: {str(e)[:150]}")
                 return False
@@ -400,7 +429,7 @@ class AdsPowerProfilePool:
 
             self._stop_all([pid for _, pid in targets])
             try:
-                self.client.delete_profiles([pid for _, pid in targets])
+                self._delete_with_retry([pid for _, pid in targets])
             except AdsPowerError as e:
                 self._log(f"[AdsPower] 批量删除环境失败: {str(e)[:150]}")
                 out["failed"] = [email for email, _ in targets]
@@ -459,6 +488,30 @@ def _resize_window(context, page, size=None):
         return False
 
 
+def _start_unlocking(client, pool, email, profile_id, args, headless):
+    """start 环境；撞占用锁时试着解一次，仍锁则把 AdsPowerProfileLocked 抛出去。
+
+    解锁动作 = stop + 等 _LOCK_RETRY_SEC + 再 start。这只对「刚关掉、云端状态还没
+    翻转」那一类锁有效，对云端残留的占用记录无效（本机 stop 会直接回 `Profile is
+    not open`，我们照样吞掉继续等——那一步本来就是尽力而为）。
+
+    先试解锁而不是直接弃环境，是因为弃掉的代价是整份登录态：GitHub 授权态没了，
+    下次跑要完整重登再过一次新设备邮箱验证，数分钟起步。为一次可能只是状态没翻转的
+    锁付这个代价不值。
+    """
+    try:
+        return client.start_profile(profile_id, launch_args=args, headless=headless)
+    except AdsPowerProfileLocked as e:
+        pool._log(f"[AdsPower] {email} 的环境 {profile_id} 被占用锁挡住"
+                  f"（{str(e)[:120]}），尝试解除…")
+        try:
+            client.stop_profile(profile_id)
+        except AdsPowerError:
+            pass       # 本机认为它没开着——正是云端残留锁的典型表现，继续等着重试
+        time.sleep(_LOCK_RETRY_SEC)
+        return client.start_profile(profile_id, launch_args=args, headless=headless)
+
+
 def create_driver_adspower(email, pool, client, launch_args=None, headless=False):
     """启动/接管该账号的 AdsPower 环境，返回与本地栈同构的 BrowserSession。
 
@@ -466,9 +519,11 @@ def create_driver_adspower(email, pool, client, launch_args=None, headless=False
     我们这一侧只需要 add_init_script 能正常前置注入——那是 Stripe enterprise hCaptcha
     的 token 交付前提，而 Patchright 恰好阉割了它（见 driver.create_driver_vanilla 注释）。
 
-    映射失效自愈：本地记着 profile_id 但 AdsPower 侧已被手工删掉时，start 会报
-    "环境不存在"。此时删本地映射重建一次，而不是把它当致命错误——用户在客户端里
-    整理环境是完全正常的操作。
+    映射失效自愈，两种：
+      1. 本地记着 profile_id 但 AdsPower 侧已被手工删掉 → start 报「环境不存在」。
+         删本地映射重建一次，而不是把它当致命错误——用户在客户端里整理环境是
+         完全正常的操作。
+      2. 环境被占用锁挡住（AdsPowerProfileLocked）→ 见 _start_unlocking。
     """
     from playwright.sync_api import sync_playwright as _vanilla_sync_playwright
 
@@ -476,10 +531,21 @@ def create_driver_adspower(email, pool, client, launch_args=None, headless=False
 
     profile_id, proxy_id, created = pool.ensure_profile(email)
     try:
-        ws, debug_port = client.start_profile(profile_id, launch_args=args, headless=headless)
+        ws, debug_port = _start_unlocking(client, pool, email, profile_id, args, headless)
     except AdsPowerProfileMissing:
         pool.drop_mapping(email)
         pool._log(f"[AdsPower] 环境 {profile_id} 在 AdsPower 侧已不存在，重新创建")
+        profile_id, proxy_id, created = pool.ensure_profile(email)
+        ws, debug_port = client.start_profile(profile_id, launch_args=args, headless=headless)
+    except AdsPowerProfileLocked:
+        # 解不开的锁：弃用这个环境，换一个新的重来。代价是登录态没了（下次跑要完整
+        # 重登 + 过一次新设备邮箱验证），但比每一轮都栽在同一个环境上强——那种情况下
+        # 这个账号等于永久出局，而日志里只有一句「本次未付成」，看不出它再也回不来。
+        pool.drop_mapping(email)
+        pool._log(
+            f"[AdsPower] ⚠️ 环境 {profile_id} 被占用锁挡住且无法解除，已弃用并新建环境；"
+            f"登录态丢失（{email} 下次需重登）。**该环境仍占着一格配额**，"
+            f"请去 AdsPower 客户端手动关闭并删除编号对应 {profile_id} 的环境")
         profile_id, proxy_id, created = pool.ensure_profile(email)
         ws, debug_port = client.start_profile(profile_id, launch_args=args, headless=headless)
 

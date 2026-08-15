@@ -114,6 +114,27 @@ class AdsPowerProfileMissing(AdsPowerError):
     """
 
 
+class AdsPowerProfileLocked(AdsPowerError):
+    """环境被「占用锁」挡住：AdsPower 认为它正在别处打开着。
+
+    同一把锁挡两种操作，文案略有不同，但都含 `is being used by`：
+      start  → `[k1fkeo7r] is being used by [x@gmail.com] and is not allowed to open`
+      delete → `[] is being used by other users and cannot be deleted`
+
+    锁在 **AdsPower 云端**，本机 local API 解不掉：2026-08-16 的现场里
+    `browser-profile/active` 报 status≠Active、`stop` 报 `Profile is not open`，
+    而 `start` 照样被拒。成因是同账号在另一处登录着并开着该环境，或上一次进程被
+    强杀（SIGTERM/崩溃）后云端没收到关闭上报，占用记录残留。
+
+    单独归类是因为处置方式与普通 AdsPowerError 相反：普通错「本轮跳过、下轮重试」
+    是对的，而占用锁不会自己好——本地映射一直指向同一个 profile，于是每一轮都撞
+    同一堵墙。2026-08-16 的现场：8 个 worker、2 个可充账号，其中一个账号每轮都栽在
+    这里，实际只有 1 个浏览器在跑，日志上却只有一句「本次未付成」。
+    调用方应做自愈（重试一次 → 仍锁则弃用该环境重建），见
+    browser/adspower_driver.py 的 create_driver_adspower 与 _delete_with_retry。
+    """
+
+
 def _classify(msg):
     """把 AdsPower 的错误文案映射到异常类。文案匹配是唯一可用的信号——
     接口对所有业务错误一律返回 code=-1，没有细分错误码。"""
@@ -132,6 +153,11 @@ def _classify(msg):
         return AdsPowerUnavailable
     if "not exist" in low or "not found" in low or "不存在" in (msg or ""):
         return AdsPowerProfileMissing
+    # 占用锁。判在 ProfileMissing 之后：两者文案不重叠，但顺序写死更省得以后有人
+    # 往上面加宽泛的关键词时把这条吃掉。只认 `is being used by` 这一段——start 与
+    # delete 的后半句不同（`not allowed to open` / `cannot be deleted`），前半句才是共有的。
+    if "is being used by" in low:
+        return AdsPowerProfileLocked
     return AdsPowerError
 
 

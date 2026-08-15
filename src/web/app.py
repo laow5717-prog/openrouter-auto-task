@@ -2138,3 +2138,26 @@ def create_app(db_path=None):
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
     return app
+
+
+def shutdown_runtime(app):
+    """进程退出前的收尾：停掉各平台本次启动过的 AdsPower 环境。
+
+    没有这一步的代价不是「浏览器窗口没关」那么轻：AdsPower 在**云端**记着环境的
+    占用状态，进程被强杀时那条记录留在「打开中」，下一次 start 同一个环境直接被拒
+    （`is being used by ... and is not allowed to open`，见 AdsPowerProfileLocked）。
+    而被锁住的恰恰是跑过账号的环境——里面存着那个账号的 GitHub 登录态。
+    2026-08-16 就这么废掉一个可充账号的环境：8 个 worker、2 个可充账号，其中一个
+    每轮都栽在锁上，实际只有 1 个浏览器在跑。
+
+    先置 stop_requested 再关环境：worker 线程全是 daemon，进程不会等它们，但置了
+    这个标志能让正在检查点上的 worker 主动收手，少一次「浏览器凭空消失」的报错。
+
+    幂等且异常不外溢——它跑在信号处理器里，抛出去只会让退出路径更难看。
+    """
+    for slug, ctx in (app.config.get('RUN_CONTEXTS') or {}).items():
+        try:
+            ctx.stop_requested = True
+            ctx._stop_started_adspower()
+        except Exception as e:
+            print(f"[退出] 收尾 {slug} 的 AdsPower 环境失败: {str(e)[:150]}")
