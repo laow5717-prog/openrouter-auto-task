@@ -164,20 +164,40 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
         充值成功 / 余额达标归档后调用——此时会话必在登录态，顺手抓 key 免得事后再
         为每个账号单独开一次浏览器补抓。适配器未实现 fetch_apikey 时静默跳过。
+
+        ⚠️ best-effort **不等于**静默。这里原来是一个光秃秃的 `except Exception: pass`，
+        连「抓到了没有」都不说一声，于是 2026-08-16 出现「账号充值成功、apikey 列却是空」
+        时，日志里一个字都没有——分不清是没执行、导航失败、页面没渲染出来，还是写库失败。
+        现在四种结局各记一条：跳过 / 异常 / 没抓到 / 抓到并落库。日志走 print（已被
+        AppState._patch_prints 劫持进平台日志流），不占 monitor 的截图通道。
         """
         if not (platform_account_model and wid):
+            print(f"  ⚠️ {email} 跳过抓 API key（缺 tenant_id 或未接账号模型）")
             return
         fetch = getattr(adapter, "fetch_apikey", None)
         if not callable(fetch):
+            return          # 平台没这个能力，属于正常，不值一条日志
+        # 已知拿不到明文的平台（infron：key 页只显示脱敏串）也不值一条日志——否则
+        # 下面那句「没抓到」会在它每一笔成功充值后重复出现，把真正的异常淹掉。
+        if not getattr(adapter, "apikey_fetchable", True):
             return
         try:
             key = fetch(session, wid, monitor_callback)
-            if key:
-                platform_account_model.update_apikey(platform, email, key)
-                if monitor_callback:
-                    monitor_callback(session, f"{email} 已抓取并落库 API key")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ⚠️ {email} 抓 API key 出错（不影响充值）: {type(e).__name__}: {str(e)[:150]}")
+            return
+        if not key:
+            print(f"  ⚠️ {email} 充值成功但没抓到 API key："
+                  f"keys 页里找不到 sk- 明文，可稍后人工补抓")
+            return
+        try:
+            platform_account_model.update_apikey(platform, email, key)
+        except Exception as e:
+            print(f"  ⚠️ {email} API key 落库失败: {str(e)[:150]}")
+            return
+        print(f"  ✅ {email} 已抓取并落库 API key（{key[:8]}…{key[-4:]}）")
+        if monitor_callback:
+            monitor_callback(session, f"{email} 已抓取并落库 API key")
 
     def _log_card_attempt(card, ok, reason, result, amount):
         """逐卡写一条 recharge_logs（成功/失败），amount 是**这一笔的实际金额**。

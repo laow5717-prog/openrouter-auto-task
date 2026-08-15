@@ -198,18 +198,33 @@ _APIKEY_RE_JS = r"""
 """
 
 
-def fetch_apikey(session, wid, monitor=None):
+def fetch_apikey(session, wid, monitor=None, timeout=20):
     """导航到 /keys 页抓 API key 明文（sk-…），抓不到返回 None。
 
     页面展示的是打码 key，但 outerHTML 里含完整明文（与 scripts/fetch_apikeys.py
     同一判据）。要求会话已登录；充值/归档后顺手调用可免去事后单独开浏览器补抓。
+
+    等待方式是**轮询到 sk- 出现**，不是固定 sleep(3)。调用点在一笔支付刚结束时，
+    那一刻浏览器往往还在收尾（Stripe 的 iframe/3DS 弹窗刚关、页面正在重新水合），
+    加上环境走的是住宅代理，keys 页这个 SPA 三秒内未必渲染得出来。固定等待的代价
+    不是「慢一点」而是「静默抓不到」——2026-08-16 两个刚充成功的账号 apikey 列就是空的。
+    轮询到手即返回，正常情况下比原来还快。
     """
     try:
         session.get(f"https://opencode.ai/workspace/{wid}/keys")
-        time.sleep(3)
-        key = session.page.evaluate(_APIKEY_RE_JS)
-    except Exception:
+    except Exception as e:
+        _step(monitor, session, f"打开 keys 页失败: {str(e)[:80]}")
         return None
+    key = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            key = session.page.evaluate(_APIKEY_RE_JS)
+        except Exception:
+            key = None      # 页面正在导航/水合，下一轮再看
+        if key:
+            break
+        time.sleep(1)
     if key:
         _step(monitor, session, "已抓到 API key")
     return key or None

@@ -92,6 +92,11 @@ class InfronAdapter:
     def read_balance_from_current_page(self, session):
         return _credits.read_balance_from_current_page(session)
 
+    # 编排层据此闭嘴：抓不到 key 在这里是**已知的常态**，不是需要报出来的异常。
+    # 少了这个标记，registration._grab_apikey 会在每一笔成功充值后都记一句
+    # 「充值成功但没抓到 API key」，把真正需要注意的失败淹掉。
+    apikey_fetchable = False
+
     def fetch_apikey(self, session, tenant_id, monitor=None):
         """恒返回 None —— infron 的 key 页只显示脱敏串，拿不到明文。
 
