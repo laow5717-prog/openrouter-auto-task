@@ -157,8 +157,12 @@ class PlatformAdapter(Protocol):
     def fetch_apikey(self, session, tenant_id, monitor=None):
         """抓取该租户的 API key 明文；抓不到返回 None。
 
-        编排层在充值成功 / 余额达标归档后调用（此时会话必在登录态），把 key 落到
-        platform_accounts.apikey，免得事后再为每个账号单独开浏览器补抓。
+        编排层在三处调用（都在登录态下），把 key 落到 platform_accounts.apikey：
+        任务登录成功后（仅当库里那格为空，补漏）、充值成功后、余额达标归档后。
+        统一入口是 registration.ensure_apikey。
+
+        拿不到明文的平台除了如实返回 None，还应把类属性 `apikey_fetchable` 置为
+        False —— 否则编排层每次都会记一条「没抓到」，把真正的异常淹掉（见 infron）。
         """
         ...
 

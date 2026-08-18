@@ -48,6 +48,61 @@ def bind_cards_to_existing_account(account_model, card_binding_model, task_id,
     raise NotImplementedError(_NOT_IMPLEMENTED.format(name="bind_cards_to_existing_account"))
 
 
+def ensure_apikey(adapter, platform_account_model, platform, email, session, wid,
+                  monitor=None, only_if_missing=False, why=''):
+    """登录态下抓平台 API key 落库。best-effort，返回是否落库成功。
+
+    两个调用时机，语义不同：
+      - only_if_missing=True —— **任务跑到这个账号、刚登录成功时**的补漏。库里已经
+        有 key 就直接返回，连页面都不导航，所以对绝大多数账号是零开销。之所以要有
+        这一道，是因为「充值成功后顺手抓」只覆盖得到当次成功充值的账号：一个早就
+        充过、这次全程拒付的账号，key 要是当初没抓着，就再也没有机会补上了。
+      - only_if_missing=False —— 充值成功 / 余额达标归档后的常规抓取，覆盖写。
+
+    ⚠️ best-effort **不等于**静默。这里原来是一个光秃秃的 `except Exception: pass`，
+    连「抓到了没有」都不说一声，于是 2026-08-16 出现「账号充值成功、apikey 列却是空」
+    时，日志里一个字都没有——分不清是没执行、导航失败、页面没渲染出来，还是写库失败。
+    现在每种结局各记一条。日志走 print（已被 AppState._patch_prints 劫持进平台日志流），
+    不占 monitor 的截图通道。
+    """
+    if not (platform_account_model and wid):
+        print(f"  ⚠️ {email} 跳过抓 API key（缺 tenant_id 或未接账号模型）")
+        return False
+    fetch = getattr(adapter, "fetch_apikey", None)
+    if not callable(fetch):
+        return False        # 平台没这个能力，属于正常，不值一条日志
+    # 已知拿不到明文的平台（infron：key 页只显示脱敏串）也不值一条日志——否则
+    # 下面那句「没抓到」会在它每一笔成功充值后重复出现，把真正的异常淹掉。
+    if not getattr(adapter, "apikey_fetchable", True):
+        return False
+    if only_if_missing:
+        try:
+            row = platform_account_model.get(platform, email) or {}
+        except Exception:
+            row = {}
+        if (row.get('apikey') or '').strip():
+            return False    # 已经有了，不导航、不打日志
+        print(f"  ℹ️ {email} 库里没有 API key，{why or '本次任务'}顺手补抓一次")
+    try:
+        key = fetch(session, wid, monitor)
+    except Exception as e:
+        print(f"  ⚠️ {email} 抓 API key 出错（不影响主流程）: {type(e).__name__}: {str(e)[:150]}")
+        return False
+    if not key:
+        print(f"  ⚠️ {email} 没抓到 API key：keys 页里找不到 sk- 明文，可稍后人工补抓"
+              f"（scripts/fetch_apikeys.py）")
+        return False
+    try:
+        platform_account_model.update_apikey(platform, email, key)
+    except Exception as e:
+        print(f"  ⚠️ {email} API key 落库失败: {str(e)[:150]}")
+        return False
+    print(f"  ✅ {email} 已抓取并落库 API key（{key[:8]}…{key[-4:]}）")
+    if monitor:
+        monitor(session, f"{email} 已抓取并落库 API key")
+    return True
+
+
 def recharge_account(email, login_password, recharge_log_model=None, monitor_callback=None,
                      skip_invoice=False, payment_cards=None,
                      valid_card_model=None, card_pool_model=None, account_model=None,
@@ -159,45 +214,11 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
 
     responses = []
 
-    def _grab_apikey(sess, wid):
-        """登录态下抓平台 API key 落库。best-effort：任何异常都不影响充值主流程。
-
-        充值成功 / 余额达标归档后调用——此时会话必在登录态，顺手抓 key 免得事后再
-        为每个账号单独开一次浏览器补抓。适配器未实现 fetch_apikey 时静默跳过。
-
-        ⚠️ best-effort **不等于**静默。这里原来是一个光秃秃的 `except Exception: pass`，
-        连「抓到了没有」都不说一声，于是 2026-08-16 出现「账号充值成功、apikey 列却是空」
-        时，日志里一个字都没有——分不清是没执行、导航失败、页面没渲染出来，还是写库失败。
-        现在四种结局各记一条：跳过 / 异常 / 没抓到 / 抓到并落库。日志走 print（已被
-        AppState._patch_prints 劫持进平台日志流），不占 monitor 的截图通道。
-        """
-        if not (platform_account_model and wid):
-            print(f"  ⚠️ {email} 跳过抓 API key（缺 tenant_id 或未接账号模型）")
-            return
-        fetch = getattr(adapter, "fetch_apikey", None)
-        if not callable(fetch):
-            return          # 平台没这个能力，属于正常，不值一条日志
-        # 已知拿不到明文的平台（infron：key 页只显示脱敏串）也不值一条日志——否则
-        # 下面那句「没抓到」会在它每一笔成功充值后重复出现，把真正的异常淹掉。
-        if not getattr(adapter, "apikey_fetchable", True):
-            return
-        try:
-            key = fetch(session, wid, monitor_callback)
-        except Exception as e:
-            print(f"  ⚠️ {email} 抓 API key 出错（不影响充值）: {type(e).__name__}: {str(e)[:150]}")
-            return
-        if not key:
-            print(f"  ⚠️ {email} 充值成功但没抓到 API key："
-                  f"keys 页里找不到 sk- 明文，可稍后人工补抓")
-            return
-        try:
-            platform_account_model.update_apikey(platform, email, key)
-        except Exception as e:
-            print(f"  ⚠️ {email} API key 落库失败: {str(e)[:150]}")
-            return
-        print(f"  ✅ {email} 已抓取并落库 API key（{key[:8]}…{key[-4:]}）")
-        if monitor_callback:
-            monitor_callback(session, f"{email} 已抓取并落库 API key")
+    def _grab_apikey(sess, wid, only_if_missing=False, why=''):
+        """模块级 ensure_apikey 的薄封装，把闭包里的 adapter/platform/email 补齐。"""
+        return ensure_apikey(adapter, platform_account_model, platform, email,
+                             session, wid, monitor=monitor_callback,
+                             only_if_missing=only_if_missing, why=why)
 
     def _log_card_attempt(card, ok, reason, result, amount):
         """逐卡写一条 recharge_logs（成功/失败），amount 是**这一笔的实际金额**。
@@ -271,6 +292,14 @@ def recharge_account(email, login_password, recharge_log_model=None, monitor_cal
                         pass
                 return (False, f"{platform} 未登录：{detail}", responses, last4, "flagged")
             return (False, f"{platform} 未登录：{detail}", responses, last4, "failed")
+
+        # 登录成功即补抓 API key —— 但只在库里那一格是空的时候。
+        #
+        # 「充值成功后顺手抓」漏得到的正是最需要补的那批：一个早就充过的账号，这次
+        # 全程拒付（卡池质量差时这是常态），一次都不会走到成功分支，key 当初没抓着
+        # 就永远补不上。而此刻会话必在登录态、wid 也拿到了，抓一次的边际成本只有
+        # 一次页面导航，且**只对缺 key 的账号付这个成本**。
+        _grab_apikey(session, wid, only_if_missing=True, why='充值任务')
 
         # R2 归档预检：登录后读实时余额，≥ 阈值即跳过充值并归档（不试任何卡、不扣款）。
         # 以实时余额为准——DB 余额会随 credits 消耗过时，不可作归档依据。

@@ -1760,6 +1760,14 @@ class AppState:
                 return "failed", f"登录失败: {sess.detail}"
             wid = sess.tenant_id
 
+            # 登录成功即补抓 API key（只补库里为空的那些，理由见 registration.ensure_apikey）。
+            # 订阅链路此前**一次都没抓过** key：它自己没有 _grab_apikey，而充值链路的
+            # 那次抓取只在充值成功后触发——一个只跑订阅、从不走充值的账号，apikey 列
+            # 会永远是空的。
+            registration.ensure_apikey(
+                adapter, models['platform_account'], platform, email, session, wid,
+                monitor=monitor, only_if_missing=True, why='订阅任务')
+
             # 账号内逐卡试付，成功即止（快照迭代；拒付卡已被标 invalid 退出后续可选集）
             cards = self._eligible_cards(payment_group_id) if payment_group_id else []
             if not cards:
